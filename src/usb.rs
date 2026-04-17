@@ -73,6 +73,7 @@ async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, write_comple
 
 impl Transport for UsbTransport {
     async fn write_bulk(&self, data: &[u8]) -> Result<()> {
+        debug!(len = data.len(), first = ?&data[..data.len().min(8)], "bulk-out");
         let mut queue = self.interface.bulk_out_queue(self.bulk_out_ep);
         queue.submit(data.to_vec());
         let completion = queue.next_complete().await;
@@ -89,6 +90,11 @@ impl Transport for UsbTransport {
         completion
             .status
             .map_err(|e| anyhow::anyhow!("bulk-in failed: {e}"))?;
+        debug!(
+            len = completion.data.len(),
+            first = ?&completion.data[..completion.data.len().min(8)],
+            "bulk-in"
+        );
         Ok(completion.data)
     }
 
@@ -149,6 +155,9 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
         "failed to claim interface 0 — is the kernel driver loaded? \
          See blacklist instructions in README.md",
     )?;
+    // Clear any residual halt condition on the bulk pipes before first use.
+    let _ = interface.clear_halt(EP_BULK_IN);
+    let _ = interface.clear_halt(EP_82357B_BULK_OUT);
     Ok(UsbTransport::new(
         device,
         interface,
@@ -207,6 +216,9 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
 
     let mut current = dev_info;
     for attempt in 1..=2u32 {
+        let old_bus = current.bus_number();
+        let old_addr = current.device_address();
+
         let device = current
             .open()
             .with_context(|| format!("failed to open pre-init device (attempt {attempt})"))?;
@@ -217,17 +229,21 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
 
         // Device handle becomes invalid once firmware releases reset; drop it.
         drop(device);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (new_info, new_pid) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_any_82357b_pid())
-                .await
-                .with_context(|| {
-                    format!("timeout waiting for renumeration on attempt {attempt}")
-                })??;
+        // Wait for the old bus+address to actually go away before accepting a
+        // new match — otherwise we race with the kernel still holding the
+        // pre-renumeration handle.
+        let (new_info, new_pid) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_for_renumeration(old_bus, old_addr),
+        )
+        .await
+        .with_context(|| format!("timeout waiting for renumeration on attempt {attempt}"))??;
 
         if new_pid == USB_PID_82357B {
             info!(attempt, "device came up as 0x0718");
+            // Small settle so the interface descriptors are readable.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             return open_transport(new_info, timeout_ms).await;
         }
 
@@ -238,4 +254,43 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
         current = new_info;
     }
     anyhow::bail!("device still pre-init (0x0518) after two upload attempts")
+}
+
+/// Wait for the pre-firmware device at `(old_bus, old_addr)` to disappear, then
+/// poll for any 82357B PID to appear (with a new bus/address or the same one).
+async fn wait_for_renumeration(old_bus: u8, old_addr: u8) -> Result<(nusb::DeviceInfo, u16)> {
+    // Phase 1: wait until the old device address is gone (or at minimum 200ms settle)
+    let phase1_start = std::time::Instant::now();
+    loop {
+        let devices: Vec<_> = nusb::list_devices()
+            .context("failed to list USB devices")?
+            .collect();
+        let still_present = devices
+            .iter()
+            .any(|d| d.bus_number() == old_bus && d.device_address() == old_addr);
+        if !still_present {
+            break;
+        }
+        if phase1_start.elapsed() >= std::time::Duration::from_secs(3) {
+            break; // fallback: assume the device re-used the same address
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Give the device a moment to settle after re-enumeration.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Phase 2: wait for any 82357B PID to appear.
+    loop {
+        let devices = nusb::list_devices().context("failed to list USB devices")?;
+        for dev in devices {
+            if dev.vendor_id() == USB_VID_AGILENT {
+                let pid = dev.product_id();
+                if pid == USB_PID_82357B || pid == USB_PID_82357B_PREINIT {
+                    return Ok((dev, pid));
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

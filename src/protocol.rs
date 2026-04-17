@@ -115,10 +115,11 @@ pub const USB_VID_AGILENT: u16 = 0x0957;
 pub const USB_PID_82357B_PREINIT: u16 = 0x0518;
 pub const USB_PID_82357B: u16 = 0x0718;
 
-// Endpoint numbers for 82357B (post-firmware)
-pub const EP_BULK_IN: u8 = 0x02;
+// Endpoint addresses for 82357B (post-firmware). USB endpoint addresses encode
+// direction in the top bit: 0x80 = IN, 0x00 = OUT. nusb asserts this.
+pub const EP_BULK_IN: u8 = 0x82;
 pub const EP_82357B_BULK_OUT: u8 = 0x06;
-pub const EP_82357B_IRQ_IN: u8 = 0x08;
+pub const EP_82357B_IRQ_IN: u8 = 0x88;
 
 pub const INTERRUPT_BUF_LEN: usize = 8;
 pub const STATUS_DATA_LEN: usize = 8;
