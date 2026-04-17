@@ -1,0 +1,12 @@
+The file `measat_releaseX1.8.hex` in this directory is firmware for the
+Agilent/Keysight 82357B USB-to-GPIB adapter.
+
+It is redistributed here unmodified from the upstream project at
+https://github.com/fmhess/linux_gpib_firmware, which in turn obtained
+it from Agilent/Keysight. The firmware itself is proprietary; its
+redistribution is permitted as part of drivers that operate the
+hardware. See the upstream repository's README files for the full
+redistribution context.
+
+This LICENSE notice applies only to the firmware blob in this directory.
+The rest of the gpibd source tree is GPL-3.0-or-later.
