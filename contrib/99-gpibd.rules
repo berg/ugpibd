@@ -1,0 +1,4 @@
+# Agilent/Keysight 82357B USB-GPIB adapter
+# Pre-firmware (PID 0x0518) and post-firmware (PID 0x0718)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0518", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0718", MODE="0660", GROUP="plugdev", TAG+="uaccess"
