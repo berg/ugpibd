@@ -74,7 +74,12 @@ fn data_line_returns_forward() {
     let auto = s.auto_read;
     let r = s.handle_line("*IDN?");
     match r {
-        LineResult::Forward { pad, auto_read, send_eoi, .. } => {
+        LineResult::Forward {
+            pad,
+            auto_read,
+            send_eoi,
+            ..
+        } => {
             assert_eq!(pad, 15);
             assert_eq!(auto_read, auto);
             assert!(send_eoi);
@@ -85,8 +90,10 @@ fn data_line_returns_forward() {
 
 #[test]
 fn data_applies_eos_termination() {
-    let mut s = PrologixState::default();
-    s.eos_mode = 0; // CR+LF
+    let mut s = PrologixState {
+        eos_mode: 0, // CR+LF
+        ..PrologixState::default()
+    };
     s.handle_line("++addr 1");
     let r = s.handle_line("MEAS:VOLT?");
     match r {
@@ -156,9 +163,11 @@ fn read_tmo_ms() {
 
 #[test]
 fn apply_eot_appends_when_enabled() {
-    let mut s = PrologixState::default();
-    s.eot_enable = true;
-    s.eot_char = 0x00;
+    let s = PrologixState {
+        eot_enable: true,
+        eot_char: 0x00,
+        ..PrologixState::default()
+    };
     let out = s.apply_eot(b"hello".to_vec());
     assert_eq!(out, b"hello\0");
 }

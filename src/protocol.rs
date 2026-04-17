@@ -144,11 +144,17 @@ pub fn encode_wr_regs(regs: &[RegisterPairlet]) -> Vec<u8> {
 /// Validate the bulk-IN response to a WR_REGS command.
 pub fn decode_wr_regs_response(resp: &[u8]) -> Result<(), ProtocolError> {
     if resp.len() < 2 {
-        return Err(ProtocolError::ShortResponse { need: 2, got: resp.len() });
+        return Err(ProtocolError::ShortResponse {
+            need: 2,
+            got: resp.len(),
+        });
     }
     let expected = !(BulkCmd::WrRegs as u8);
     if resp[0] != expected {
-        return Err(ProtocolError::BadResponse { expected, got: resp[0] });
+        return Err(ProtocolError::BadResponse {
+            expected,
+            got: resp[0],
+        });
     }
     if resp[1] != UGP_SUCCESS {
         return Err(ProtocolError::DeviceError {
@@ -175,11 +181,17 @@ pub fn decode_rd_regs_response(
 ) -> Result<(), ProtocolError> {
     let need = 2 + regs.len();
     if resp.len() < need {
-        return Err(ProtocolError::ShortResponse { need, got: resp.len() });
+        return Err(ProtocolError::ShortResponse {
+            need,
+            got: resp.len(),
+        });
     }
     let expected = !(BulkCmd::RdRegs as u8);
     if resp[0] != expected {
-        return Err(ProtocolError::BadResponse { expected, got: resp[0] });
+        return Err(ProtocolError::BadResponse {
+            expected,
+            got: resp[0],
+        });
     }
     if resp[1] != UGP_SUCCESS {
         return Err(ProtocolError::DeviceError {
@@ -204,8 +216,7 @@ pub fn encode_gpib_write(data: &[u8], send_eoi: bool) -> Vec<u8> {
 
 /// Encode a DATA_PIPE_CMD_WRITE packet for GPIB bus commands (ATN asserted).
 pub fn encode_gpib_command(cmd: &[u8]) -> Vec<u8> {
-    let flags =
-        WriteFlag::NoAddress as u8 | WriteFlag::Atn as u8 | WriteFlag::NoFastTalker as u8;
+    let flags = WriteFlag::NoAddress as u8 | WriteFlag::Atn as u8 | WriteFlag::NoFastTalker as u8;
     build_write_packet(flags, cmd)
 }
 

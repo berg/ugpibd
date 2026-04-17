@@ -50,11 +50,7 @@ impl UsbTransport {
     }
 }
 
-async fn interrupt_poller(
-    interface: nusb::Interface,
-    endpoint: u8,
-    write_complete: Arc<Notify>,
-) {
+async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, write_complete: Arc<Notify>) {
     let mut queue = interface.interrupt_in_queue(endpoint);
     loop {
         queue.submit(RequestBuffer::new(INTERRUPT_BUF_LEN));
@@ -80,7 +76,9 @@ impl Transport for UsbTransport {
         let mut queue = self.interface.bulk_out_queue(self.bulk_out_ep);
         queue.submit(data.to_vec());
         let completion = queue.next_complete().await;
-        completion.status.map_err(|e| anyhow::anyhow!("bulk-out failed: {e}"))?;
+        completion
+            .status
+            .map_err(|e| anyhow::anyhow!("bulk-out failed: {e}"))?;
         Ok(())
     }
 
@@ -141,9 +139,7 @@ pub fn find_device() -> Result<(nusb::DeviceInfo, u16)> {
             return Ok((dev, pid));
         }
     }
-    anyhow::bail!(
-        "no Agilent/Keysight 82357B found (expected VID 0x0957, PID 0x0518 or 0x0718)"
-    )
+    anyhow::bail!("no Agilent/Keysight 82357B found (expected VID 0x0957, PID 0x0518 or 0x0718)")
 }
 
 /// Open device, claim interface 0, return UsbTransport wired to the 82357B endpoints.
@@ -164,10 +160,7 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
 }
 
 /// Poll for a device with the given PID to appear, up to `timeout`.
-pub async fn wait_for_pid(
-    pid: u16,
-    timeout: std::time::Duration,
-) -> Result<nusb::DeviceInfo> {
+pub async fn wait_for_pid(pid: u16, timeout: std::time::Duration) -> Result<nusb::DeviceInfo> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let devices = nusb::list_devices().context("failed to list USB devices")?;
@@ -178,9 +171,7 @@ pub async fn wait_for_pid(
             return Ok(dev);
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for device 0x0957:{pid:#06x} to appear"
-            );
+            anyhow::bail!("timed out waiting for device 0x0957:{pid:#06x} to appear");
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -228,19 +219,22 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
         drop(device);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (new_info, new_pid) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            wait_for_any_82357b_pid(),
-        )
-        .await
-        .with_context(|| format!("timeout waiting for renumeration on attempt {attempt}"))??;
+        let (new_info, new_pid) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait_for_any_82357b_pid())
+                .await
+                .with_context(|| {
+                    format!("timeout waiting for renumeration on attempt {attempt}")
+                })??;
 
         if new_pid == USB_PID_82357B {
             info!(attempt, "device came up as 0x0718");
             return open_transport(new_info, timeout_ms).await;
         }
 
-        info!(attempt, "device still 0x0518 — double-upload quirk, retrying");
+        info!(
+            attempt,
+            "device still 0x0518 — double-upload quirk, retrying"
+        );
         current = new_info;
     }
     anyhow::bail!("device still pre-init (0x0518) after two upload attempts")

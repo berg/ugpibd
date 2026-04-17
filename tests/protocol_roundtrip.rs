@@ -4,8 +4,14 @@ use gpibd::protocol::*;
 #[test]
 fn wr_regs_roundtrip() {
     let regs = vec![
-        RegisterPairlet { address: 0x0a, value: 0x01 },
-        RegisterPairlet { address: 0x0b, value: 0x20 },
+        RegisterPairlet {
+            address: 0x0a,
+            value: 0x01,
+        },
+        RegisterPairlet {
+            address: 0x0b,
+            value: 0x20,
+        },
     ];
     let encoded = encode_wr_regs(&regs);
     assert_eq!(encoded[0], BulkCmd::WrRegs as u8);
@@ -42,8 +48,14 @@ fn rd_regs_request() {
 fn rd_regs_response_ok() {
     let resp = [!(BulkCmd::RdRegs as u8), 0x00, 0x42, 0x13];
     let mut regs = vec![
-        RegisterPairlet { address: 0x0a, value: 0 },
-        RegisterPairlet { address: 0x0b, value: 0 },
+        RegisterPairlet {
+            address: 0x0a,
+            value: 0,
+        },
+        RegisterPairlet {
+            address: 0x0b,
+            value: 0,
+        },
     ];
     decode_rd_regs_response(&resp, &mut regs).unwrap();
     assert_eq!(regs[0].value, 0x42);

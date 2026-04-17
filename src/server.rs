@@ -10,11 +10,11 @@ use crate::gpib::{GpibController, Transport};
 use crate::prologix::{LineResult, PrologixState};
 
 /// Run the TCP server. Accepts one connection at a time.
-pub async fn run<T: Transport>(
-    listener: TcpListener,
-    mut ctrl: GpibController<T>,
-) -> Result<()> {
-    info!("Prologix TCP server listening on {}", listener.local_addr()?);
+pub async fn run<T: Transport>(listener: TcpListener, mut ctrl: GpibController<T>) -> Result<()> {
+    info!(
+        "Prologix TCP server listening on {}",
+        listener.local_addr()?
+    );
 
     loop {
         let (mut stream, addr) = listener.accept().await?;

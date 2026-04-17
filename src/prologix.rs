@@ -19,7 +19,9 @@ pub enum LineResult {
         until_char: Option<u8>,
     },
     /// Send Selected Device Clear to `pad`.
-    DeviceClear { pad: u8 },
+    DeviceClear {
+        pad: u8,
+    },
     /// Pulse IFC.
     Ifc,
     /// Reset daemon GPIB state (not the instrument).
@@ -171,9 +173,7 @@ impl PrologixState {
             "clr" => LineResult::DeviceClear { pad: self.addr },
             "ifc" => LineResult::Ifc,
             "rst" => LineResult::Reset,
-            "ver" => LineResult::Response(
-                "Prologix GPIB-USB Controller version 6.107".to_string(),
-            ),
+            "ver" => LineResult::Response("Prologix GPIB-USB Controller version 6.107".to_string()),
             "mode" => match args {
                 "1" => LineResult::Ok,
                 "0" => LineResult::Error(
@@ -197,7 +197,7 @@ impl PrologixState {
             }
             1 => data.push(b'\r'),
             2 => data.push(b'\n'),
-            3 | _ => {}
+            _ => {}
         }
         LineResult::Forward {
             pad: self.addr,

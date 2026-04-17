@@ -19,8 +19,7 @@ const CPUCS_ADDR: u16 = 0xE600;
 /// Upload firmware to an FX2 device in pre-init state.
 /// Holds the 8051 in reset, writes all HEX records, then releases reset.
 pub async fn upload_firmware(device: &nusb::Device) -> Result<()> {
-    let hex_text = std::str::from_utf8(FX2_FIRMWARE)
-        .context("firmware blob is not valid UTF-8")?;
+    let hex_text = std::str::from_utf8(FX2_FIRMWARE).context("firmware blob is not valid UTF-8")?;
     let records = parse_hex(hex_text).context("failed to parse firmware HEX")?;
 
     tracing::info!("holding 8051 in reset");

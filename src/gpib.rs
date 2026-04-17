@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 gpibd contributors
 
-use anyhow::Result;
 use crate::protocol::*;
+use anyhow::Result;
 
 #[allow(async_fn_in_trait)]
 pub trait Transport {
@@ -63,8 +63,14 @@ impl<T: Transport> GpibController<T> {
     pub async fn init(&mut self, my_pad: u8) -> Result<()> {
         // Batch 1: light FAIL LED and pulse reset
         let batch1 = [
-            RegisterPairlet { address: REG_LED_CONTROL, value: FAIL_LED_ON },
-            RegisterPairlet { address: REG_RESET_TO_POWERUP, value: RESET_SPACEBALL },
+            RegisterPairlet {
+                address: REG_LED_CONTROL,
+                value: FAIL_LED_ON,
+            },
+            RegisterPairlet {
+                address: REG_RESET_TO_POWERUP,
+                value: RESET_SPACEBALL,
+            },
         ];
         self.write_registers(&batch1).await?;
 
@@ -74,29 +80,86 @@ impl<T: Transport> GpibController<T> {
         // Fast-talker T1 bits for 800 ns, clamped to valid register range.
         let t1_bits: u8 = (800u32 / 21).clamp(0x11, 0x72) as u8;
         let batch2 = [
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_NBAF },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_HLDE },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_TON },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_LON },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_RSV2 },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_INVAL },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_RPP },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_STDL },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_VSTDL },
-            RegisterPairlet { address: REG_FAST_TALKER_T1, value: t1_bits },
-            RegisterPairlet { address: TMS_ADR, value: my_pad & ADDRESS_MASK },
-            RegisterPairlet { address: TMS_PPR, value: 0 },
-            RegisterPairlet { address: TMS_SPMR, value: 0 },
-            RegisterPairlet { address: REG_PROTOCOL_CONTROL, value: WRITE_COMPLETE_INTERRUPT_EN },
-            RegisterPairlet { address: TMS_IMR0, value: HR_BOIE | HR_BIIE },
-            RegisterPairlet { address: TMS_IMR1, value: HR_SRQIE },
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_CHIP_RESET },
-            RegisterPairlet { address: REG_LED_CONTROL, value: FIRMWARE_LED_CONTROL },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_NBAF,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_HLDE,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_TON,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_LON,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_RSV2,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_INVAL,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_RPP,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_STDL,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_VSTDL,
+            },
+            RegisterPairlet {
+                address: REG_FAST_TALKER_T1,
+                value: t1_bits,
+            },
+            RegisterPairlet {
+                address: TMS_ADR,
+                value: my_pad & ADDRESS_MASK,
+            },
+            RegisterPairlet {
+                address: TMS_PPR,
+                value: 0,
+            },
+            RegisterPairlet {
+                address: TMS_SPMR,
+                value: 0,
+            },
+            RegisterPairlet {
+                address: REG_PROTOCOL_CONTROL,
+                value: WRITE_COMPLETE_INTERRUPT_EN,
+            },
+            RegisterPairlet {
+                address: TMS_IMR0,
+                value: HR_BOIE | HR_BIIE,
+            },
+            RegisterPairlet {
+                address: TMS_IMR1,
+                value: HR_SRQIE,
+            },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_CHIP_RESET,
+            },
+            RegisterPairlet {
+                address: REG_LED_CONTROL,
+                value: FIRMWARE_LED_CONTROL,
+            },
         ];
         self.write_registers(&batch2).await?;
 
         // Read back HW_CONTROL and stash it
-        let mut hw = [RegisterPairlet { address: REG_HW_CONTROL, value: 0 }];
+        let mut hw = [RegisterPairlet {
+            address: REG_HW_CONTROL,
+            value: 0,
+        }];
         self.read_registers(&mut hw).await?;
         self.hw_control_bits = (hw[0].value & !0x07) | NOT_TI_RESET | NOT_PARALLEL_POLL;
 
@@ -110,18 +173,30 @@ impl<T: Transport> GpibController<T> {
     async fn request_system_control(&mut self) -> Result<()> {
         self.hw_control_bits |= SYSTEM_CONTROLLER;
         let regs = [
-            RegisterPairlet { address: TMS_AUXCR, value: AUX_RQC },
-            RegisterPairlet { address: REG_HW_CONTROL, value: self.hw_control_bits },
+            RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_RQC,
+            },
+            RegisterPairlet {
+                address: REG_HW_CONTROL,
+                value: self.hw_control_bits,
+            },
         ];
         self.write_registers(&regs).await
     }
 
     /// Send Interface Clear pulse (~200 µs: assert then deassert).
     pub async fn ifc(&mut self) -> Result<()> {
-        let assert_ = [RegisterPairlet { address: TMS_AUXCR, value: AUX_SIC | AUX_CS }];
+        let assert_ = [RegisterPairlet {
+            address: TMS_AUXCR,
+            value: AUX_SIC | AUX_CS,
+        }];
         self.write_registers(&assert_).await?;
         tokio::time::sleep(std::time::Duration::from_micros(200)).await;
-        let deassert = [RegisterPairlet { address: TMS_AUXCR, value: AUX_SIC }];
+        let deassert = [RegisterPairlet {
+            address: TMS_AUXCR,
+            value: AUX_SIC,
+        }];
         self.write_registers(&deassert).await?;
         Ok(())
     }
@@ -129,7 +204,10 @@ impl<T: Transport> GpibController<T> {
     /// Assert or deassert Remote Enable.
     pub async fn ren(&mut self, enable: bool) -> Result<()> {
         let value = if enable { AUX_SRE | AUX_CS } else { AUX_SRE };
-        let reg = [RegisterPairlet { address: TMS_AUXCR, value }];
+        let reg = [RegisterPairlet {
+            address: TMS_AUXCR,
+            value,
+        }];
         self.write_registers(&reg).await
     }
 
@@ -153,7 +231,10 @@ impl<T: Transport> GpibController<T> {
         let addr_cmd = [0x3f_u8, 0x20_u8, 0x40 + pad];
         self.send_command_bytes(&addr_cmd).await?;
         // Go to standby (release ATN)
-        let gts = [RegisterPairlet { address: TMS_AUXCR, value: AUX_GTS }];
+        let gts = [RegisterPairlet {
+            address: TMS_AUXCR,
+            value: AUX_GTS,
+        }];
         self.write_registers(&gts).await?;
         // Issue read command
         let pkt = encode_gpib_read(max_len as u32, self.eos_enabled, self.eos_char);
@@ -233,13 +314,7 @@ mod tests {
             }
             Ok(q.remove(0))
         }
-        async fn control_in(
-            &self,
-            _req: u8,
-            _val: u16,
-            _idx: u16,
-            _max: usize,
-        ) -> Result<Vec<u8>> {
+        async fn control_in(&self, _req: u8, _val: u16, _idx: u16, _max: usize) -> Result<Vec<u8>> {
             let mut q = self.control_responses.lock().unwrap();
             if q.is_empty() {
                 anyhow::bail!("mock: control_in called with no response queued");
@@ -266,7 +341,10 @@ mod tests {
         let t = MockTransport::new();
         t.push_response(wr_regs_ok());
         let mut ctrl = GpibController::new(t, 3000);
-        let regs = &[RegisterPairlet { address: 0x0a, value: 0x01 }];
+        let regs = &[RegisterPairlet {
+            address: 0x0a,
+            value: 0x01,
+        }];
         ctrl.write_registers(regs).await.unwrap();
         let sent = ctrl.transport.last_written();
         assert_eq!(sent[0], BulkCmd::WrRegs as u8);
@@ -280,7 +358,10 @@ mod tests {
         let t = MockTransport::new();
         t.push_response(vec![!(BulkCmd::RdRegs as u8), 0x00, 0x42]);
         let mut ctrl = GpibController::new(t, 3000);
-        let mut regs = vec![RegisterPairlet { address: 0x0a, value: 0 }];
+        let mut regs = vec![RegisterPairlet {
+            address: 0x0a,
+            value: 0,
+        }];
         ctrl.read_registers(&mut regs).await.unwrap();
         assert_eq!(regs[0].value, 0x42);
     }
