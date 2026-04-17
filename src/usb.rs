@@ -155,9 +155,25 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
         "failed to claim interface 0 — is the kernel driver loaded? \
          See blacklist instructions in README.md",
     )?;
+
     // Clear any residual halt condition on the bulk pipes before first use.
     let _ = interface.clear_halt(EP_BULK_IN);
     let _ = interface.clear_halt(EP_82357B_BULK_OUT);
+
+    // Drain any stale bulk-in data from a previous session. If nothing is
+    // pending, the transfer times out quickly and we discard the empty buffer.
+    let drain = async {
+        let mut queue = interface.bulk_in_queue(EP_BULK_IN);
+        queue.submit(nusb::transfer::RequestBuffer::new(0x40));
+        let completion = queue.next_complete().await;
+        if let Ok(()) = completion.status {
+            if !completion.data.is_empty() {
+                debug!(len = completion.data.len(), "drained stale bulk-in data");
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), drain).await;
+
     Ok(UsbTransport::new(
         device,
         interface,

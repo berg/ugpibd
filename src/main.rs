@@ -4,6 +4,7 @@
 use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -41,12 +42,19 @@ async fn main() -> Result<()> {
     info!("USB device open");
 
     let mut ctrl = gpibd::gpib::GpibController::new(transport, args.timeout_ms);
+    info!("issuing startup abort");
+    match ctrl.abort(true).await {
+        Ok(()) => info!("startup abort: ok"),
+        Err(e) => info!("startup abort: {e:#}"),
+    }
+    info!("running init");
     ctrl.init(0).await?;
     info!("GPIB controller initialized");
 
     let listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
     info!("listening on {}:{}", args.bind, args.port);
 
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -55,9 +63,8 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         result = gpibd::server::run(listener, ctrl) => result?,
-        _ = ctrl_c => {
-            info!("shutting down");
-        }
+        _ = ctrl_c => info!("SIGINT received, shutting down"),
+        _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
     }
 
     Ok(())

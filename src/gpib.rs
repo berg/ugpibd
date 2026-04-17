@@ -226,37 +226,90 @@ impl<T: Transport> GpibController<T> {
     }
 
     /// Read up to `max_len` bytes from instrument at `pad`. Returns (data, end_of_message).
+    /// Aborts the pending transfer on timeout/failure so the next command can proceed.
     pub async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
-        // Address: UNL, MLA(0), TAD(pad)
         let addr_cmd = [0x3f_u8, 0x20_u8, 0x40 + pad];
         self.send_command_bytes(&addr_cmd).await?;
-        // Go to standby (release ATN)
         let gts = [RegisterPairlet {
             address: TMS_AUXCR,
             value: AUX_GTS,
         }];
         self.write_registers(&gts).await?;
-        // Issue read command
         let pkt = encode_gpib_read(max_len as u32, self.eos_enabled, self.eos_char);
         self.transport.write_bulk(&pkt).await?;
-        let raw = self.transport.read_bulk(max_len + 1).await?;
-        Ok(decode_gpib_read_response(&raw))
+
+        // Bound the bulk-in wait. Without this, a missing instrument (or one
+        // that never asserts EOI) leaves the read hanging forever.
+        let read_fut = self.transport.read_bulk(max_len + 1);
+        let timeout = std::time::Duration::from_millis(self.timeout_ms as u64);
+        match tokio::time::timeout(timeout, read_fut).await {
+            Ok(Ok(raw)) => Ok(decode_gpib_read_response(&raw)),
+            Ok(Err(e)) => {
+                let _ = self.abort(true).await;
+                Err(e)
+            }
+            Err(_) => {
+                // Flush the stuck transfer and drain any partial data the kernel
+                // driver would pick up here; we just discard it for now.
+                let _ = self.abort(true).await;
+                anyhow::bail!("gpib read timed out after {} ms", self.timeout_ms)
+            }
+        }
     }
 
     async fn send_command_bytes(&mut self, cmd: &[u8]) -> Result<()> {
         let pkt = encode_gpib_command(cmd);
         self.transport.write_bulk(&pkt).await?;
-        self.transport.await_write_complete().await?;
-        self.get_xfer_status().await?;
+        if let Err(e) = self.transport.await_write_complete().await {
+            let _ = self.abort(true).await;
+            return Err(e);
+        }
+        if let Err(e) = self.get_xfer_status().await {
+            let _ = self.abort(false).await;
+            return Err(e);
+        }
         Ok(())
     }
 
     async fn send_data_bytes(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
         let pkt = encode_gpib_write(data, send_eoi);
         self.transport.write_bulk(&pkt).await?;
-        self.transport.await_write_complete().await?;
-        self.get_xfer_status().await?;
+        if let Err(e) = self.transport.await_write_complete().await {
+            let _ = self.abort(true).await;
+            return Err(e);
+        }
+        if let Err(e) = self.get_xfer_status().await {
+            let _ = self.abort(false).await;
+            return Err(e);
+        }
         Ok(())
+    }
+
+    /// Issue XFER_ABORT control transfer. `flush` cancels an in-progress
+    /// bulk transfer; without flush it just finalizes an aborted state.
+    pub async fn abort(&mut self, flush: bool) -> Result<()> {
+        let idx = if flush { XA_FLUSH } else { 0 };
+        let resp = self
+            .transport
+            .control_in(CONTROL_REQUEST, XFER_ABORT, idx, 2)
+            .await?;
+        if resp.len() < 2 {
+            anyhow::bail!("XFER_ABORT response too short: {} bytes", resp.len());
+        }
+        let expected = !(XFER_ABORT as u8);
+        if resp[0] != expected {
+            anyhow::bail!(
+                "XFER_ABORT bad response byte: got {:#x}, expected {:#x}",
+                resp[0],
+                expected
+            );
+        }
+        match resp[1] {
+            UGP_SUCCESS => Ok(()),
+            // "already flushing" is fine when we asked for flush
+            UGP_ERR_FLUSHING if flush => Ok(()),
+            code => anyhow::bail!("XFER_ABORT returned error {:#x}", code),
+        }
     }
 
     /// Issue XFER_STATUS control transfer and return bytes-written count.

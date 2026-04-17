@@ -39,7 +39,20 @@ fn history_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".scpi_history"))
 }
 
+fn restore_terminal() {
+    // Fallback: ask stty to reset to sane defaults. Runs when rustyline's
+    // own Drop impl couldn't (panic, abnormal exit from another thread, etc.).
+    let _ = std::process::Command::new("stty").arg("sane").status();
+}
+
 fn main() -> Result<()> {
+    // Always reset terminal on panic so the user doesn't land in raw mode.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
     let args = Args::parse();
     let target = format!("{}:{}", args.host, args.port);
     let stream = TcpStream::connect(&target)
@@ -92,15 +105,17 @@ fn run_interactive(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    let _ = printer.print("[server closed connection]\n".into());
-                    std::process::exit(0);
+                    let _ = printer.print(
+                        "[server closed connection — press Enter or Ctrl-D to exit]\n".into(),
+                    );
+                    return;
                 }
                 Ok(_) => {
                     let _ = printer.print(line.clone());
                 }
                 Err(e) => {
                     let _ = printer.print(format!("[read error: {e}]\n"));
-                    std::process::exit(1);
+                    return;
                 }
             }
         }
@@ -113,12 +128,14 @@ fn run_interactive(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Err(e) = writer
+                if writer
                     .write_all(trimmed.as_bytes())
                     .and_then(|_| writer.write_all(b"\n"))
                     .and_then(|_| writer.flush())
+                    .is_err()
                 {
-                    eprintln!("[send error: {e}]");
+                    // Socket is gone; reader thread has already printed a
+                    // message. Exit cleanly so Editor::drop restores the terminal.
                     break;
                 }
                 thread::sleep(std::time::Duration::from_millis(50));
@@ -149,14 +166,12 @@ fn run_batch(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) => {
-                    std::process::exit(0);
-                }
+                Ok(0) => return,
                 Ok(_) => {
                     print!("{line}");
                     let _ = std::io::stdout().flush();
                 }
-                Err(_) => std::process::exit(1),
+                Err(_) => return,
             }
         }
     });
@@ -171,7 +186,6 @@ fn run_batch(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
         writer.write_all(b"\n")?;
         writer.flush()?;
     }
-    // Drain any pending response.
     thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }

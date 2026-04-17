@@ -48,6 +48,10 @@ pub const XFER_STATUS: u16 = 0xb0;
 pub const CONTROL_REQUEST: u8 = 0x04;
 
 pub const UGP_SUCCESS: u8 = 0x00;
+pub const UGP_ERR_FLUSHING: u8 = 0x06;
+pub const UGP_ERR_FLUSHING_ALREADY: u8 = 0x07;
+
+pub const XA_FLUSH: u16 = 0x01;
 
 // Firmware-level register addresses (not TMS9914)
 pub const REG_HW_CONTROL: u8 = 0x0a;
