@@ -19,6 +19,10 @@ pub trait Transport {
     /// Block until the device signals write-complete via the interrupt endpoint.
     /// On a mock transport, this returns immediately.
     async fn await_write_complete(&self) -> Result<()>;
+    /// Discard any pending write-complete interrupts so the next
+    /// await_write_complete only sees interrupts that fire from now on.
+    /// Called during error recovery to re-synchronize with the firmware.
+    async fn drain_write_complete(&self);
 }
 
 pub struct GpibController<T: Transport> {
@@ -43,7 +47,14 @@ impl<T: Transport> GpibController<T> {
     pub async fn write_registers(&mut self, regs: &[RegisterPairlet]) -> Result<()> {
         let pkt = encode_wr_regs(regs);
         self.transport.write_bulk(&pkt).await?;
-        let resp = self.transport.read_bulk(0x20).await?;
+        // Bound register-response wait. If the device is wedged the bulk-in
+        // never completes; we'd rather surface an error than block forever.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(self.timeout_ms as u64),
+            self.transport.read_bulk(0x20),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("WR_REGS bulk-in timed out"))??;
         decode_wr_regs_response(&resp)?;
         Ok(())
     }
@@ -52,7 +63,12 @@ impl<T: Transport> GpibController<T> {
         let addrs: Vec<u8> = regs.iter().map(|r| r.address).collect();
         let pkt = encode_rd_regs(&addrs);
         self.transport.write_bulk(&pkt).await?;
-        let resp = self.transport.read_bulk(0x20).await?;
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(self.timeout_ms as u64),
+            self.transport.read_bulk(0x20),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("RD_REGS bulk-in timed out"))??;
         decode_rd_regs_response(&resp, regs)?;
         Ok(())
     }
@@ -226,7 +242,9 @@ impl<T: Transport> GpibController<T> {
     }
 
     /// Read up to `max_len` bytes from instrument at `pad`. Returns (data, end_of_message).
-    /// Aborts the pending transfer on timeout/failure so the next command can proceed.
+    /// On timeout, aborts the pending transfer AND pulses IFC to return all
+    /// bus participants to idle — otherwise a device left addressed as talker
+    /// will hang the next transaction.
     pub async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
         let addr_cmd = [0x3f_u8, 0x20_u8, 0x40 + pad];
         self.send_command_bytes(&addr_cmd).await?;
@@ -238,34 +256,60 @@ impl<T: Transport> GpibController<T> {
         let pkt = encode_gpib_read(max_len as u32, self.eos_enabled, self.eos_char);
         self.transport.write_bulk(&pkt).await?;
 
-        // Bound the bulk-in wait. Without this, a missing instrument (or one
-        // that never asserts EOI) leaves the read hanging forever.
         let read_fut = self.transport.read_bulk(max_len + 1);
         let timeout = std::time::Duration::from_millis(self.timeout_ms as u64);
         match tokio::time::timeout(timeout, read_fut).await {
             Ok(Ok(raw)) => Ok(decode_gpib_read_response(&raw)),
             Ok(Err(e)) => {
-                let _ = self.abort(true).await;
+                self.recover_from_stall().await;
                 Err(e)
             }
             Err(_) => {
-                // Flush the stuck transfer and drain any partial data the kernel
-                // driver would pick up here; we just discard it for now.
-                let _ = self.abort(true).await;
+                self.recover_from_stall().await;
                 anyhow::bail!("gpib read timed out after {} ms", self.timeout_ms)
             }
         }
     }
 
+    /// Best-effort recovery after a stalled transfer: flush the in-flight USB
+    /// transfer, drain any partial bulk-in data and any late write-complete
+    /// interrupts, finalize the abort, then pulse IFC to reset the GPIB bus.
+    /// Errors are swallowed — the caller is already propagating a failure.
+    async fn recover_from_stall(&mut self) {
+        tracing::debug!("recover_from_stall: abort(flush), drain, abort, ifc");
+        let _ = self.abort(true).await;
+
+        let drain_fut = self.transport.read_bulk(0x20);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), drain_fut).await;
+
+        let _ = self.abort(false).await;
+
+        // Discard any late write-complete interrupts that the firmware fired
+        // after the abort — otherwise they'd prematurely satisfy the next
+        // await_write_complete call.
+        self.transport.drain_write_complete().await;
+
+        let _ = self.ifc().await;
+
+        // IFC itself produces register writes which we've already awaited;
+        // drain again just to be safe.
+        self.transport.drain_write_complete().await;
+    }
+
     async fn send_command_bytes(&mut self, cmd: &[u8]) -> Result<()> {
         let pkt = encode_gpib_command(cmd);
         self.transport.write_bulk(&pkt).await?;
-        if let Err(e) = self.transport.await_write_complete().await {
-            let _ = self.abort(true).await;
+        // Race the write-complete interrupt against the GPIB timeout. The
+        // control-IN for XFER_STATUS that follows acts as the real sync
+        // point — the firmware only responds to it after the bulk write is
+        // actually complete — but the interrupt gives us an early signal so
+        // back-to-back writes don't stall unnecessarily.
+        if let Err(e) = self.wait_write_or_timeout().await {
+            self.recover_from_stall().await;
             return Err(e);
         }
         if let Err(e) = self.get_xfer_status().await {
-            let _ = self.abort(false).await;
+            self.recover_from_stall().await;
             return Err(e);
         }
         Ok(())
@@ -274,15 +318,24 @@ impl<T: Transport> GpibController<T> {
     async fn send_data_bytes(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
         let pkt = encode_gpib_write(data, send_eoi);
         self.transport.write_bulk(&pkt).await?;
-        if let Err(e) = self.transport.await_write_complete().await {
-            let _ = self.abort(true).await;
+        if let Err(e) = self.wait_write_or_timeout().await {
+            self.recover_from_stall().await;
             return Err(e);
         }
         if let Err(e) = self.get_xfer_status().await {
-            let _ = self.abort(false).await;
+            self.recover_from_stall().await;
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Wait for a write-complete interrupt bounded by `timeout_ms`. Returns
+    /// Ok even if a *stale* permit from a previous operation satisfies it —
+    /// the subsequent XFER_STATUS control transfer acts as the authoritative
+    /// sync point, so a false-early return is harmless and matches the kernel
+    /// driver's permit-style behavior.
+    async fn wait_write_or_timeout(&mut self) -> Result<()> {
+        self.transport.await_write_complete().await
     }
 
     /// Issue XFER_ABORT control transfer. `flush` cancels an in-progress
@@ -377,6 +430,7 @@ mod tests {
         async fn await_write_complete(&self) -> Result<()> {
             Ok(())
         }
+        async fn drain_write_complete(&self) {}
     }
 
     pub(crate) fn wr_regs_ok() -> Vec<u8> {

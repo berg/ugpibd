@@ -31,11 +31,11 @@ impl UsbTransport {
         timeout_ms: u32,
     ) -> Self {
         let write_complete = Arc::new(Notify::new());
-        let notify_clone = write_complete.clone();
+        let notify = write_complete.clone();
         let irq_iface = interface.clone();
 
         let irq_task = tokio::spawn(async move {
-            interrupt_poller(irq_iface, irq_in_ep, notify_clone).await;
+            interrupt_poller(irq_iface, irq_in_ep, notify).await;
         });
 
         Self {
@@ -50,7 +50,7 @@ impl UsbTransport {
     }
 }
 
-async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, write_complete: Arc<Notify>) {
+async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, notify: Arc<Notify>) {
     let mut queue = interface.interrupt_in_queue(endpoint);
     loop {
         queue.submit(RequestBuffer::new(INTERRUPT_BUF_LEN));
@@ -60,7 +60,7 @@ async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, write_comple
                 let flags = completion.data.first().copied().unwrap_or(0);
                 debug!(flags = ?format_args!("{:#04x}", flags), "interrupt");
                 if flags & (1 << AIF_WRITE_COMPLETE_BN) != 0 {
-                    write_complete.notify_one();
+                    notify.notify_one();
                 }
             }
             Err(e) => {
@@ -131,6 +131,17 @@ impl Transport for UsbTransport {
         .context("timeout waiting for write-complete interrupt")?;
         Ok(())
     }
+
+    async fn drain_write_complete(&self) {
+        // Consume any pending notification without waiting. `notified` without
+        // `.await` doesn't consume; but a quick poll+ready check via a 0ms
+        // timeout does. Notify permits cap at 1, so one drain is enough.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(0),
+            self.write_complete.notified(),
+        )
+        .await;
+    }
 }
 
 /// Find an 82357B device in either pre-firmware or post-firmware state.
@@ -156,23 +167,33 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
          See blacklist instructions in README.md",
     )?;
 
-    // Clear any residual halt condition on the bulk pipes before first use.
+    // Clear residual halt conditions on the bulk pipes before first use.
     let _ = interface.clear_halt(EP_BULK_IN);
     let _ = interface.clear_halt(EP_82357B_BULK_OUT);
 
-    // Drain any stale bulk-in data from a previous session. If nothing is
-    // pending, the transfer times out quickly and we discard the empty buffer.
-    let drain = async {
-        let mut queue = interface.bulk_in_queue(EP_BULK_IN);
-        queue.submit(nusb::transfer::RequestBuffer::new(0x40));
-        let completion = queue.next_complete().await;
-        if let Ok(()) = completion.status {
-            if !completion.data.is_empty() {
-                debug!(len = completion.data.len(), "drained stale bulk-in data");
+    // Drain any stale bulk-in data left over from a prior session. Retry a few
+    // times in case the data arrives slightly delayed. Each submit that times
+    // out is simply cancelled when its Queue drops.
+    for _ in 0..3 {
+        let drain = async {
+            let mut queue = interface.bulk_in_queue(EP_BULK_IN);
+            queue.submit(nusb::transfer::RequestBuffer::new(0x40));
+            let completion = queue.next_complete().await;
+            if let Ok(()) = completion.status {
+                if !completion.data.is_empty() {
+                    debug!(len = completion.data.len(), "drained stale bulk-in data");
+                    return true;
+                }
             }
+            false
+        };
+        let got_data = tokio::time::timeout(std::time::Duration::from_millis(100), drain)
+            .await
+            .unwrap_or(false);
+        if !got_data {
+            break;
         }
-    };
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), drain).await;
+    }
 
     Ok(UsbTransport::new(
         device,

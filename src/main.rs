@@ -42,14 +42,30 @@ async fn main() -> Result<()> {
     info!("USB device open");
 
     let mut ctrl = gpibd::gpib::GpibController::new(transport, args.timeout_ms);
-    info!("issuing startup abort");
-    match ctrl.abort(true).await {
-        Ok(()) => info!("startup abort: ok"),
-        Err(e) => info!("startup abort: {e:#}"),
+
+    // Try up to 3 times: abort -> init. If init fails it's usually because
+    // the device is holding stale state from a prior session; another abort
+    // (flush + finalize) typically unsticks it.
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        let _ = ctrl.abort(true).await; // flush pending
+        let _ = ctrl.abort(false).await; // finalize
+        match ctrl.init(0).await {
+            Ok(()) => {
+                info!("GPIB controller initialized (attempt {attempt})");
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("init attempt {attempt} failed: {e:#}");
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
     }
-    info!("running init");
-    ctrl.init(0).await?;
-    info!("GPIB controller initialized");
+    if let Some(e) = last_err {
+        return Err(e);
+    }
 
     let listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
     info!("listening on {}:{}", args.bind, args.port);
