@@ -1,7 +1,14 @@
 # gpibd
 
 Userspace Rust daemon for the Agilent/Keysight 82357B USB-to-GPIB adapter.
-Exposes a Prologix-compatible TCP server on port 1234 (configurable).
+Exposes two TCP front-ends against the same bus:
+
+- **Prologix-compatible** ASCII protocol on port 1234 (configurable)
+- **HiSLIP** (IVI-6.1) on port 4880 (the IANA-assigned HiSLIP port)
+
+Use HiSLIP with pyvisa/NI-VISA for proper `TCPIP::...::INSTR` resource
+strings with locking, clear, trigger, and REN. Use the Prologix port for
+existing scripts written against `prologix-gpib-async` or raw sockets.
 
 ## Requirements
 
@@ -36,8 +43,21 @@ sudo modprobe -r agilent_82357a
 
 ## PyVISA usage
 
-Use `TCPIP::...::SOCKET` (not `::INSTR` — that speaks VXI-11 which we don't
-implement):
+### HiSLIP (recommended)
+
+```python
+import pyvisa
+rm = pyvisa.ResourceManager("@py")
+# Subaddress encodes the GPIB primary address (e.g. "gpib0,15" or "hislip0,15").
+inst = rm.open_resource("TCPIP::localhost::hislip0,15::INSTR")
+print(inst.query("*IDN?"))
+```
+
+The HiSLIP server accepts subaddresses of the form `hislip0`, `hislip0,N`,
+`gpib0,N`, or a bare `N`. If no PAD is encoded, the default from
+`--hislip-default-pad` (default 14) is used.
+
+### Prologix (legacy)
 
 ```python
 import pyvisa
@@ -72,3 +92,7 @@ Stubbed (no-op or constant response): `++srq`, `++spoll`, `++llo`, `++loc`,
 The daemon is GPL-3.0-or-later. The firmware blob under `firmware/` is
 redistributed from https://github.com/fmhess/linux_gpib_firmware; see
 `firmware/LICENSE` for its terms.
+
+The HiSLIP message codec and protocol definitions in `src/hislip/` are
+adapted from [lxi-rs](https://github.com/Atmelfan/lxi-rs) (GPL-3.0-or-later,
+© Gustav Palmqvist).
