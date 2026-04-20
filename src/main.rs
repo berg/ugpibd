@@ -1,22 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 gpibd contributors
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+use gpibd::hislip;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "gpibd",
-    about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix-compatible)"
+    about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix + HiSLIP compatible)"
 )]
 struct Args {
     /// TCP port for the Prologix-compatible server
     #[arg(long, default_value_t = 1234)]
     port: u16,
+
+    /// TCP port for the HiSLIP server (set to 0 to disable)
+    #[arg(long, default_value_t = hislip::STANDARD_PORT)]
+    hislip_port: u16,
 
     /// Bind address
     #[arg(long, default_value = "0.0.0.0")]
@@ -25,6 +34,11 @@ struct Args {
     /// GPIB timeout in milliseconds
     #[arg(long, default_value_t = 3000)]
     timeout_ms: u32,
+
+    /// Default GPIB primary address for HiSLIP clients that do not encode
+    /// one in their subaddress (e.g. the bare "hislip0" subaddress).
+    #[arg(long, default_value_t = 14)]
+    hislip_default_pad: u8,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -67,8 +81,18 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    let listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
-    info!("listening on {}:{}", args.bind, args.port);
+    let ctrl = Arc::new(Mutex::new(ctrl));
+
+    let prologix_listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
+    info!("prologix listening on {}:{}", args.bind, args.port);
+
+    let hislip_listener = if args.hislip_port != 0 {
+        let l = TcpListener::bind(format!("{}:{}", args.bind, args.hislip_port)).await?;
+        info!("hislip listening on {}:{}", args.bind, args.hislip_port);
+        Some(l)
+    } else {
+        None
+    };
 
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let ctrl_c = async {
@@ -77,8 +101,31 @@ async fn main() -> Result<()> {
             .expect("failed to install Ctrl-C handler");
     };
 
+    let prologix_ctrl = ctrl.clone();
+    let hislip_ctrl = ctrl.clone();
+    let default_pad = args.hislip_default_pad;
+
+    let hislip_fut = async move {
+        match hislip_listener {
+            Some(listener) => {
+                let device_for = move |subaddr: &str| {
+                    let pad = hislip::server::parse_subaddress_pad(subaddr).unwrap_or(default_pad);
+                    let dev: Arc<dyn hislip::server::Device> = Arc::new(
+                        hislip::instrument::GpibInstrument::new(hislip_ctrl.clone(), pad),
+                    );
+                    Some(dev)
+                };
+                hislip::server::run(listener, hislip::server::Config::default(), device_for)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            None => std::future::pending::<Result<()>>().await,
+        }
+    };
+
     tokio::select! {
-        result = gpibd::server::run(listener, ctrl) => result?,
+        result = gpibd::server::run(prologix_listener, prologix_ctrl) => result?,
+        result = hislip_fut => result?,
         _ = ctrl_c => info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
     }

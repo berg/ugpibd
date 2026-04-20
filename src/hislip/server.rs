@@ -544,7 +544,7 @@ where
                 let res = match msg.control_code {
                     0 | 2 | 6 => entry.device.set_remote(false).await,
                     1 => Ok(()),
-                    3 | 4 | 5 => entry.device.set_remote(true).await,
+                    3..=5 => entry.device.set_remote(true).await,
                     _ => {
                         send_nonfatal(
                             wr,
@@ -616,7 +616,7 @@ where
 /// embedded in the string.
 pub fn parse_subaddress_pad(sub: &str) -> Option<u8> {
     let s = sub.trim().trim_end_matches('\0');
-    let tail = s.rsplit(|c: char| c == ',' || c == ':').next().unwrap_or("");
+    let tail = s.rsplit([',', ':']).next().unwrap_or("");
     if let Ok(n) = tail.parse::<u8>() {
         if n <= 30 {
             return Some(n);

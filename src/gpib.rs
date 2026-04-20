@@ -4,25 +4,27 @@
 use crate::protocol::*;
 use anyhow::Result;
 
-#[allow(async_fn_in_trait)]
 pub trait Transport {
-    async fn write_bulk(&self, data: &[u8]) -> Result<()>;
-    async fn read_bulk(&self, max_len: usize) -> Result<Vec<u8>>;
+    fn write_bulk(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn read_bulk(
+        &self,
+        max_len: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
     /// Issue a vendor control-IN transfer (bmRequestType = 0xC0).
-    async fn control_in(
+    fn control_in(
         &self,
         request: u8,
         value: u16,
         index: u16,
         max_len: usize,
-    ) -> Result<Vec<u8>>;
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
     /// Block until the device signals write-complete via the interrupt endpoint.
     /// On a mock transport, this returns immediately.
-    async fn await_write_complete(&self) -> Result<()>;
+    fn await_write_complete(&self) -> impl std::future::Future<Output = Result<()>> + Send;
     /// Discard any pending write-complete interrupts so the next
     /// await_write_complete only sees interrupts that fire from now on.
     /// Called during error recovery to re-synchronize with the firmware.
-    async fn drain_write_complete(&self);
+    fn drain_write_complete(&self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 pub struct GpibController<T: Transport> {
@@ -230,6 +232,12 @@ impl<T: Transport> GpibController<T> {
     /// Send Selected Device Clear to `pad` (SDC = 0x04, preceded by addressing).
     pub async fn device_clear(&mut self, pad: u8) -> Result<()> {
         let cmd = [0x3f_u8, 0x40 + pad, 0x04]; // UNL, TAD(pad), SDC
+        self.send_command_bytes(&cmd).await
+    }
+
+    /// Send Group Execute Trigger to `pad` (GET = 0x08, addressed as listener).
+    pub async fn trigger(&mut self, pad: u8) -> Result<()> {
+        let cmd = [0x3f_u8, 0x20 + pad, 0x08]; // UNL, LAD(pad), GET
         self.send_command_bytes(&cmd).await
     }
 

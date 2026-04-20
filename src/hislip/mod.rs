@@ -8,6 +8,7 @@
 // GPL-3.0-or-later. Original author: Gustav Palmqvist.
 
 pub mod errors;
+pub mod instrument;
 pub mod messages;
 pub mod protocol;
 pub mod server;

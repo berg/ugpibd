@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 gpibd contributors
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::gpib::{GpibController, Transport};
 use crate::prologix::{LineResult, PrologixState};
 
 /// Run the TCP server. Accepts one connection at a time.
-pub async fn run<T: Transport>(listener: TcpListener, mut ctrl: GpibController<T>) -> Result<()> {
+pub async fn run<T: Transport + Send + Sync + 'static>(
+    listener: TcpListener,
+    ctrl: Arc<Mutex<GpibController<T>>>,
+) -> Result<()> {
     info!(
         "Prologix TCP server listening on {}",
         listener.local_addr()?
@@ -19,7 +25,7 @@ pub async fn run<T: Transport>(listener: TcpListener, mut ctrl: GpibController<T
     loop {
         let (mut stream, addr) = listener.accept().await?;
         info!(%addr, "client connected");
-        match handle_connection(&mut stream, &mut ctrl).await {
+        match handle_connection(&mut stream, &ctrl).await {
             Ok(()) => info!(%addr, "client disconnected"),
             Err(e) => warn!(%addr, "client error: {e:#}"),
         }
@@ -28,7 +34,7 @@ pub async fn run<T: Transport>(listener: TcpListener, mut ctrl: GpibController<T
 
 async fn handle_connection<T: Transport>(
     stream: &mut TcpStream,
-    ctrl: &mut GpibController<T>,
+    ctrl: &Arc<Mutex<GpibController<T>>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut lines = BufReader::new(reader).lines();
@@ -54,13 +60,15 @@ async fn handle_connection<T: Transport>(
                 send_eoi,
                 auto_read,
             } => {
-                if let Err(e) = ctrl.write(pad, &data, send_eoi).await {
+                let mut c = ctrl.lock().await;
+                if let Err(e) = c.write(pad, &data, send_eoi).await {
                     warn!("gpib write failed: {e:#}");
                     continue;
                 }
                 if auto_read {
-                    match ctrl.read(pad, 65536).await {
+                    match c.read(pad, 65536).await {
                         Ok((resp, _eom)) => {
+                            drop(c);
                             let resp = state.apply_eot(resp);
                             debug!("> {} bytes", resp.len());
                             writer.write_all(&resp).await?;
@@ -69,26 +77,29 @@ async fn handle_connection<T: Transport>(
                     }
                 }
             }
-            LineResult::Read { .. } => match ctrl.read(state.addr, 65536).await {
-                Ok((resp, _eom)) => {
-                    let resp = state.apply_eot(resp);
-                    debug!("> {} bytes", resp.len());
-                    writer.write_all(&resp).await?;
+            LineResult::Read { .. } => {
+                let res = ctrl.lock().await.read(state.addr, 65536).await;
+                match res {
+                    Ok((resp, _eom)) => {
+                        let resp = state.apply_eot(resp);
+                        debug!("> {} bytes", resp.len());
+                        writer.write_all(&resp).await?;
+                    }
+                    Err(e) => warn!("gpib read failed: {e:#}"),
                 }
-                Err(e) => warn!("gpib read failed: {e:#}"),
-            },
+            }
             LineResult::DeviceClear { pad } => {
-                if let Err(e) = ctrl.device_clear(pad).await {
+                if let Err(e) = ctrl.lock().await.device_clear(pad).await {
                     warn!("gpib device_clear failed: {e:#}");
                 }
             }
             LineResult::Ifc => {
-                if let Err(e) = ctrl.ifc().await {
+                if let Err(e) = ctrl.lock().await.ifc().await {
                     warn!("gpib ifc failed: {e:#}");
                 }
             }
             LineResult::Reset => {
-                if let Err(e) = ctrl.init(0).await {
+                if let Err(e) = ctrl.lock().await.init(0).await {
                     warn!("gpib reset/init failed: {e:#}");
                 }
                 state = PrologixState::default();
