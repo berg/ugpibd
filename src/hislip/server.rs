@@ -611,13 +611,37 @@ where
     }
 }
 
-/// Parse a HiSLIP subaddress (e.g. "hislip0", "gpib0,14", "14") into an
-/// optional GPIB primary address. Returns `None` if no numeric PAD is
-/// embedded in the string.
+/// Parse a HiSLIP subaddress into an optional GPIB primary address.
+///
+/// Supported forms:
+/// - `hislip<N>` / `gpib<N>` / `inst<N>` — trailing digits are the PAD
+/// - `<N>` — bare numeric subaddress
+/// - `foo,N` / `foo:N` — explicit separator form (PAD is after the last
+///   separator). Note: most VISA clients collapse `foo,N` into
+///   `sub_address=foo, port=N` before the string ever reaches us, so
+///   clients typically want the no-separator form.
+///
+/// The literal `hislip0` and `gpib0` stay reserved for "use the
+/// daemon-configured default PAD" so existing scripts that treat
+/// `TCPIP::host::hislip0::INSTR` as a generic handle still work.
 pub fn parse_subaddress_pad(sub: &str) -> Option<u8> {
     let s = sub.trim().trim_end_matches('\0');
-    let tail = s.rsplit([',', ':']).next().unwrap_or("");
-    if let Ok(n) = tail.parse::<u8>() {
+    if s.is_empty() || s.eq_ignore_ascii_case("hislip0") || s.eq_ignore_ascii_case("gpib0") {
+        return None;
+    }
+    let tail = s.rsplit([',', ':']).next().unwrap_or(s);
+    let digits: String = tail
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if let Ok(n) = digits.parse::<u8>() {
         if n <= 30 {
             return Some(n);
         }
@@ -631,12 +655,23 @@ mod tests {
 
     #[test]
     fn parse_pad() {
+        // pyvisa-compatible no-separator forms
+        assert_eq!(parse_subaddress_pad("hislip14"), Some(14));
+        assert_eq!(parse_subaddress_pad("hislip16"), Some(16));
+        assert_eq!(parse_subaddress_pad("gpib7"), Some(7));
+        assert_eq!(parse_subaddress_pad("inst3"), Some(3));
+        // bare numeric
+        assert_eq!(parse_subaddress_pad("14"), Some(14));
+        // explicit-separator forms (for clients that don't strip commas)
         assert_eq!(parse_subaddress_pad("gpib0,14"), Some(14));
         assert_eq!(parse_subaddress_pad("hislip0,7"), Some(7));
-        assert_eq!(parse_subaddress_pad("14"), Some(14));
+        // reserved defaults
         assert_eq!(parse_subaddress_pad("hislip0"), None);
-        assert_eq!(parse_subaddress_pad("gpib0,31"), None); // out of range
+        assert_eq!(parse_subaddress_pad("gpib0"), None);
         assert_eq!(parse_subaddress_pad(""), None);
+        // out of range
+        assert_eq!(parse_subaddress_pad("gpib0,31"), None);
+        assert_eq!(parse_subaddress_pad("hislip31"), None);
     }
 
     #[test]

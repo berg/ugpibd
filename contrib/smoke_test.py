@@ -47,11 +47,11 @@ def _trim(s: str) -> str:
 
 def test_hislip(host: str, port: int, pad: int, query: Optional[str], timeout_ms: int) -> Result:
     rm = pyvisa.ResourceManager("@py")
-    resource = f"TCPIP::{host}::hislip0,{pad}::INSTR"
+    # NOTE: pyvisa-py treats "hislip0,N" as "sub_address=hislip0, port=N"
+    # (see pyvisa_py/tcpip.py). We encode the PAD into the sub_address
+    # itself ("hislip<PAD>") so pyvisa-py sends it to us verbatim.
+    resource = f"TCPIP::{host}::hislip{pad}::INSTR"
     if port != 4880:
-        # pyvisa-py doesn't accept a non-default port in the resource
-        # string; it always connects to 4880. Warn if the user asked for
-        # something else.
         print(f"WARNING: HiSLIP port {port} requested but pyvisa-py will use 4880", file=sys.stderr)
     print(f"[hislip]   open {resource}")
     try:

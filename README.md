@@ -48,14 +48,19 @@ sudo modprobe -r agilent_82357a
 ```python
 import pyvisa
 rm = pyvisa.ResourceManager("@py")
-# Subaddress encodes the GPIB primary address (e.g. "gpib0,15" or "hislip0,15").
-inst = rm.open_resource("TCPIP::localhost::hislip0,15::INSTR")
+# Sub-address encodes the GPIB primary address: "hislip<PAD>".
+inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")
 print(inst.query("*IDN?"))
 ```
 
-The HiSLIP server accepts subaddresses of the form `hislip0`, `hislip0,N`,
-`gpib0,N`, or a bare `N`. If no PAD is encoded, the default from
-`--hislip-default-pad` (default 14) is used.
+The HiSLIP server accepts sub-addresses of the form `hislip<N>`,
+`gpib<N>`, or a bare `<N>`. A bare `hislip0` / `gpib0` means "use the
+daemon's configured default PAD" (`--hislip-default-pad`, default 14).
+
+Why no comma in the sub-address: pyvisa-py parses
+`hislip0,15` as `sub_address=hislip0, port=15` — it would try to open
+TCP port 15 rather than passing 15 through to the server. Embedding the
+PAD in the sub-address itself (`hislip15`) avoids that.
 
 ### Prologix (legacy)
 
