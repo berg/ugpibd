@@ -24,6 +24,9 @@ anyhow = "1"
 thiserror = "2"
 bytes = "1"
 rustyline = "18"
+byteorder = "1.4"
+bitfield = "0.14"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

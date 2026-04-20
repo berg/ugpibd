@@ -2,6 +2,7 @@
 // Copyright (C) 2026 gpibd contributors
 pub mod firmware;
 pub mod gpib;
+pub mod hislip;
 pub mod prologix;
 pub mod protocol;
 pub mod server;
