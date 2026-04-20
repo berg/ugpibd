@@ -64,7 +64,6 @@ async fn handle_connection<T: Transport>(
                             let resp = state.apply_eot(resp);
                             debug!("> {} bytes", resp.len());
                             writer.write_all(&resp).await?;
-                            writer.write_all(b"\n").await?;
                         }
                         Err(e) => warn!("gpib read failed: {e:#}"),
                     }
@@ -75,7 +74,6 @@ async fn handle_connection<T: Transport>(
                     let resp = state.apply_eot(resp);
                     debug!("> {} bytes", resp.len());
                     writer.write_all(&resp).await?;
-                    writer.write_all(b"\n").await?;
                 }
                 Err(e) => warn!("gpib read failed: {e:#}"),
             },
