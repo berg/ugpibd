@@ -39,17 +39,30 @@ struct Args {
     /// one in their subaddress (e.g. the bare "hislip0" subaddress).
     #[arg(long, default_value_t = 14)]
     hislip_default_pad: u8,
+
+    /// Increase log verbosity: -v enables debug (dumps HiSLIP cmd/response
+    /// bytes with non-printables escaped), -vv enables trace. Ignored if
+    /// RUST_LOG is set in the environment.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("gpibd=info"));
+    let args = Args::parse();
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let level = match args.verbose {
+            0 => "gpibd=info",
+            1 => "gpibd=debug",
+            _ => "gpibd=trace",
+        };
+        EnvFilter::new(level)
+    });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
-
-    let args = Args::parse();
 
     info!("gpibd starting — looking for 82357B");
     let transport = gpibd::usb::initialize_device(args.timeout_ms).await?;

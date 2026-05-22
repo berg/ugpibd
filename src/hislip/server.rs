@@ -368,10 +368,31 @@ where
                 }
                 let cmd = std::mem::take(&mut buffer);
                 let expect_response = cmd.contains(&b'?');
+                debug!(
+                    "exec ({} bytes, expect_response={}): {}",
+                    cmd.len(),
+                    expect_response,
+                    escape_bytes(&cmd)
+                );
                 let resp = match entry.device.execute(&cmd, expect_response).await {
-                    Ok(r) => r,
+                    Ok(r) => {
+                        match &r {
+                            Some(data) => debug!(
+                                "resp ({} bytes): {}",
+                                data.len(),
+                                escape_bytes(data)
+                            ),
+                            None => debug!("resp: (write-only, no read attempted)"),
+                        }
+                        r
+                    }
                     Err(e) => {
-                        warn!("device execute failed: {e:#}");
+                        warn!(
+                            "device execute failed for cmd ({} bytes, expect_response={}) {:?}: {e:#}",
+                            cmd.len(),
+                            expect_response,
+                            escape_bytes_truncated(&cmd, 120),
+                        );
                         send_nonfatal(
                             wr,
                             NonFatalErrorCode::UnidentifiedError,
@@ -649,6 +670,35 @@ pub fn parse_subaddress_pad(sub: &str) -> Option<u8> {
     None
 }
 
+/// Render bytes as a single-line string with non-printable bytes escaped as
+/// `\xNN`. Common control characters get C-style escapes (`\n \r \t \\`) so
+/// SCPI traffic stays readable in the log. Used by the `-v` HiSLIP cmd/response
+/// dump.
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\n' => s.push_str("\\n"),
+            b'\r' => s.push_str("\\r"),
+            b'\t' => s.push_str("\\t"),
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    s
+}
+
+fn escape_bytes_truncated(bytes: &[u8], max: usize) -> String {
+    if bytes.len() <= max {
+        escape_bytes(bytes)
+    } else {
+        let mut s = escape_bytes(&bytes[..max]);
+        s.push_str(&format!("… (+{} bytes)", bytes.len() - max));
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +727,27 @@ mod tests {
     #[test]
     fn standard_port_is_4880() {
         assert_eq!(super::super::STANDARD_PORT, 4880);
+    }
+
+    #[test]
+    fn escape_keeps_printable_and_escapes_controls() {
+        assert_eq!(escape_bytes(b"*IDN?"), "*IDN?");
+        assert_eq!(escape_bytes(b"hi\nthere\r\n"), "hi\\nthere\\r\\n");
+        assert_eq!(escape_bytes(b"tab\there"), "tab\\there");
+        assert_eq!(escape_bytes(b"back\\slash"), "back\\\\slash");
+        // 0x01 is non-printable, no shortcut → \x01
+        assert_eq!(escape_bytes(&[0x01, b'A', 0xff]), "\\x01A\\xff");
+        // 0x7e (~) is the last printable, 0x7f (DEL) is not
+        assert_eq!(escape_bytes(&[0x7e, 0x7f]), "~\\x7f");
+    }
+
+    #[test]
+    fn escape_truncated_appends_suffix() {
+        assert_eq!(escape_bytes_truncated(b"abcdef", 10), "abcdef");
+        assert_eq!(escape_bytes_truncated(b"abcdef", 6), "abcdef");
+        assert_eq!(
+            escape_bytes_truncated(b"abcdefghij", 4),
+            "abcd… (+6 bytes)"
+        );
     }
 }
