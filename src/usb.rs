@@ -50,24 +50,68 @@ impl UsbTransport {
     }
 }
 
+/// What the interrupt poller should do after a failed transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollerAction {
+    /// Clear the endpoint halt, back off, and resubmit — the error is
+    /// transient (idle/not-responding, stall, or a one-off fault).
+    Recover,
+    /// Stop the poller: the queue was cancelled (shutdown) or the device is
+    /// gone, neither of which resubmitting can fix.
+    Stop,
+}
+
+/// Decide how to react to an interrupt-endpoint transfer error.
+fn classify_error(e: &nusb::transfer::TransferError) -> PollerAction {
+    use nusb::transfer::TransferError::*;
+    match e {
+        Cancelled | Disconnected => PollerAction::Stop,
+        // `Unknown` is the macOS IOKit catch-all (e.g. kIOReturnNotResponding
+        // after the bus goes idle); `Stall`/`Fault` clear with a halt reset.
+        Stall | Fault | Unknown => PollerAction::Recover,
+    }
+}
+
+/// Backoff bounds for recovering the interrupt endpoint after a transient
+/// error. Starts short so a single idle hiccup re-arms almost immediately,
+/// and caps so a persistently failing endpoint doesn't hot-loop.
+const IRQ_RECOVER_MIN: std::time::Duration = std::time::Duration::from_millis(50);
+const IRQ_RECOVER_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, notify: Arc<Notify>) {
-    let mut queue = interface.interrupt_in_queue(endpoint);
-    loop {
-        queue.submit(RequestBuffer::new(INTERRUPT_BUF_LEN));
-        let completion = queue.next_complete().await;
-        match completion.status {
-            Ok(_) => {
-                let flags = completion.data.first().copied().unwrap_or(0);
-                debug!(flags = ?format_args!("{:#04x}", flags), "interrupt");
-                if flags & (1 << AIF_WRITE_COMPLETE_BN) != 0 {
-                    notify.notify_one();
+    let mut backoff = IRQ_RECOVER_MIN;
+    'recover: loop {
+        let mut queue = interface.interrupt_in_queue(endpoint);
+        loop {
+            queue.submit(RequestBuffer::new(INTERRUPT_BUF_LEN));
+            let completion = queue.next_complete().await;
+            match completion.status {
+                Ok(_) => {
+                    backoff = IRQ_RECOVER_MIN; // healthy again; reset backoff
+                    let flags = completion.data.first().copied().unwrap_or(0);
+                    debug!(flags = ?format_args!("{:#04x}", flags), "interrupt");
+                    if flags & (1 << AIF_WRITE_COMPLETE_BN) != 0 {
+                        notify.notify_one();
+                    }
                 }
-            }
-            Err(e) => {
-                warn!("interrupt endpoint error: {e} — stopping poller");
-                break;
+                Err(e) => match classify_error(&e) {
+                    PollerAction::Stop => {
+                        warn!("interrupt endpoint error: {e} — stopping poller");
+                        break 'recover;
+                    }
+                    PollerAction::Recover => {
+                        warn!("interrupt endpoint error: {e} — recovering in {backoff:?}");
+                        break; // drop the queue, then clear halt + back off
+                    }
+                },
             }
         }
+
+        // Recovery: drop the stale queue (done above), clear any halt the
+        // device may have raised, wait out the backoff, then resubmit.
+        let _ = interface.clear_halt(endpoint);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(IRQ_RECOVER_MAX);
     }
 }
 
@@ -329,5 +373,39 @@ async fn wait_for_renumeration(old_bus: u8, old_addr: u8) -> Result<(nusb::Devic
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_error, PollerAction};
+    use nusb::transfer::TransferError;
+
+    #[test]
+    fn transient_errors_recover() {
+        // The macOS IOKit backend collapses idle/not-responding/timeout into
+        // `Unknown`; a stall or transient fault is likewise recoverable by
+        // clearing the halt and resubmitting. None of these may kill the
+        // poller — that's the "must restart gpibd after idle" bug.
+        assert_eq!(
+            classify_error(&TransferError::Unknown),
+            PollerAction::Recover
+        );
+        assert_eq!(classify_error(&TransferError::Stall), PollerAction::Recover);
+        assert_eq!(classify_error(&TransferError::Fault), PollerAction::Recover);
+    }
+
+    #[test]
+    fn terminal_errors_stop() {
+        // Cancelled means the queue was dropped (shutdown); Disconnected means
+        // the device is physically gone — neither is fixable by resubmitting.
+        assert_eq!(
+            classify_error(&TransferError::Cancelled),
+            PollerAction::Stop
+        );
+        assert_eq!(
+            classify_error(&TransferError::Disconnected),
+            PollerAction::Stop
+        );
     }
 }
