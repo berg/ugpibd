@@ -78,7 +78,45 @@ inst.write("++auto 1")
 print(inst.query("*IDN?"))
 ```
 
+## Interactive `scpi` client
+
+`scpi` is a small REPL bundled with the daemon. It speaks **HiSLIP** to
+`gpibd` (the same transport pyvisa uses), so it does not need the Prologix
+port.
+
+```bash
+# Talk to the instrument at GPIB primary address 15:
+scpi --addr 15
+# Or omit --addr to use the daemon's default PAD (sub-address hislip0):
+scpi --host bench-pi --port 4880
+```
+
+Each line is a request/response round-trip: a line containing `?` is sent as
+a query and its reply is printed; any other line is written without reading.
+`--addr N` is encoded as the HiSLIP sub-address `hislip<N>` at connect time;
+the address is fixed for the session.
+
+Meta-commands map to HiSLIP control operations:
+
+| Command | Action |
+|---------|--------|
+| `++clr` | Selected Device Clear |
+| `++trg` | GPIB trigger (GET) |
+| `++ren <0\|1>` | REN off / on |
+| `++status` | print the serial-poll status byte |
+| `++help` | list meta-commands |
+
+Non-TTY stdin is supported for scripting:
+
+```bash
+printf '++ren 1\n*RST\n*IDN?\n' | scpi --addr 15
+```
+
 ## Supported `++` commands
+
+The following applies to the **Prologix** server (port 1234), not the
+`scpi` client above.
+
 
 Implemented: `++addr`, `++auto`, `++read`, `++eoi`, `++eos`, `++eot_enable`,
 `++eot_char`, `++read_tmo_ms`, `++clr`, `++ifc`, `++rst`, `++ver`, `++mode`.

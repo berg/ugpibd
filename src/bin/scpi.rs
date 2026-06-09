@@ -1,38 +1,42 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 gpibd contributors
 //
-// Interactive SCPI/Prologix CLI. Connects to gpibd over TCP and forwards stdin
-// lines verbatim; server replies stream to stdout from a reader thread.
-// Uses rustyline for line editing + history.
+// Interactive SCPI CLI. Connects to gpibd over HiSLIP (IVI-6.1) and runs a
+// request/response REPL: queries (lines containing `?`) print the
+// instrument's reply, plain commands are written, and a small set of `++`
+// meta-commands map to HiSLIP control operations. Uses rustyline for line
+// editing + history.
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use gpibd::hislip::client::HislipClient;
+use gpibd::hislip::STANDARD_PORT;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
-use rustyline::{Config, Editor, ExternalPrinter};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::net::TcpStream;
+use rustyline::{Config, Editor};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
-use std::thread;
+use tokio::runtime::{Builder, Runtime};
+
+/// Vendor id the client advertises in the HiSLIP Initialize handshake.
+const CLIENT_VENDOR_ID: u16 = 0xBEEF;
 
 #[derive(Parser)]
-#[command(name = "scpi", about = "Interactive SCPI/Prologix TCP client for gpibd")]
+#[command(name = "scpi", about = "Interactive SCPI client for gpibd (HiSLIP)")]
 struct Args {
     /// gpibd host
     #[arg(long, default_value = "localhost")]
     host: String,
 
-    /// gpibd port
-    #[arg(long, default_value_t = 1234)]
+    /// gpibd HiSLIP port
+    #[arg(long, default_value_t = STANDARD_PORT)]
     port: u16,
 
-    /// Initial GPIB address to select (sends `++addr N` on connect)
+    /// GPIB primary address to talk to. Encoded as the HiSLIP sub-address
+    /// `hislip<N>` at connect time. Omit to use the daemon's default PAD
+    /// (sub-address `hislip0`).
     #[arg(long)]
     addr: Option<u8>,
-
-    /// Enable auto-read (`++auto 1`) on startup
-    #[arg(long)]
-    auto: bool,
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -54,41 +58,113 @@ fn main() -> Result<()> {
     }));
 
     let args = Args::parse();
-    let target = format!("{}:{}", args.host, args.port);
-    let stream = TcpStream::connect(&target)
-        .with_context(|| format!("failed to connect to {target}"))?;
-    let interactive = std::io::stdin().is_terminal();
-    if interactive {
-        eprintln!("[connected to {target}]  (Ctrl-D to quit)");
-    } else {
-        eprintln!("[connected to {target}]");
-    }
-
-    let mut writer = stream.try_clone().context("clone stream for writer")?;
-    let send = |w: &mut TcpStream, s: &str| -> Result<()> {
-        w.write_all(s.as_bytes())?;
-        w.write_all(b"\n")?;
-        w.flush()?;
-        Ok(())
+    let subaddress = match args.addr {
+        Some(n) => format!("hislip{n}"),
+        None => gpibd::hislip::DEFAULT_SUBADDRESS.to_string(),
     };
 
-    // Startup setup.
-    send(&mut writer, "++mode 1")?;
-    if let Some(a) = args.addr {
-        send(&mut writer, &format!("++addr {a}"))?;
-    }
-    if args.auto {
-        send(&mut writer, "++auto 1")?;
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("create tokio runtime")?;
+    let mut client = rt
+        .block_on(HislipClient::connect(
+            &args.host,
+            args.port,
+            &subaddress,
+            CLIENT_VENDOR_ID,
+        ))
+        .with_context(|| format!("connect to {}:{}", args.host, args.port))?;
+
+    let target = format!("{}:{}", args.host, args.port);
+    let interactive = std::io::stdin().is_terminal();
+    if interactive {
+        eprintln!("[connected to {target} as {subaddress}]  (Ctrl-D to quit)");
+    } else {
+        eprintln!("[connected to {target} as {subaddress}]");
     }
 
     if interactive {
-        run_interactive(stream, writer)
+        run_interactive(&rt, &mut client)
     } else {
-        run_batch(stream, writer)
+        run_batch(&rt, &mut client)
     }
 }
 
-fn run_interactive(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
+/// Outcome of handling one input line.
+enum Step {
+    /// Line handled; continue the REPL.
+    Continue,
+    /// The connection is gone; stop the REPL.
+    Disconnected,
+}
+
+/// Execute one input line against the instrument, printing any output.
+fn handle_line(rt: &Runtime, client: &mut HislipClient, line: &str) -> Step {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Step::Continue;
+    }
+
+    let result: Result<()> = if let Some(rest) = trimmed.strip_prefix("++") {
+        handle_meta(rt, client, rest)
+    } else if trimmed.contains('?') {
+        rt.block_on(client.query(trimmed.as_bytes()))
+            .map(|resp| print_response(&resp))
+    } else {
+        rt.block_on(client.write(trimmed.as_bytes()))
+    };
+
+    if let Err(e) = result {
+        eprintln!("[error: {e:#}]");
+        // An I/O error means the socket is gone; nothing more will work.
+        if e.chain().any(|c| c.is::<std::io::Error>()) {
+            return Step::Disconnected;
+        }
+    }
+    Step::Continue
+}
+
+/// Handle a `++` meta-command (the part after `++`).
+fn handle_meta(rt: &Runtime, client: &mut HislipClient, rest: &str) -> Result<()> {
+    let mut parts = rest.split_whitespace();
+    let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
+    let arg = parts.next();
+    match cmd.as_str() {
+        "clr" | "cls" => rt.block_on(client.clear()),
+        "trg" => rt.block_on(client.trigger()),
+        "ren" => {
+            let on = match arg {
+                Some("0") | Some("off") => false,
+                Some("1") | Some("on") | None => true,
+                Some(other) => anyhow::bail!("++ren expects 0/1/on/off, got {other:?}"),
+            };
+            rt.block_on(client.remote(on))
+        }
+        "status" | "stb" | "spoll" => {
+            let stb = rt.block_on(client.status())?;
+            println!("{stb}");
+            Ok(())
+        }
+        "help" => {
+            eprintln!("meta-commands: ++clr ++trg ++ren <0|1> ++status ++help");
+            Ok(())
+        }
+        other => anyhow::bail!("unknown meta-command ++{other} (try ++help)"),
+    }
+}
+
+/// Print an instrument response to stdout, ensuring a trailing newline.
+fn print_response(resp: &[u8]) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(resp);
+    if !resp.ends_with(b"\n") {
+        let _ = out.write_all(b"\n");
+    }
+    let _ = out.flush();
+}
+
+fn run_interactive(rt: &Runtime, client: &mut HislipClient) -> Result<()> {
     let mut rl: Editor<(), FileHistory> =
         Editor::with_config(Config::builder().auto_add_history(true).build())?;
 
@@ -97,48 +173,13 @@ fn run_interactive(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
         let _ = rl.load_history(p);
     }
 
-    let mut printer = rl.create_external_printer()?;
-    thread::spawn(move || {
-        let mut reader = BufReader::new(read_side);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    let _ = printer.print(
-                        "[server closed connection — press Enter or Ctrl-D to exit]\n".into(),
-                    );
-                    return;
-                }
-                Ok(_) => {
-                    let _ = printer.print(line.clone());
-                }
-                Err(e) => {
-                    let _ = printer.print(format!("[read error: {e}]\n"));
-                    return;
-                }
-            }
-        }
-    });
-
     loop {
         match rl.readline("scpi> ") {
             Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if writer
-                    .write_all(trimmed.as_bytes())
-                    .and_then(|_| writer.write_all(b"\n"))
-                    .and_then(|_| writer.flush())
-                    .is_err()
-                {
-                    // Socket is gone; reader thread has already printed a
-                    // message. Exit cleanly so Editor::drop restores the terminal.
+                if let Step::Disconnected = handle_line(rt, client, &line) {
+                    eprintln!("[connection closed]");
                     break;
                 }
-                thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => {
@@ -158,34 +199,13 @@ fn run_interactive(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
     Ok(())
 }
 
-fn run_batch(read_side: TcpStream, mut writer: TcpStream) -> Result<()> {
-    // Simple non-TTY mode: stream stdin → socket, stream socket → stdout.
-    thread::spawn(move || {
-        let mut reader = BufReader::new(read_side);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => return,
-                Ok(_) => {
-                    print!("{line}");
-                    let _ = std::io::stdout().flush();
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
+fn run_batch(rt: &Runtime, client: &mut HislipClient) -> Result<()> {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line.context("stdin read")?;
-        if line.is_empty() {
-            continue;
+        if let Step::Disconnected = handle_line(rt, client, &line) {
+            break;
         }
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
     }
-    thread::sleep(std::time::Duration::from_millis(500));
     Ok(())
 }

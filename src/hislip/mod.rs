@@ -7,6 +7,7 @@
 // adapted from lxi-rs (https://github.com/Atmelfan/lxi-rs), which is
 // GPL-3.0-or-later. Original author: Gustav Palmqvist.
 
+pub mod client;
 pub mod errors;
 pub mod instrument;
 pub mod messages;
