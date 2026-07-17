@@ -123,7 +123,9 @@ pub async fn send_fatal<W: AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let m = msg.into();
     tracing::error!("hislip fatal: {m}");
-    Message::from(Error::Fatal(code, m)).write_to(writer).await?;
+    Message::from(Error::Fatal(code, m))
+        .write_to(writer)
+        .await?;
     writer.flush().await
 }
 

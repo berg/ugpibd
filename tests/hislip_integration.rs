@@ -56,14 +56,11 @@ fn init_param(protocol: u16, vendor: u16) -> u32 {
 }
 
 async fn read_msg(s: &mut BufStream<TcpStream>) -> Message {
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        Message::read_from(s, 1024 * 1024),
-    )
-    .await
-    .expect("read timeout")
-    .expect("io error")
-    .expect("protocol error")
+    tokio::time::timeout(Duration::from_secs(2), Message::read_from(s, 1024 * 1024))
+        .await
+        .expect("read timeout")
+        .expect("io error")
+        .expect("protocol error")
 }
 
 #[tokio::test]
@@ -93,9 +90,14 @@ async fn hislip_round_trip_idn_query() {
         .write_to(&mut async_ch)
         .await
         .unwrap();
-    tokio::io::AsyncWriteExt::flush(&mut async_ch).await.unwrap();
+    tokio::io::AsyncWriteExt::flush(&mut async_ch)
+        .await
+        .unwrap();
     let ainit_resp = read_msg(&mut async_ch).await;
-    assert_eq!(ainit_resp.message_type, MessageType::AsyncInitializeResponse);
+    assert_eq!(
+        ainit_resp.message_type,
+        MessageType::AsyncInitializeResponse
+    );
 
     // Sync channel: DataEnd("*IDN?") -> expect DataEnd with echoed IDN.
     MessageType::DataEnd
@@ -135,7 +137,9 @@ async fn hislip_async_lock_noop() {
         .write_to(&mut async_ch)
         .await
         .unwrap();
-    tokio::io::AsyncWriteExt::flush(&mut async_ch).await.unwrap();
+    tokio::io::AsyncWriteExt::flush(&mut async_ch)
+        .await
+        .unwrap();
     let _ = read_msg(&mut async_ch).await;
 
     // Request an exclusive lock (control_code != 0).
@@ -145,7 +149,9 @@ async fn hislip_async_lock_noop() {
         .write_to(&mut async_ch)
         .await
         .unwrap();
-    tokio::io::AsyncWriteExt::flush(&mut async_ch).await.unwrap();
+    tokio::io::AsyncWriteExt::flush(&mut async_ch)
+        .await
+        .unwrap();
 
     let resp = read_msg(&mut async_ch).await;
     assert_eq!(resp.message_type, MessageType::AsyncLockResponse);

@@ -377,11 +377,9 @@ where
                 let resp = match entry.device.execute(&cmd, expect_response).await {
                     Ok(r) => {
                         match &r {
-                            Some(data) => debug!(
-                                "resp ({} bytes): {}",
-                                data.len(),
-                                escape_bytes(data)
-                            ),
+                            Some(data) => {
+                                debug!("resp ({} bytes): {}", data.len(), escape_bytes(data))
+                            }
                             None => debug!("resp: (write-only, no read attempted)"),
                         }
                         r
@@ -595,8 +593,7 @@ where
                     .await?;
                 wr.flush().await?;
             }
-            MessageType::AsyncStartTLS
-            | MessageType::AsyncEndTLS
+            MessageType::AsyncStartTLS | MessageType::AsyncEndTLS
                 if entry.protocol >= super::protocol::PROTOCOL_2_0 =>
             {
                 send_fatal(
@@ -745,9 +742,6 @@ mod tests {
     fn escape_truncated_appends_suffix() {
         assert_eq!(escape_bytes_truncated(b"abcdef", 10), "abcdef");
         assert_eq!(escape_bytes_truncated(b"abcdef", 6), "abcdef");
-        assert_eq!(
-            escape_bytes_truncated(b"abcdefghij", 4),
-            "abcd… (+6 bytes)"
-        );
+        assert_eq!(escape_bytes_truncated(b"abcdefghij", 4), "abcd… (+6 bytes)");
     }
 }
