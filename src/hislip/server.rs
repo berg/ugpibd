@@ -37,7 +37,7 @@ use super::DEFAULT_SUBADDRESS;
 /// these on Initialize and then drives all per-session I/O through it.
 ///
 /// All methods are cancel-safe at the GPIB-bus level: the underlying
-/// [`crate::backend::agilent_82357b::gpib::GpibController`] serializes calls via its own mutex.
+/// [`crate::backend::agilent_82357::gpib::GpibController`] serializes calls via its own mutex.
 #[async_trait::async_trait]
 pub trait Device: Send + Sync + 'static {
     /// Execute a full query: write `cmd` to the instrument with EOI on the

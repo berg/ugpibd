@@ -422,7 +422,9 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
         self.timeout_ms = timeout_ms;
     }
     fn name(&self) -> &'static str {
-        "agilent-82357b"
+        // Family id: the shared controller is not told which model opened it.
+        // The specific backend id is available via the registry (BackendKind).
+        "agilent-82357"
     }
 }
 

@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use super::gpib::Transport;
 use super::protocol::*;
+use super::Model;
 
 pub struct UsbTransport {
     interface: nusb::Interface,
@@ -188,23 +189,33 @@ impl Transport for UsbTransport {
     }
 }
 
-/// Find an 82357B device in either pre-firmware or post-firmware state.
-pub fn find_device() -> Result<(nusb::DeviceInfo, u16)> {
+/// Find an adapter of `model` in either pre-firmware or post-firmware state.
+pub fn find_device(model: &Model) -> Result<(nusb::DeviceInfo, u16)> {
     let devices = nusb::list_devices().context("failed to list USB devices")?;
     for dev in devices {
         if dev.vendor_id() != USB_VID_AGILENT {
             continue;
         }
         let pid = dev.product_id();
-        if pid == USB_PID_82357B || pid == USB_PID_82357B_PREINIT {
+        if pid == model.pid_ready || pid == model.pid_preinit {
             return Ok((dev, pid));
         }
     }
-    anyhow::bail!("no Agilent/Keysight 82357B found (expected VID 0x0957, PID 0x0518 or 0x0718)")
+    anyhow::bail!(
+        "no {} found (expected VID {:#06x}, PID {:#06x} or {:#06x})",
+        model.id,
+        USB_VID_AGILENT,
+        model.pid_preinit,
+        model.pid_ready
+    )
 }
 
-/// Open device, claim interface 0, return UsbTransport wired to the 82357B endpoints.
-pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Result<UsbTransport> {
+/// Open device, claim interface 0, return UsbTransport wired to the model's endpoints.
+pub async fn open_transport(
+    model: &Model,
+    dev_info: nusb::DeviceInfo,
+    timeout_ms: u32,
+) -> Result<UsbTransport> {
     let device = dev_info.open().context("failed to open USB device")?;
     let interface = device.claim_interface(0).context(
         "failed to claim interface 0 — is the kernel driver loaded? \
@@ -213,7 +224,7 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
 
     // Clear residual halt conditions on the bulk pipes before first use.
     let _ = interface.clear_halt(EP_BULK_IN);
-    let _ = interface.clear_halt(EP_82357B_BULK_OUT);
+    let _ = interface.clear_halt(model.bulk_out_ep);
 
     // Drain any stale bulk-in data left over from a prior session. Retry a few
     // times in case the data arrives slightly delayed. Each submit that times
@@ -242,9 +253,9 @@ pub async fn open_transport(dev_info: nusb::DeviceInfo, timeout_ms: u32) -> Resu
     Ok(UsbTransport::new(
         device,
         interface,
-        EP_82357B_BULK_OUT,
+        model.bulk_out_ep,
         EP_BULK_IN,
-        EP_82357B_IRQ_IN,
+        model.irq_in_ep,
         timeout_ms,
     ))
 }
@@ -267,33 +278,32 @@ pub async fn wait_for_pid(pid: u16, timeout: std::time::Duration) -> Result<nusb
     }
 }
 
-/// Poll for any 82357B PID (pre-init or post-firmware), returning the first match.
-pub async fn wait_for_any_82357b_pid() -> Result<(nusb::DeviceInfo, u16)> {
-    loop {
-        let devices = nusb::list_devices().context("failed to list USB devices")?;
-        for dev in devices {
-            if dev.vendor_id() == USB_VID_AGILENT {
-                let pid = dev.product_id();
-                if pid == USB_PID_82357B || pid == USB_PID_82357B_PREINIT {
-                    return Ok((dev, pid));
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
 /// Full startup sequence: firmware upload if needed, returning an open `UsbTransport`.
 /// Implements the 82357B double-upload quirk.
-pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
-    let (dev_info, pid) = find_device()?;
+pub async fn initialize_device(model: &Model, timeout_ms: u32) -> Result<UsbTransport> {
+    let (dev_info, pid) = find_device(model)?;
 
-    if pid == USB_PID_82357B {
-        info!("82357B already firmware-loaded (PID 0x0718), skipping upload");
-        return open_transport(dev_info, timeout_ms).await;
+    if pid == model.pid_ready {
+        info!(
+            "{} already firmware-loaded (PID {:#06x}), skipping upload",
+            model.id, model.pid_ready
+        );
+        return open_transport(model, dev_info, timeout_ms).await;
     }
 
-    info!("82357B pre-init (PID 0x0518), uploading firmware");
+    let firmware = model.firmware.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is in pre-firmware state (PID {:#06x}) but its firmware image is not bundled; \
+             load it externally (e.g. fxload) or connect an already-initialized adapter",
+            model.id,
+            model.pid_preinit
+        )
+    })?;
+
+    info!(
+        "{} pre-init (PID {:#06x}), uploading firmware",
+        model.id, model.pid_preinit
+    );
 
     let mut current = dev_info;
     for attempt in 1..=2u32 {
@@ -303,7 +313,7 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
         let device = current
             .open()
             .with_context(|| format!("failed to open pre-init device (attempt {attempt})"))?;
-        super::firmware::upload_firmware(&device)
+        super::firmware::upload_firmware(&device, firmware)
             .await
             .with_context(|| format!("firmware upload failed (attempt {attempt})"))?;
         info!(attempt, "upload done, waiting for renumeration");
@@ -316,30 +326,37 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
         // pre-renumeration handle.
         let (new_info, new_pid) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            wait_for_renumeration(old_bus, old_addr),
+            wait_for_renumeration(model, old_bus, old_addr),
         )
         .await
         .with_context(|| format!("timeout waiting for renumeration on attempt {attempt}"))??;
 
-        if new_pid == USB_PID_82357B {
-            info!(attempt, "device came up as 0x0718");
+        if new_pid == model.pid_ready {
+            info!(attempt, "device came up as {:#06x}", model.pid_ready);
             // Small settle so the interface descriptors are readable.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            return open_transport(new_info, timeout_ms).await;
+            return open_transport(model, new_info, timeout_ms).await;
         }
 
         info!(
             attempt,
-            "device still 0x0518 — double-upload quirk, retrying"
+            "device still {:#06x} — double-upload quirk, retrying", model.pid_preinit
         );
         current = new_info;
     }
-    anyhow::bail!("device still pre-init (0x0518) after two upload attempts")
+    anyhow::bail!(
+        "device still pre-init ({:#06x}) after two upload attempts",
+        model.pid_preinit
+    )
 }
 
 /// Wait for the pre-firmware device at `(old_bus, old_addr)` to disappear, then
-/// poll for any 82357B PID to appear (with a new bus/address or the same one).
-async fn wait_for_renumeration(old_bus: u8, old_addr: u8) -> Result<(nusb::DeviceInfo, u16)> {
+/// poll for any PID of `model` to appear (with a new bus/address or the same one).
+async fn wait_for_renumeration(
+    model: &Model,
+    old_bus: u8,
+    old_addr: u8,
+) -> Result<(nusb::DeviceInfo, u16)> {
     // Phase 1: wait until the old device address is gone (or at minimum 200ms settle)
     let phase1_start = std::time::Instant::now();
     loop {
@@ -361,13 +378,13 @@ async fn wait_for_renumeration(old_bus: u8, old_addr: u8) -> Result<(nusb::Devic
     // Give the device a moment to settle after re-enumeration.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Phase 2: wait for any 82357B PID to appear.
+    // Phase 2: wait for any PID of this model to appear.
     loop {
         let devices = nusb::list_devices().context("failed to list USB devices")?;
         for dev in devices {
             if dev.vendor_id() == USB_VID_AGILENT {
                 let pid = dev.product_id();
-                if pid == USB_PID_82357B || pid == USB_PID_82357B_PREINIT {
+                if pid == model.pid_ready || pid == model.pid_preinit {
                     return Ok((dev, pid));
                 }
             }

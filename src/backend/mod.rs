@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 use tracing::info;
 
-pub mod agilent_82357b;
+pub mod agilent_82357;
 pub mod ni_usb_hs;
 
 /// The daemon shares one opened adapter across both front-ends behind this.
@@ -74,17 +74,31 @@ pub trait GpibBackend: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Agilent82357b,
+    Agilent82357a,
     NiUsbHs,
 }
 
 impl BackendKind {
     /// Every known backend, in preference order for auto-detection.
-    pub const ALL: &'static [BackendKind] = &[BackendKind::Agilent82357b, BackendKind::NiUsbHs];
+    pub const ALL: &'static [BackendKind] = &[
+        BackendKind::Agilent82357b,
+        BackendKind::Agilent82357a,
+        BackendKind::NiUsbHs,
+    ];
+
+    /// The 82357-family model descriptor backing an Agilent variant.
+    fn agilent_model(self) -> &'static agilent_82357::Model {
+        match self {
+            BackendKind::Agilent82357b => &agilent_82357::MODEL_82357B,
+            BackendKind::Agilent82357a => &agilent_82357::MODEL_82357A,
+            BackendKind::NiUsbHs => unreachable!("not an Agilent model"),
+        }
+    }
 
     /// Stable `--backend` identifier.
     pub fn id(self) -> &'static str {
         match self {
-            BackendKind::Agilent82357b => agilent_82357b::ID,
+            BackendKind::Agilent82357b | BackendKind::Agilent82357a => self.agilent_model().id,
             BackendKind::NiUsbHs => ni_usb_hs::ID,
         }
     }
@@ -92,7 +106,9 @@ impl BackendKind {
     /// Human-readable description for `--backend list`.
     pub fn description(self) -> &'static str {
         match self {
-            BackendKind::Agilent82357b => agilent_82357b::DESCRIPTION,
+            BackendKind::Agilent82357b | BackendKind::Agilent82357a => {
+                self.agilent_model().description
+            }
             BackendKind::NiUsbHs => ni_usb_hs::DESCRIPTION,
         }
     }
@@ -100,7 +116,7 @@ impl BackendKind {
     /// (VID, PID) pairs whose presence indicates this adapter.
     pub fn usb_ids(self) -> &'static [(u16, u16)] {
         match self {
-            BackendKind::Agilent82357b => agilent_82357b::USB_IDS,
+            BackendKind::Agilent82357b | BackendKind::Agilent82357a => self.agilent_model().usb_ids,
             BackendKind::NiUsbHs => ni_usb_hs::USB_IDS,
         }
     }
@@ -113,7 +129,9 @@ impl BackendKind {
     /// Open, initialize, and return the adapter ready for use.
     pub async fn open(self, timeout_ms: u32) -> Result<SharedBackend> {
         match self {
-            BackendKind::Agilent82357b => agilent_82357b::open(timeout_ms).await,
+            BackendKind::Agilent82357b | BackendKind::Agilent82357a => {
+                agilent_82357::open(self.agilent_model(), timeout_ms).await
+            }
             BackendKind::NiUsbHs => ni_usb_hs::open(timeout_ms).await,
         }
     }

@@ -19,6 +19,7 @@ the ids.
 | Backend id | Adapter | Status |
 |------------|---------|--------|
 | `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
+| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | Shares the 82357B's protocol, but its firmware image is **not bundled** — a cold adapter must be firmware-loaded externally (e.g. `fxload`); an already-initialized one works |
 | `ni-usb-hs` | NI GPIB-USB-HS / HS+ (and KUSB-488A, MC-USB-488 clones), VID `0x3923` | **Experimental — translated from the kernel driver, not yet tested on hardware** |
 
 ## Requirements

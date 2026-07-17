@@ -114,16 +114,22 @@ pub const AIF_SRQ_BN: u8 = 0;
 pub const AIF_WRITE_COMPLETE_BN: u8 = 1;
 pub const AIF_READ_COMPLETE_BN: u8 = 2;
 
-// USB IDs
+// USB IDs. The 82357A and 82357B share the vendor id and register protocol but
+// enumerate with different product ids (pre-firmware and post-firmware each).
 pub const USB_VID_AGILENT: u16 = 0x0957;
 pub const USB_PID_82357B_PREINIT: u16 = 0x0518;
 pub const USB_PID_82357B: u16 = 0x0718;
+pub const USB_PID_82357A_PREINIT: u16 = 0x0007;
+pub const USB_PID_82357A: u16 = 0x0107;
 
-// Endpoint addresses for 82357B (post-firmware). USB endpoint addresses encode
-// direction in the top bit: 0x80 = IN, 0x00 = OUT. nusb asserts this.
+// Endpoint addresses. Bulk-in is shared; the two models differ only in their
+// bulk-out and interrupt-in endpoints. USB endpoint addresses encode direction
+// in the top bit: 0x80 = IN, 0x00 = OUT. nusb asserts this.
 pub const EP_BULK_IN: u8 = 0x82;
 pub const EP_82357B_BULK_OUT: u8 = 0x06;
 pub const EP_82357B_IRQ_IN: u8 = 0x88;
+pub const EP_82357A_BULK_OUT: u8 = 0x04;
+pub const EP_82357A_IRQ_IN: u8 = 0x86;
 
 pub const INTERRUPT_BUF_LEN: usize = 8;
 pub const STATUS_DATA_LEN: usize = 8;

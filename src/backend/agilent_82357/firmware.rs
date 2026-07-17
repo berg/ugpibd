@@ -10,16 +10,18 @@ pub struct HexRecord {
     pub data: Vec<u8>,
 }
 
-const FX2_FIRMWARE: &[u8] = include_bytes!("../../../firmware/measat_releaseX1.8.hex");
+/// The 82357B firmware blob. The 82357A uses a different image that is not
+/// bundled (see the `agilent_82357` module docs).
+pub const FX2_FIRMWARE_82357B: &[u8] = include_bytes!("../../../firmware/measat_releaseX1.8.hex");
 
 // FX2 vendor-request constants for 8051 memory access.
 const ANCHOR_LOAD_INTERNAL: u8 = 0xA0;
 const CPUCS_ADDR: u16 = 0xE600;
 
-/// Upload firmware to an FX2 device in pre-init state.
+/// Upload `firmware` (Intel HEX text) to an FX2 device in pre-init state.
 /// Holds the 8051 in reset, writes all HEX records, then releases reset.
-pub async fn upload_firmware(device: &nusb::Device) -> Result<()> {
-    let hex_text = std::str::from_utf8(FX2_FIRMWARE).context("firmware blob is not valid UTF-8")?;
+pub async fn upload_firmware(device: &nusb::Device, firmware: &[u8]) -> Result<()> {
+    let hex_text = std::str::from_utf8(firmware).context("firmware blob is not valid UTF-8")?;
     let records = parse_hex(hex_text).context("failed to parse firmware HEX")?;
 
     tracing::info!("holding 8051 in reset");
