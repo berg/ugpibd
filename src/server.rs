@@ -9,14 +9,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::gpib::{GpibController, Transport};
+use crate::backend::GpibBackend;
 use crate::prologix::{LineResult, PrologixState};
 
 /// Run the TCP server. Accepts one connection at a time.
-pub async fn run<T: Transport + Send + Sync + 'static>(
-    listener: TcpListener,
-    ctrl: Arc<Mutex<GpibController<T>>>,
-) -> Result<()> {
+pub async fn run(listener: TcpListener, ctrl: Arc<Mutex<dyn GpibBackend>>) -> Result<()> {
     info!(
         "Prologix TCP server listening on {}",
         listener.local_addr()?
@@ -32,9 +29,9 @@ pub async fn run<T: Transport + Send + Sync + 'static>(
     }
 }
 
-async fn handle_connection<T: Transport>(
+async fn handle_connection(
     stream: &mut TcpStream,
-    ctrl: &Arc<Mutex<GpibController<T>>>,
+    ctrl: &Arc<Mutex<dyn GpibBackend>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut lines = BufReader::new(reader).lines();

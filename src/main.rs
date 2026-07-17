@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
-    let ctrl = Arc::new(Mutex::new(ctrl));
+    let ctrl: Arc<Mutex<dyn ugpibd::backend::GpibBackend>> = Arc::new(Mutex::new(ctrl));
 
     let prologix_listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
     info!("prologix listening on {}:{}", args.bind, args.port);

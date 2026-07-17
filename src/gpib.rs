@@ -386,6 +386,46 @@ impl<T: Transport> GpibController<T> {
     }
 }
 
+// Expose the 82357B controller through the adapter-agnostic backend trait.
+// The generic GPIB operations already exist as inherent methods above (which
+// take precedence in resolution, so these forward rather than recurse); the
+// 82357B-specific machinery — register I/O, firmware, abort/XFER control — stays
+// off the trait as this backend's private detail.
+#[async_trait::async_trait]
+impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibController<T> {
+    async fn init(&mut self, my_pad: u8) -> Result<()> {
+        self.init(my_pad).await
+    }
+    async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
+        self.write(pad, data, send_eoi).await
+    }
+    async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.read(pad, max_len).await
+    }
+    async fn device_clear(&mut self, pad: u8) -> Result<()> {
+        self.device_clear(pad).await
+    }
+    async fn trigger(&mut self, pad: u8) -> Result<()> {
+        self.trigger(pad).await
+    }
+    async fn ifc(&mut self) -> Result<()> {
+        self.ifc().await
+    }
+    async fn ren(&mut self, enable: bool) -> Result<()> {
+        self.ren(enable).await
+    }
+    fn set_eos(&mut self, eos_char: u8, enabled: bool) {
+        self.eos_char = eos_char;
+        self.eos_enabled = enabled;
+    }
+    fn set_timeout(&mut self, timeout_ms: u32) {
+        self.timeout_ms = timeout_ms;
+    }
+    fn name(&self) -> &'static str {
+        "agilent-82357b"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

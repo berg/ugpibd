@@ -9,19 +9,19 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use super::server::Device;
-use crate::gpib::{GpibController, Transport};
+use crate::backend::GpibBackend;
 
 /// A GPIB instrument addressable at `pad` on the shared bus.
-pub struct GpibInstrument<T: Transport> {
-    ctrl: Arc<Mutex<GpibController<T>>>,
+pub struct GpibInstrument {
+    ctrl: Arc<Mutex<dyn GpibBackend>>,
     pad: u8,
     /// Upper bound on a single bulk read. Matches the Prologix server's
     /// default so behavior is consistent across front-ends.
     max_read: usize,
 }
 
-impl<T: Transport> GpibInstrument<T> {
-    pub fn new(ctrl: Arc<Mutex<GpibController<T>>>, pad: u8) -> Self {
+impl GpibInstrument {
+    pub fn new(ctrl: Arc<Mutex<dyn GpibBackend>>, pad: u8) -> Self {
         Self {
             ctrl,
             pad,
@@ -31,7 +31,7 @@ impl<T: Transport> GpibInstrument<T> {
 }
 
 #[async_trait::async_trait]
-impl<T: Transport + Send + Sync + 'static> Device for GpibInstrument<T> {
+impl Device for GpibInstrument {
     async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Option<Vec<u8>>> {
         let mut ctrl = self.ctrl.lock().await;
         ctrl.write(self.pad, cmd, true).await?;
