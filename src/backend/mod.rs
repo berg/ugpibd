@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 pub mod agilent_82357b;
+pub mod ni_usb_hs;
 
 /// The daemon shares one opened adapter across both front-ends behind this.
 pub type SharedBackend = Arc<Mutex<dyn GpibBackend>>;
@@ -73,16 +74,18 @@ pub trait GpibBackend: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Agilent82357b,
+    NiUsbHs,
 }
 
 impl BackendKind {
     /// Every known backend, in preference order for auto-detection.
-    pub const ALL: &'static [BackendKind] = &[BackendKind::Agilent82357b];
+    pub const ALL: &'static [BackendKind] = &[BackendKind::Agilent82357b, BackendKind::NiUsbHs];
 
     /// Stable `--backend` identifier.
     pub fn id(self) -> &'static str {
         match self {
             BackendKind::Agilent82357b => agilent_82357b::ID,
+            BackendKind::NiUsbHs => ni_usb_hs::ID,
         }
     }
 
@@ -90,6 +93,7 @@ impl BackendKind {
     pub fn description(self) -> &'static str {
         match self {
             BackendKind::Agilent82357b => agilent_82357b::DESCRIPTION,
+            BackendKind::NiUsbHs => ni_usb_hs::DESCRIPTION,
         }
     }
 
@@ -97,6 +101,7 @@ impl BackendKind {
     pub fn usb_ids(self) -> &'static [(u16, u16)] {
         match self {
             BackendKind::Agilent82357b => agilent_82357b::USB_IDS,
+            BackendKind::NiUsbHs => ni_usb_hs::USB_IDS,
         }
     }
 
@@ -109,6 +114,7 @@ impl BackendKind {
     pub async fn open(self, timeout_ms: u32) -> Result<SharedBackend> {
         match self {
             BackendKind::Agilent82357b => agilent_82357b::open(timeout_ms).await,
+            BackendKind::NiUsbHs => ni_usb_hs::open(timeout_ms).await,
         }
     }
 

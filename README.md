@@ -1,7 +1,7 @@
 # ugpibd
 
-Userspace Rust daemon for the Agilent/Keysight 82357B USB-to-GPIB adapter.
-Exposes two TCP front-ends against the same bus:
+Userspace Rust daemon for USB-to-GPIB adapters that otherwise need an
+out-of-tree kernel driver. Exposes two TCP front-ends against the same bus:
 
 - **Prologix-compatible** ASCII protocol on port 1234 (configurable)
 - **HiSLIP** (IVI-6.1) on port 4880 (the IANA-assigned HiSLIP port)
@@ -10,10 +10,21 @@ Use HiSLIP with pyvisa/NI-VISA for proper `TCPIP::...::INSTR` resource
 strings with locking, clear, trigger, and REN. Use the Prologix port for
 existing scripts written against `prologix-gpib-async` or raw sockets.
 
+## Supported adapters
+
+The adapter is selected with `--backend` (default `auto`, which detects a
+single connected adapter by USB VID/PID). Run `ugpibd --backend list` to see
+the ids.
+
+| Backend id | Adapter | Status |
+|------------|---------|--------|
+| `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
+| `ni-usb-hs` | NI GPIB-USB-HS / HS+ (and KUSB-488A, MC-USB-488 clones), VID `0x3923` | **Experimental — translated from the kernel driver, not yet tested on hardware** |
+
 ## Requirements
 
 - Linux (Ubuntu 24.04+) or macOS 12+
-- An Agilent/Keysight 82357B (USB ID 0957:0518 before firmware, 0957:0718 after)
+- A supported USB-GPIB adapter (see above)
 - Rust 1.75+
 
 ## Quick Start
@@ -33,12 +44,14 @@ RUST_LOG=ugpibd=debug ./target/release/ugpibd
 
 ## If the kernel driver interferes (Linux)
 
-If you see "failed to claim interface 0", the kernel `agilent_82357a` module may
-be loaded. Blacklist it:
+If you see "failed to claim interface 0", the matching kernel GPIB module may be
+loaded (`agilent_82357a` for the 82357B, `ni_usb_gpib` for the NI adapters).
+Blacklist whichever applies:
 
 ```bash
 echo "blacklist agilent_82357a" | sudo tee /etc/modprobe.d/blacklist-gpib.conf
-sudo modprobe -r agilent_82357a
+echo "blacklist ni_usb_gpib" | sudo tee -a /etc/modprobe.d/blacklist-gpib.conf
+sudo modprobe -r agilent_82357a ni_usb_gpib
 ```
 
 ## PyVISA usage
