@@ -2,9 +2,14 @@
 // Copyright (C) 2026 ugpibd contributors
 //
 // Entry point for the Agilent/Keysight 82357B backend. The wire protocol,
-// firmware upload, USB discovery, and TMS9914 controller logic live in
-// `crate::{protocol, firmware, usb, gpib}`; this module just wires them into a
-// ready-to-use `GpibBackend` for the registry.
+// firmware upload, USB discovery, and TMS9914 controller logic live in the
+// submodules below; this module just wires them into a ready-to-use
+// `GpibBackend` for the registry.
+
+pub mod firmware;
+pub mod gpib;
+pub mod protocol;
+pub mod usb;
 
 use std::sync::Arc;
 
@@ -12,9 +17,9 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use self::gpib::GpibController;
+use self::protocol::{USB_PID_82357B, USB_PID_82357B_PREINIT, USB_VID_AGILENT};
 use crate::backend::SharedBackend;
-use crate::gpib::GpibController;
-use crate::protocol::{USB_PID_82357B, USB_PID_82357B_PREINIT, USB_VID_AGILENT};
 
 /// Stable backend identifier used by `--backend`.
 pub const ID: &str = "agilent-82357b";
@@ -31,7 +36,7 @@ pub const USB_IDS: &[(u16, u16)] = &[
 /// Discover, firmware-load if needed, open, and initialize a 82357B.
 pub async fn open(timeout_ms: u32) -> Result<SharedBackend> {
     info!("opening Agilent/Keysight 82357B");
-    let transport = crate::usb::initialize_device(timeout_ms).await?;
+    let transport = self::usb::initialize_device(timeout_ms).await?;
     info!("USB device open");
 
     let mut ctrl = GpibController::new(transport, timeout_ms);

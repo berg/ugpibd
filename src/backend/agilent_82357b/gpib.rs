@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ugpibd contributors
 
-use crate::protocol::*;
+use super::protocol::*;
 use anyhow::Result;
 
 pub trait Transport {

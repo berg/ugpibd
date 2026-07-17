@@ -10,7 +10,7 @@ pub struct HexRecord {
     pub data: Vec<u8>,
 }
 
-const FX2_FIRMWARE: &[u8] = include_bytes!("../firmware/measat_releaseX1.8.hex");
+const FX2_FIRMWARE: &[u8] = include_bytes!("../../../firmware/measat_releaseX1.8.hex");
 
 // FX2 vendor-request constants for 8051 memory access.
 const ANCHOR_LOAD_INTERNAL: u8 = 0xA0;

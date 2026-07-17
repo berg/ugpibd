@@ -8,8 +8,8 @@ use nusb::transfer::{ControlIn, ControlType, Recipient, RequestBuffer};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use crate::gpib::Transport;
-use crate::protocol::*;
+use super::gpib::Transport;
+use super::protocol::*;
 
 pub struct UsbTransport {
     interface: nusb::Interface,
@@ -303,7 +303,7 @@ pub async fn initialize_device(timeout_ms: u32) -> Result<UsbTransport> {
         let device = current
             .open()
             .with_context(|| format!("failed to open pre-init device (attempt {attempt})"))?;
-        crate::firmware::upload_firmware(&device)
+        super::firmware::upload_firmware(&device)
             .await
             .with_context(|| format!("firmware upload failed (attempt {attempt})"))?;
         info!(attempt, "upload done, waiting for renumeration");
