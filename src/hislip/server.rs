@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 //
 // HiSLIP server. Accepts one TCP connection per session-channel. Each client
 // opens two connections to the same port: a synchronous channel for

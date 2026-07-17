@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::protocol::*;
+use ugpibd::protocol::*;
 
 #[test]
 fn wr_regs_roundtrip() {

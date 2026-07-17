@@ -220,24 +220,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
 
 [[package]]
-name = "gpibd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bitfield",
- "byteorder",
- "bytes",
- "clap",
- "nusb",
- "rustyline",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -646,6 +628,24 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "ugpibd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bitfield",
+ "byteorder",
+ "bytes",
+ "clap",
+ "nusb",
+ "rustyline",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

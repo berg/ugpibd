@@ -1,4 +1,4 @@
-# gpibd
+# ugpibd
 
 Userspace Rust daemon for the Agilent/Keysight 82357B USB-to-GPIB adapter.
 Exposes two TCP front-ends against the same bus:
@@ -20,15 +20,15 @@ existing scripts written against `prologix-gpib-async` or raw sockets.
 
 ```bash
 cargo build --release
-sudo cp contrib/99-gpibd.rules /etc/udev/rules.d/
+sudo cp contrib/99-ugpibd.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-./target/release/gpibd
+./target/release/ugpibd
 ```
 
 For protocol-level tracing:
 
 ```bash
-RUST_LOG=gpibd=debug ./target/release/gpibd
+RUST_LOG=ugpibd=debug ./target/release/ugpibd
 ```
 
 ## If the kernel driver interferes (Linux)
@@ -81,7 +81,7 @@ print(inst.query("*IDN?"))
 ## Interactive `scpi` client
 
 `scpi` is a small REPL bundled with the daemon. It speaks **HiSLIP** to
-`gpibd` (the same transport pyvisa uses), so it does not need the Prologix
+`ugpibd` (the same transport pyvisa uses), so it does not need the Prologix
 port.
 
 ```bash

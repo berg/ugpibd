@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Smoke test for a running gpibd: exercises HiSLIP and Prologix front-ends
+"""Smoke test for a running ugpibd: exercises HiSLIP and Prologix front-ends
 against the same instrument and reports any behavioral mismatch.
 
 Usage:
@@ -101,7 +101,7 @@ def test_prologix(host: str, port: int, pad: int, query: Optional[str], timeout_
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="gpibd smoke test")
+    ap = argparse.ArgumentParser(description="ugpibd smoke test")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--pad", type=int, required=True, help="GPIB primary address (0-30)")
     ap.add_argument("--prologix-port", type=int, default=1234)

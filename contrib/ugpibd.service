@@ -3,10 +3,10 @@ Description=Agilent/Keysight 82357B GPIB daemon (Prologix-compatible)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/gpibd
+ExecStart=/usr/local/bin/ugpibd
 Restart=on-failure
 RestartSec=3
-User=gpibd
+User=ugpibd
 Group=plugdev
 StandardOutput=journal
 StandardError=journal

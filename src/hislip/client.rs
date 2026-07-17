@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 //
 // HiSLIP client. Drives the same message codec as the server (messages.rs)
 // over two TCP channels: a synchronous channel for data/trigger and an

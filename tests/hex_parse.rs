@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::firmware::parse_hex;
+use ugpibd::firmware::parse_hex;
 
 // Intel HEX checksum = two's complement of sum of all other bytes.
 // Record 1 below: byte_count=03, addr=0000, type=00, data=[02,00,0E],

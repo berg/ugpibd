@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpibd::hislip::server::{run, Config, Device};
 use tokio::net::TcpListener;
+use ugpibd::hislip::server::{run, Config, Device};
 
 #[derive(Default)]
 struct EchoDevice {

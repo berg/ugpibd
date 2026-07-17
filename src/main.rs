@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use std::sync::Arc;
 
@@ -11,11 +11,11 @@ use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use gpibd::hislip;
+use ugpibd::hislip;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "gpibd",
+    name = "ugpibd",
     about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix + HiSLIP compatible)"
 )]
 struct Args {
@@ -53,9 +53,9 @@ async fn main() -> Result<()> {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = match args.verbose {
-            0 => "gpibd=info",
-            1 => "gpibd=debug",
-            _ => "gpibd=trace",
+            0 => "ugpibd=info",
+            1 => "ugpibd=debug",
+            _ => "ugpibd=trace",
         };
         EnvFilter::new(level)
     });
@@ -64,11 +64,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("gpibd starting — looking for 82357B");
-    let transport = gpibd::usb::initialize_device(args.timeout_ms).await?;
+    info!("ugpibd starting — looking for 82357B");
+    let transport = ugpibd::usb::initialize_device(args.timeout_ms).await?;
     info!("USB device open");
 
-    let mut ctrl = gpibd::gpib::GpibController::new(transport, args.timeout_ms);
+    let mut ctrl = ugpibd::gpib::GpibController::new(transport, args.timeout_ms);
 
     // Try up to 3 times: abort -> init. If init fails it's usually because
     // the device is holding stale state from a prior session; another abort
@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
     };
 
     tokio::select! {
-        result = gpibd::server::run(prologix_listener, prologix_ctrl) => result?,
+        result = ugpibd::server::run(prologix_listener, prologix_ctrl) => result?,
         result = hislip_fut => result?,
         _ = ctrl_c => info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => info!("SIGTERM received, shutting down"),

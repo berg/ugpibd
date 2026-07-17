@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::prologix::{LineResult, PrologixState};
+use ugpibd::prologix::{LineResult, PrologixState};
 
 #[test]
 fn addr_set_and_query() {

@@ -1,4 +1,4 @@
-# gpibd Implementation Plan
+# ugpibd Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,7 +17,7 @@ Before writing any USB/GPIB code, read these local files:
 - `linux/linux-7.0/drivers/gpib/agilent_82357a/agilent_82357a.c` — reference implementation
 - `linux/linux-7.0/drivers/gpib/include/tms9914.h` — TMS9914 register names and AUX_* constants
 - `docs/DESIGN.md` — full design rationale and gotchas
-- `docs/superpowers/specs/2026-04-17-gpibd-design.md` — resolved design decisions
+- `docs/superpowers/specs/2026-04-17-ugpibd-design.md` — resolved design decisions
 
 Key constants you will need (from the headers):
 ```
@@ -64,8 +64,8 @@ Error codes:     UGP_SUCCESS=0
 | `tests/protocol_roundtrip.rs` | Unit tests: encode/decode roundtrips (no hardware) |
 | `tests/prologix_parse.rs` | Unit tests: Prologix line parser (no hardware) |
 | `firmware/measat_releaseX1.8.hex` | Firmware blob (must be obtained separately; see Task 1) |
-| `contrib/99-gpibd.rules` | Linux udev rule |
-| `contrib/gpibd.service` | Systemd unit |
+| `contrib/99-ugpibd.rules` | Linux udev rule |
+| `contrib/ugpibd.service` | Systemd unit |
 
 ---
 
@@ -82,7 +82,7 @@ Error codes:     UGP_SUCCESS=0
 
 ```toml
 [package]
-name = "gpibd"
+name = "ugpibd"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -90,11 +90,11 @@ license = "GPL-3.0-or-later"
 description = "Userspace driver for Agilent/Keysight 82357B USB-GPIB adapter with Prologix TCP server"
 
 [[bin]]
-name = "gpibd"
+name = "ugpibd"
 path = "src/main.rs"
 
 [lib]
-name = "gpibd"
+name = "ugpibd"
 path = "src/lib.rs"
 
 [dependencies]
@@ -122,7 +122,7 @@ Each file gets an SPDX header and a `// TODO` stub:
 `src/lib.rs`:
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 pub mod firmware;
 pub mod gpib;
 pub mod protocol;
@@ -134,7 +134,7 @@ pub mod usb;
 `src/main.rs`:
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 fn main() {}
 ```
 
@@ -190,7 +190,7 @@ git commit -m "chore: initial project scaffold"
 `tests/protocol_roundtrip.rs`:
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::protocol::*;
+use ugpibd::protocol::*;
 
 #[test]
 fn wr_regs_roundtrip() {
@@ -301,7 +301,7 @@ Expected: compile errors (types not defined yet).
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use thiserror::Error;
 
@@ -542,7 +542,7 @@ pub fn decode_gpib_read_response(raw: &[u8]) -> (Vec<u8>, bool) {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cargo test -p gpibd --test protocol_roundtrip 2>&1
+cargo test -p ugpibd --test protocol_roundtrip 2>&1
 ```
 Expected: all tests pass.
 
@@ -566,7 +566,7 @@ git commit -m "feat: protocol constants and packet encode/decode"
 `tests/hex_parse.rs`:
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::firmware::{parse_hex, HexRecord};
+use ugpibd::firmware::{parse_hex, HexRecord};
 
 #[test]
 fn parse_data_record() {
@@ -633,7 +633,7 @@ cargo test --test hex_parse 2>&1 | head -20
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use anyhow::{bail, Context, Result};
 
@@ -799,7 +799,7 @@ mod tests {
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use anyhow::Result;
 use crate::protocol::*;
@@ -853,7 +853,7 @@ impl<T: Transport> GpibController<T> {
 - [ ] **Step 3: Run tests**
 
 ```bash
-cargo test -p gpibd 2>&1
+cargo test -p ugpibd 2>&1
 ```
 Expected: `write_registers_sends_correct_packet` and `read_registers_sends_and_parses` pass.
 
@@ -1157,7 +1157,7 @@ pub const TMS_PPR: u8  = 0x06;
 - [ ] **Step 3: Run tests**
 
 ```bash
-cargo test -p gpibd 2>&1
+cargo test -p ugpibd 2>&1
 ```
 Expected: all tests pass.
 
@@ -1183,7 +1183,7 @@ The `UsbTransport` wraps a `nusb::Interface`. It spawns a background Tokio task 
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use std::sync::Arc;
 use anyhow::{Context, Result};
@@ -1520,7 +1520,7 @@ git commit -m "feat: FX2 firmware upload with double-upload quirk handling"
 `tests/prologix_parse.rs`:
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-use gpibd::prologix::{PrologixState, LineResult};
+use ugpibd::prologix::{PrologixState, LineResult};
 
 #[test]
 fn addr_set_and_query() {
@@ -1683,7 +1683,7 @@ cargo test --test prologix_parse 2>&1 | head -20
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 #[derive(Debug, PartialEq)]
 pub enum LineResult {
@@ -1863,7 +1863,7 @@ git commit -m "feat: Prologix line parser and ++ command state machine"
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1972,7 +1972,7 @@ git commit -m "feat: TCP server with Prologix protocol dispatch"
 
 ```rust
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use anyhow::Result;
 use clap::Parser;
@@ -1981,7 +1981,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "gpibd", about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix-compatible)")]
+#[command(name = "ugpibd", about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix-compatible)")]
 struct Args {
     /// TCP port for the Prologix-compatible server
     #[arg(long, default_value_t = 1234)]
@@ -2000,17 +2000,17 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("gpibd=info".parse()?))
+            .add_directive("ugpibd=info".parse()?))
         .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
 
-    info!("gpibd starting — looking for 82357B");
-    let transport = gpibd::usb::initialize_device().await?;
+    info!("ugpibd starting — looking for 82357B");
+    let transport = ugpibd::usb::initialize_device().await?;
     info!("USB device open");
 
-    let mut ctrl = gpibd::gpib::GpibController::new(transport, args.timeout_ms);
+    let mut ctrl = ugpibd::gpib::GpibController::new(transport, args.timeout_ms);
     ctrl.init(0).await?;
     info!("GPIB controller initialized");
 
@@ -2023,7 +2023,7 @@ async fn main() -> Result<()> {
     };
 
     tokio::select! {
-        result = gpibd::server::run(listener, ctrl) => result?,
+        result = ugpibd::server::run(listener, ctrl) => result?,
         _ = ctrl_c => {
             info!("shutting down");
         }
@@ -2038,7 +2038,7 @@ async fn main() -> Result<()> {
 ```bash
 cargo build --release 2>&1
 ```
-Expected: clean compile. Binary at `target/release/gpibd`.
+Expected: clean compile. Binary at `target/release/ugpibd`.
 
 - [ ] **Step 3: Run unit tests**
 
@@ -2059,14 +2059,14 @@ git commit -m "feat: main entry point with clap CLI and signal handling"
 ## Task 11: Contrib Files, README, and Hardware Test Doc
 
 **Files:**
-- Create: `contrib/99-gpibd.rules`
-- Create: `contrib/gpibd.service`
+- Create: `contrib/99-ugpibd.rules`
+- Create: `contrib/ugpibd.service`
 - Create: `README.md`
 - Create: `docs/HARDWARE-TEST.md`
 
 - [ ] **Step 1: Create udev rule**
 
-`contrib/99-gpibd.rules`:
+`contrib/99-ugpibd.rules`:
 ```
 # Agilent/Keysight 82357B USB-GPIB adapter
 # Pre-firmware (PID 0x0518) and post-firmware (PID 0x0718)
@@ -2074,21 +2074,21 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0518", MODE="0660", 
 SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0718", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 ```
 
-Install: `sudo cp contrib/99-gpibd.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger`
+Install: `sudo cp contrib/99-ugpibd.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger`
 
 - [ ] **Step 2: Create systemd unit**
 
-`contrib/gpibd.service`:
+`contrib/ugpibd.service`:
 ```ini
 [Unit]
 Description=Agilent/Keysight 82357B GPIB daemon (Prologix-compatible)
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/gpibd
+ExecStart=/usr/local/bin/ugpibd
 Restart=on-failure
 RestartSec=3
-User=gpibd
+User=ugpibd
 Group=plugdev
 StandardOutput=journal
 StandardError=journal
@@ -2101,7 +2101,7 @@ WantedBy=multi-user.target
 
 `README.md`:
 ```markdown
-# gpibd
+# ugpibd
 
 Userspace Rust daemon for the Agilent/Keysight 82357B USB-to-GPIB adapter.
 Exposes a Prologix-compatible TCP server on port 1234 (configurable).
@@ -2116,9 +2116,9 @@ Exposes a Prologix-compatible TCP server on port 1234 (configurable).
 
 ```bash
 cargo build --release
-sudo cp contrib/99-gpibd.rules /etc/udev/rules.d/
+sudo cp contrib/99-ugpibd.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-./target/release/gpibd
+./target/release/ugpibd
 ```
 
 ## If the kernel driver interferes (Linux)
@@ -2174,14 +2174,14 @@ Manual tests requiring a physical 82357B and a SCPI instrument.
 
 1. Unplug the 82357B, wait 5 seconds, replug.
 2. Confirm `lsusb` shows `0957:0518`.
-3. Run `RUST_LOG=gpibd=debug gpibd`.
+3. Run `RUST_LOG=ugpibd=debug ugpibd`.
 4. Confirm log shows "holding 8051 in reset", firmware record writes, "device came up as 0x0718".
 5. Confirm `lsusb` shows `0957:0718` and only the green READY LED is lit.
 
 ## Test 2: *IDN? round-trip
 
 1. Connect a SCPI instrument (e.g. Keysight 34461A) at PAD 15.
-2. Start gpibd.
+2. Start ugpibd.
 3. `nc localhost 1234`, type: `++addr 15`, `++auto 1`, `*IDN?`
 4. Confirm instrument IDN string is returned.
 
@@ -2203,7 +2203,7 @@ Manual tests requiring a physical 82357B and a SCPI instrument.
 
 ## Test 6: Disconnect mid-session
 
-1. Start gpibd, connect a client.
+1. Start ugpibd, connect a client.
 2. Unplug the 82357B while idle.
 3. Confirm daemon logs disconnect and exits cleanly (exit code 0 or 1, no panic).
 ```
@@ -2259,7 +2259,7 @@ git commit -m "docs: README, hardware test checklist, udev rule, systemd unit"
 
 ---
 
-**Plan complete and saved to `docs/superpowers/plans/2026-04-17-gpibd-implementation.md`.**
+**Plan complete and saved to `docs/superpowers/plans/2026-04-17-ugpibd-implementation.md`.**
 
 Two execution options:
 

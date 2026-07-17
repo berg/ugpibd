@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 //
 // Bridge from the HiSLIP `Device` abstraction to our `GpibController`.
 

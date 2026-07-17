@@ -6,7 +6,7 @@ Manual tests requiring a physical 82357B and a SCPI instrument.
 
 1. Unplug the 82357B, wait 5 seconds, replug.
 2. Confirm `lsusb` shows `0957:0518`.
-3. Run `RUST_LOG=gpibd=debug gpibd`.
+3. Run `RUST_LOG=ugpibd=debug ugpibd`.
 4. Confirm log shows "holding 8051 in reset", firmware record writes,
    "device came up as 0x0718".
 5. Confirm `lsusb` shows `0957:0718` and only the green READY LED is lit.
@@ -14,7 +14,7 @@ Manual tests requiring a physical 82357B and a SCPI instrument.
 ## Test 2: *IDN? round-trip
 
 1. Connect a SCPI instrument (e.g. Keysight 34461A) at PAD 15.
-2. Start gpibd.
+2. Start ugpibd.
 3. `nc localhost 1234`, type: `++addr 15`, `++auto 1`, `*IDN?`
 4. Confirm instrument IDN string is returned.
 
@@ -37,6 +37,6 @@ Manual tests requiring a physical 82357B and a SCPI instrument.
 
 ## Test 6: Disconnect mid-session
 
-1. Start gpibd, connect a client.
+1. Start ugpibd, connect a client.
 2. Unplug the 82357B while idle.
 3. Confirm daemon logs disconnect and exits cleanly (exit code 0 or 1, no panic).

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 //
-// Interactive SCPI CLI. Connects to gpibd over HiSLIP (IVI-6.1) and runs a
+// Interactive SCPI CLI. Connects to ugpibd over HiSLIP (IVI-6.1) and runs a
 // request/response REPL: queries (lines containing `?`) print the
 // instrument's reply, plain commands are written, and a small set of `++`
 // meta-commands map to HiSLIP control operations. Uses rustyline for line
@@ -9,26 +9,26 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gpibd::hislip::client::HislipClient;
-use gpibd::hislip::STANDARD_PORT;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
 use rustyline::{Config, Editor};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::runtime::{Builder, Runtime};
+use ugpibd::hislip::client::HislipClient;
+use ugpibd::hislip::STANDARD_PORT;
 
 /// Vendor id the client advertises in the HiSLIP Initialize handshake.
 const CLIENT_VENDOR_ID: u16 = 0xBEEF;
 
 #[derive(Parser)]
-#[command(name = "scpi", about = "Interactive SCPI client for gpibd (HiSLIP)")]
+#[command(name = "scpi", about = "Interactive SCPI client for ugpibd (HiSLIP)")]
 struct Args {
-    /// gpibd host
+    /// ugpibd host
     #[arg(long, default_value = "localhost")]
     host: String,
 
-    /// gpibd HiSLIP port
+    /// ugpibd HiSLIP port
     #[arg(long, default_value_t = STANDARD_PORT)]
     port: u16,
 
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let subaddress = match args.addr {
         Some(n) => format!("hislip{n}"),
-        None => gpibd::hislip::DEFAULT_SUBADDRESS.to_string(),
+        None => ugpibd::hislip::DEFAULT_SUBADDRESS.to_string(),
     };
 
     let rt = Builder::new_current_thread()

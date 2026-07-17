@@ -1,4 +1,4 @@
-# `gpibd` — a userspace Rust driver for the Agilent/Keysight 82357B, exposing a Prologix-compatible TCP server
+# `ugpibd` — a userspace Rust driver for the Agilent/Keysight 82357B, exposing a Prologix-compatible TCP server
 
 **Status:** design doc, v0.1
 **Scope:** handoff to a coding agent for an initial implementation.
@@ -261,7 +261,7 @@ Use Tokio. We need concurrent bulk-IN polling and TCP I/O. Keep it single-thread
 
 ### 8.3 Other crates (suggested, not mandatory)
 
-- `tracing` + `tracing-subscriber` — logging. Default to `info`; `RUST_LOG=gpibd=debug` for protocol-level tracing.
+- `tracing` + `tracing-subscriber` — logging. Default to `info`; `RUST_LOG=ugpibd=debug` for protocol-level tracing.
 - `clap` (derive) — CLI args.
 - `anyhow` for app errors, `thiserror` for library-layer errors.
 - `bytes` — byte buffer management, optional.
@@ -278,13 +278,13 @@ No serialization crate needed; everything is ASCII text or hand-rolled binary.
   1. Document how to blacklist the module (`/etc/modprobe.d/blacklist-gpib.conf` containing `blacklist agilent_82357a`).
   2. In `nusb`, attempt `detach_kernel_driver()` before claiming the interface. On Linux this works.
   3. Detect the conflict and emit a clear error message pointing to (1).
-- **Permissions:** the device node is owned by root by default. Ship a udev rule (`99-gpibd.rules`):
+- **Permissions:** the device node is owned by root by default. Ship a udev rule (`99-ugpibd.rules`):
   ```
   SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0518", MODE="0660", GROUP="plugdev", TAG+="uaccess"
   SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0718", MODE="0660", GROUP="plugdev", TAG+="uaccess"
   ```
   Both PIDs are needed (pre- and post-firmware). `TAG+="uaccess"` grants access to the logged-in seat user, which is usually what people want.
-- **Systemd unit:** provide one (`gpibd.service`) running as a dedicated user in `plugdev`. `Restart=on-failure`.
+- **Systemd unit:** provide one (`ugpibd.service`) running as a dedicated user in `plugdev`. `Restart=on-failure`.
 
 ### 9.2 macOS
 
@@ -302,7 +302,7 @@ Windows needs a WinUSB driver binding via Zadig or similar. `nusb` supports this
 ## 10. Repo and module layout
 
 ```
-gpibd/
+ugpibd/
 ├── Cargo.toml
 ├── LICENSE                             # GPL-3.0
 ├── README.md
@@ -313,8 +313,8 @@ gpibd/
 │   ├── measat_releaseX1.8.hex          # embedded via include_bytes!
 │   └── LICENSE                         # firmware redistribution notice
 ├── contrib/
-│   ├── 99-gpibd.rules                  # Linux udev
-│   └── gpibd.service                   # systemd unit
+│   ├── 99-ugpibd.rules                  # Linux udev
+│   └── ugpibd.service                   # systemd unit
 ├── src/
 │   ├── main.rs                         # CLI, config, top-level wiring
 │   ├── lib.rs                          # re-exports for integration tests

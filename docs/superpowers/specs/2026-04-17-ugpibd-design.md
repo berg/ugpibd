@@ -1,4 +1,4 @@
-# gpibd — Implementation Spec
+# ugpibd — Implementation Spec
 
 **Date:** 2026-04-17  
 **Status:** approved  
@@ -12,7 +12,7 @@
 |----------|----------|
 | Multi-adapter support in v1 | Single-adapter only. Architecture stays multi-adapter-friendly (USB device + TCP listener as one instantiable unit) but no config-file or multi-port wiring in v1. |
 | TCP port | Default `1234`, overridable with `--port`. |
-| Logging | `tracing` to stderr only. `RUST_LOG=gpibd=debug` for protocol-level tracing. No syslog/os_log. |
+| Logging | `tracing` to stderr only. `RUST_LOG=ugpibd=debug` for protocol-level tracing. No syslog/os_log. |
 | Metrics/telemetry | None. No seam left open. |
 | `++ver` response | `Prologix GPIB-USB Controller version 6.107` — verbatim fake to satisfy client library sniffing. |
 | `++eos` default | `0` (append CR+LF), matching real Prologix hardware. Values: 0=CR+LF, 1=CR, 2=LF, 3=nothing. |
@@ -124,7 +124,7 @@ trait Transport {
 
 ## Platform specifics
 
-- **Linux:** ship `contrib/99-gpibd.rules` (both PIDs, `MODE=0660`, `GROUP=plugdev`, `TAG+="uaccess"`) and `contrib/gpibd.service`.
+- **Linux:** ship `contrib/99-ugpibd.rules` (both PIDs, `MODE=0660`, `GROUP=plugdev`, `TAG+="uaccess"`) and `contrib/ugpibd.service`.
 - **macOS:** no special permissions needed. Detect if Keysight IO Libraries have claimed the device and report clearly.
 - **Endpoint numbers:** never hardcoded — read from interface descriptor at runtime.
 

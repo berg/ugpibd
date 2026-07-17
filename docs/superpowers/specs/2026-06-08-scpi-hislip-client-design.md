@@ -5,7 +5,7 @@
 Make the `scpi` CLI (`src/bin/scpi.rs`) speak **HiSLIP** instead of the
 Prologix line protocol. HiSLIP replaces Prologix in this client entirely —
 the `++mode`/`++addr`/`++auto` startup and raw line-forwarding are removed.
-The `gpibd` daemon keeps serving both front-ends; only the `scpi` client
+The `ugpibd` daemon keeps serving both front-ends; only the `scpi` client
 changes.
 
 ## Decisions
@@ -15,7 +15,7 @@ changes.
 - **Scope:** full two-channel client — synchronous channel for data/trigger
   plus asynchronous channel for device-clear / REN / status.
 - **Approach:** reuse the existing async message codec
-  (`gpibd::hislip::messages`) via a thin lib client; the binary keeps a
+  (`ugpibd::hislip::messages`) via a thin lib client; the binary keeps a
   blocking rustyline REPL and drives the client with a current-thread tokio
   runtime through `block_on`. No wire-format duplication, no background
   reader thread (the server does not forward SRQ, so every reply is

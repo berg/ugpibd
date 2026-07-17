@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Tests for the HiSLIP client used by the `scpi` CLI. Each test drives a
-// real in-process HiSLIP server (the same one `gpibd` runs) over a loopback
+// real in-process HiSLIP server (the same one `ugpibd` runs) over a loopback
 // TCP socket, so the client exercises the actual wire protocol end to end.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpibd::hislip::client::HislipClient;
-use gpibd::hislip::server::{run, Config, Device};
 use tokio::net::TcpListener;
+use ugpibd::hislip::client::HislipClient;
+use ugpibd::hislip::server::{run, Config, Device};
 
 /// A device that records control operations and echoes data so the client's
 /// round-trips can be asserted.

@@ -1,5 +1,5 @@
 [package]
-name = "gpibd"
+name = "ugpibd"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -7,11 +7,11 @@ license = "GPL-3.0-or-later"
 description = "Userspace driver for Agilent/Keysight 82357B USB-GPIB adapter with Prologix TCP server"
 
 [[bin]]
-name = "gpibd"
+name = "ugpibd"
 path = "src/main.rs"
 
 [lib]
-name = "gpibd"
+name = "ugpibd"
 path = "src/lib.rs"
 
 [dependencies]

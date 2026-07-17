@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use gpibd::hislip::messages::{
-    InitializeParameter, InitializeResponseParameter, Message, MessageType,
-};
-use gpibd::hislip::protocol::PROTOCOL_2_0;
-use gpibd::hislip::server::{run, Config, Device};
 use tokio::io::BufStream;
 use tokio::net::{TcpListener, TcpStream};
+use ugpibd::hislip::messages::{
+    InitializeParameter, InitializeResponseParameter, Message, MessageType,
+};
+use ugpibd::hislip::protocol::PROTOCOL_2_0;
+use ugpibd::hislip::server::{run, Config, Device};
 
 struct EchoDevice;
 

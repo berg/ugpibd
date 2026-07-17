@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 gpibd contributors
+// Copyright (C) 2026 ugpibd contributors
 
 use std::sync::Arc;
 
@@ -386,7 +386,7 @@ mod tests {
         // The macOS IOKit backend collapses idle/not-responding/timeout into
         // `Unknown`; a stall or transient fault is likewise recoverable by
         // clearing the halt and resubmitting. None of these may kill the
-        // poller — that's the "must restart gpibd after idle" bug.
+        // poller — that's the "must restart ugpibd after idle" bug.
         assert_eq!(
             classify_error(&TransferError::Unknown),
             PollerAction::Recover

@@ -9,4 +9,4 @@ hardware. See the upstream repository's README files for the full
 redistribution context.
 
 This LICENSE notice applies only to the firmware blob in this directory.
-The rest of the gpibd source tree is GPL-3.0-or-later.
+The rest of the ugpibd source tree is GPL-3.0-or-later.
