@@ -7,7 +7,6 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -34,6 +33,11 @@ struct Args {
     /// GPIB timeout in milliseconds
     #[arg(long, default_value_t = 3000)]
     timeout_ms: u32,
+
+    /// USB-GPIB adapter backend: "auto" to detect by USB VID/PID, "list" to
+    /// print the known backends and exit, or a specific backend id.
+    #[arg(long, default_value = "auto")]
+    backend: String,
 
     /// Default GPIB primary address for HiSLIP clients that do not encode
     /// one in their subaddress (e.g. the bare "hislip0" subaddress).
@@ -64,37 +68,19 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!("ugpibd starting — looking for 82357B");
-    let transport = ugpibd::usb::initialize_device(args.timeout_ms).await?;
-    info!("USB device open");
-
-    let mut ctrl = ugpibd::gpib::GpibController::new(transport, args.timeout_ms);
-
-    // Try up to 3 times: abort -> init. If init fails it's usually because
-    // the device is holding stale state from a prior session; another abort
-    // (flush + finalize) typically unsticks it.
-    let mut last_err = None;
-    for attempt in 1..=3 {
-        let _ = ctrl.abort(true).await; // flush pending
-        let _ = ctrl.abort(false).await; // finalize
-        match ctrl.init(0).await {
-            Ok(()) => {
-                info!("GPIB controller initialized (attempt {attempt})");
-                last_err = None;
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("init attempt {attempt} failed: {e:#}");
-                last_err = Some(e);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
+    if args.backend == "list" {
+        for kind in ugpibd::backend::BackendKind::ALL {
+            println!("{:<16}  {}", kind.id(), kind.description());
         }
-    }
-    if let Some(e) = last_err {
-        return Err(e);
+        return Ok(());
     }
 
-    let ctrl: Arc<Mutex<dyn ugpibd::backend::GpibBackend>> = Arc::new(Mutex::new(ctrl));
+    info!("ugpibd starting");
+    let selection = match args.backend.as_str() {
+        "auto" => None,
+        id => Some(id),
+    };
+    let ctrl = ugpibd::backend::open_selected(selection, args.timeout_ms).await?;
 
     let prologix_listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
     info!("prologix listening on {}:{}", args.bind, args.port);
