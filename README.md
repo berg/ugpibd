@@ -144,12 +144,42 @@ Stubbed (no-op or constant response): `++srq`, `++spoll`, `++llo`, `++loc`,
 - No secondary addressing
 - 8-bit EOS comparison only
 
+## Origin and relationship to linux-gpib
+
+The USB adapter backends in `src/backend/` are **not** original protocol
+implementations. They were translated — re-expressed in Rust — from the
+in-kernel GPIB drivers under `drivers/gpib/`, as of the **Linux v7.0** release
+(`VERSION = 7`, `PATCHLEVEL = 0`, `SUBLEVEL = 0`). That subsystem is the
+mainline home of the [linux-gpib] project by Frank Mori Hess. Concretely:
+
+- `agilent-82357a` / `agilent-82357b` ← `drivers/gpib/agilent_82357a/`, plus
+  the shared `tms9914` controller logic
+- `ni-usb-hs` ← `drivers/gpib/ni_usb/ni_usb_gpib.c`, plus `nec7210` / `tnt4882`
+  register definitions
+
+> [!IMPORTANT]
+> **Report bugs here — never to the linux-gpib or kernel `drivers/gpib`
+> maintainers.** ugpibd is an independent userspace re-implementation. Any
+> defect you hit is a bug in *this* port: the upstream maintainers did not
+> write this Rust code, cannot reproduce it, and cannot support it. Do **not**
+> open issues, send email, or otherwise contact them about ugpibd. File it in
+> this repository's issue tracker instead.
+
+[linux-gpib]: https://linux-gpib.sourceforge.io/
+
 ## License
 
-The daemon is GPL-3.0-or-later. The firmware blob under `firmware/` is
-redistributed from https://github.com/fmhess/linux_gpib_firmware; see
-`firmware/LICENSE` for its terms.
+`ugpibd` as a whole is distributed under **GPL-3.0-or-later**; every source
+file carries an SPDX header.
 
-The HiSLIP message codec and protocol definitions in `src/hislip/` are
-adapted from [lxi-rs](https://github.com/Atmelfan/lxi-rs) (GPL-3.0-or-later,
-© Gustav Palmqvist).
+- **Translated adapter drivers** (`src/backend/`) are a derivative work of the
+  in-kernel `drivers/gpib/` drivers (the linux-gpib project), copyright ©
+  2001–2006 Frank Mori Hess and © 1997–2002 David A. Schleef, among others.
+- **HiSLIP message codec and protocol definitions** (`src/hislip/`) are adapted
+  from [lxi-rs](https://github.com/Atmelfan/lxi-rs) (GPL-3.0-or-later,
+  © Gustav Palmqvist).
+- **Firmware blob** (`firmware/measat_releaseX1.8.hex`) is proprietary
+  Agilent/Keysight firmware, redistributed unmodified from
+  [fmhess/linux_gpib_firmware](https://github.com/fmhess/linux_gpib_firmware).
+  It is **not** covered by this project's GPL; see `firmware/LICENSE` for its
+  redistribution terms.
