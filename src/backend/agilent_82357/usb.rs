@@ -313,7 +313,7 @@ pub async fn initialize_device(model: &Model, timeout_ms: u32) -> Result<UsbTran
         let device = current
             .open()
             .with_context(|| format!("failed to open pre-init device (attempt {attempt})"))?;
-        super::firmware::upload_firmware(&device, firmware)
+        super::firmware::upload_firmware(&device, firmware, model.cpucs_addr)
             .await
             .with_context(|| format!("firmware upload failed (attempt {attempt})"))?;
         info!(attempt, "upload done, waiting for renumeration");
