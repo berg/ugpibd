@@ -55,6 +55,15 @@ impl Default for PrologixState {
 }
 
 impl PrologixState {
+    /// Like `default()`, but with the initial addressed PAD set to `addr`.
+    /// Used to seed the front-end from the daemon's `--default-address`.
+    pub fn with_addr(addr: u8) -> Self {
+        Self {
+            addr,
+            ..Self::default()
+        }
+    }
+
     /// Process one line from the TCP client.
     pub fn handle_line(&mut self, line: &str) -> LineResult {
         let line = line.trim_end_matches(['\r', '\n']);

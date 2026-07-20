@@ -39,10 +39,11 @@ struct Args {
     #[arg(long, default_value = "auto")]
     backend: String,
 
-    /// Default GPIB primary address for HiSLIP clients that do not encode
-    /// one in their subaddress (e.g. the bare "hislip0" subaddress).
-    #[arg(long, default_value_t = 14)]
-    hislip_default_pad: u8,
+    /// Default GPIB primary address used when a request does not specify one:
+    /// the fallback PAD for HiSLIP clients using a bare "hislip0"/"gpib0"
+    /// subaddress, and the initial Prologix "++addr".
+    #[arg(long, default_value_t = 0)]
+    default_address: u8,
 
     /// Increase log verbosity: -v enables debug (dumps HiSLIP cmd/response
     /// bytes with non-printables escaped), -vv enables trace. Ignored if
@@ -102,7 +103,7 @@ async fn main() -> Result<()> {
 
     let prologix_ctrl = ctrl.clone();
     let hislip_ctrl = ctrl.clone();
-    let default_pad = args.hislip_default_pad;
+    let default_pad = args.default_address;
 
     let hislip_fut = async move {
         match hislip_listener {
@@ -123,7 +124,7 @@ async fn main() -> Result<()> {
     };
 
     tokio::select! {
-        result = ugpibd::server::run(prologix_listener, prologix_ctrl) => result?,
+        result = ugpibd::server::run(prologix_listener, prologix_ctrl, default_pad) => result?,
         result = hislip_fut => result?,
         _ = ctrl_c => info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
