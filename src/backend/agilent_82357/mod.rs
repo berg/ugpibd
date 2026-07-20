@@ -83,9 +83,14 @@ pub const MODEL_82357A: Model = Model {
 };
 
 /// Discover, firmware-load if needed, open, and initialize the adapter.
-pub async fn open(model: &'static Model, timeout_ms: u32) -> Result<SharedBackend> {
+/// `port` restricts the search to the device at that USB port id.
+pub async fn open(
+    model: &'static Model,
+    timeout_ms: u32,
+    port: Option<&str>,
+) -> Result<SharedBackend> {
     info!("opening {}", model.description);
-    let transport = usb::initialize_device(model, timeout_ms).await?;
+    let transport = usb::initialize_device(model, timeout_ms, port).await?;
     info!("USB device open");
 
     let mut ctrl = GpibController::new(transport, timeout_ms);

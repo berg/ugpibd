@@ -189,25 +189,35 @@ impl Transport for UsbTransport {
     }
 }
 
-/// Find an adapter of `model` in either pre-firmware or post-firmware state.
-pub fn find_device(model: &Model) -> Result<(nusb::DeviceInfo, u16)> {
+/// Find an adapter of `model` in either pre-firmware or post-firmware state,
+/// restricted to `port` (USB port id) when given.
+pub fn find_device(model: &Model, port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
     let devices = nusb::list_devices().context("failed to list USB devices")?;
     for dev in devices {
         if dev.vendor_id() != USB_VID_AGILENT {
             continue;
         }
         let pid = dev.product_id();
-        if pid == model.pid_ready || pid == model.pid_preinit {
-            return Ok((dev, pid));
+        if pid != model.pid_ready && pid != model.pid_preinit {
+            continue;
         }
+        if let Some(want) = port {
+            if crate::backend::select::port_id(&dev) != want {
+                continue;
+            }
+        }
+        return Ok((dev, pid));
     }
-    anyhow::bail!(
-        "no {} found (expected VID {:#06x}, PID {:#06x} or {:#06x})",
-        model.id,
-        USB_VID_AGILENT,
-        model.pid_preinit,
-        model.pid_ready
-    )
+    match port {
+        Some(want) => anyhow::bail!("no {} found at USB port {want:?}", model.id),
+        None => anyhow::bail!(
+            "no {} found (expected VID {:#06x}, PID {:#06x} or {:#06x})",
+            model.id,
+            USB_VID_AGILENT,
+            model.pid_preinit,
+            model.pid_ready
+        ),
+    }
 }
 
 /// Open device, claim interface 0, return UsbTransport wired to the model's endpoints.
@@ -280,8 +290,12 @@ pub async fn wait_for_pid(pid: u16, timeout: std::time::Duration) -> Result<nusb
 
 /// Full startup sequence: firmware upload if needed, returning an open `UsbTransport`.
 /// Implements the 82357B double-upload quirk.
-pub async fn initialize_device(model: &Model, timeout_ms: u32) -> Result<UsbTransport> {
-    let (dev_info, pid) = find_device(model)?;
+pub async fn initialize_device(
+    model: &Model,
+    timeout_ms: u32,
+    port: Option<&str>,
+) -> Result<UsbTransport> {
+    let (dev_info, pid) = find_device(model, port)?;
 
     if pid == model.pid_ready {
         info!(
@@ -326,7 +340,7 @@ pub async fn initialize_device(model: &Model, timeout_ms: u32) -> Result<UsbTran
         // pre-renumeration handle.
         let (new_info, new_pid) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            wait_for_renumeration(model, old_bus, old_addr),
+            wait_for_renumeration(model, port, old_bus, old_addr),
         )
         .await
         .with_context(|| format!("timeout waiting for renumeration on attempt {attempt}"))??;
@@ -351,9 +365,13 @@ pub async fn initialize_device(model: &Model, timeout_ms: u32) -> Result<UsbTran
 }
 
 /// Wait for the pre-firmware device at `(old_bus, old_addr)` to disappear, then
-/// poll for any PID of `model` to appear (with a new bus/address or the same one).
+/// poll for a PID of `model` to appear. When `port` is set, only the device at
+/// that USB port id is accepted — the port is stable across renumeration, so
+/// this re-finds the *same* physical adapter even when identical units share the
+/// bus.
 async fn wait_for_renumeration(
     model: &Model,
+    port: Option<&str>,
     old_bus: u8,
     old_addr: u8,
 ) -> Result<(nusb::DeviceInfo, u16)> {
@@ -385,6 +403,11 @@ async fn wait_for_renumeration(
             if dev.vendor_id() == USB_VID_AGILENT {
                 let pid = dev.product_id();
                 if pid == model.pid_ready || pid == model.pid_preinit {
+                    if let Some(want) = port {
+                        if crate::backend::select::port_id(&dev) != want {
+                            continue;
+                        }
+                    }
                     return Ok((dev, pid));
                 }
             }

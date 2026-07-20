@@ -22,6 +22,26 @@ the ids.
 | `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | **Experimental — firmware now bundled and uploaded automatically, but not yet tested on 82357A hardware** |
 | `ni-usb-hs` | NI GPIB-USB-HS / HS+ (and KUSB-488A, MC-USB-488 clones), VID `0x3923` | **Experimental — translated from the kernel driver, not yet tested on hardware** |
 
+### Multiple adapters
+
+With one adapter attached, `auto` just works. When several are present, list
+them and pick one by its physical USB port:
+
+```bash
+$ ugpibd --list
+#   backend          vid:pid    port           serial             product
+0   agilent-82357b   0957:0718  1-1.1          (none)             82357B
+1   agilent-82357b   0957:0718  1-1.2          (none)             82357B
+
+$ ugpibd --usb-port 1-1.2
+```
+
+The **port id** identifies the physical socket, not the unit: on Linux it is the
+sysfs name (`1-1.2`), on macOS the IOKit location id (`0x03440000`). It is stable
+across replug into the same port and across firmware reload. Serial numbers are
+shown for reference only — this hardware's serials are not reliably unique, so
+they are never used to select an adapter.
+
 ## Requirements
 
 - Linux (Ubuntu 24.04+) or macOS 12+

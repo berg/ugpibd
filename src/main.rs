@@ -43,6 +43,15 @@ struct Args {
     #[arg(long)]
     enable_prologix: bool,
 
+    /// List attached supported USB-GPIB adapters (with their port ids) and exit.
+    #[arg(long)]
+    list: bool,
+
+    /// Select the adapter at this USB port id (from --list). Needed when more
+    /// than one supported adapter is attached.
+    #[arg(long)]
+    usb_port: Option<String>,
+
     /// Default GPIB primary address used when a request does not specify one:
     /// the fallback PAD for HiSLIP clients using a bare "hislip0"/"gpib0"
     /// subaddress, and the initial Prologix "++addr".
@@ -82,17 +91,45 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.list {
+        let found = ugpibd::backend::select::enumerate()?;
+        if found.is_empty() {
+            println!("no supported USB-GPIB adapters found");
+        } else {
+            println!(
+                "{:<3} {:<16} {:<10} {:<14} {:<18} product",
+                "#", "backend", "vid:pid", "port", "serial"
+            );
+            for (i, a) in found.iter().enumerate() {
+                println!(
+                    "{:<3} {:<16} {:<10} {:<14} {:<18} {}",
+                    i,
+                    a.kind.id(),
+                    format!("{:04x}:{:04x}", a.vid, a.pid),
+                    a.port_id,
+                    a.serial.as_deref().unwrap_or("(none)"),
+                    a.product.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        return Ok(());
+    }
+
     info!("ugpibd starting");
     if !args.enable_prologix && args.hislip_port == 0 {
         anyhow::bail!(
             "no front-end enabled: pass --enable-prologix and/or a nonzero --hislip-port"
         );
     }
-    let selection = match args.backend.as_str() {
+    let backend = match args.backend.as_str() {
         "auto" => None,
         id => Some(id),
     };
-    let ctrl = ugpibd::backend::open_selected(selection, args.timeout_ms).await?;
+    let selector = match args.usb_port {
+        Some(ref port) => ugpibd::backend::select::UsbSelector::Port(port.clone()),
+        None => ugpibd::backend::select::UsbSelector::Auto,
+    };
+    let ctrl = ugpibd::backend::open_selected(&selector, backend, args.timeout_ms).await?;
 
     let prologix_listener = if args.enable_prologix {
         let l = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
