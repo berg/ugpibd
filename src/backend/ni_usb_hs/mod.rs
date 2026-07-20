@@ -219,10 +219,11 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 }
 
-/// Discover, open, and initialize an NI GPIB-USB-HS.
-pub async fn open(timeout_ms: u32) -> Result<SharedBackend> {
+/// Discover, open, and initialize an NI GPIB-USB-HS. `port` restricts the
+/// search to the device at that USB port id.
+pub async fn open(timeout_ms: u32, port: Option<&str>) -> Result<SharedBackend> {
     warn!("ni-usb-hs backend is EXPERIMENTAL and untested on hardware");
-    let transport = usb::NiUsbTransport::open(timeout_ms).await?;
+    let transport = usb::NiUsbTransport::open(timeout_ms, port).await?;
     let backend: SharedBackend = std::sync::Arc::new(tokio::sync::Mutex::new(NiUsbHsBackend::new(
         transport, timeout_ms,
     )));

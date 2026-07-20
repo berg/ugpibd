@@ -19,6 +19,9 @@ use tracing::info;
 
 pub mod agilent_82357;
 pub mod ni_usb_hs;
+pub mod select;
+
+use select::UsbSelector;
 
 /// The daemon shares one opened adapter across both front-ends behind this.
 pub type SharedBackend = Arc<Mutex<dyn GpibBackend>>;
@@ -126,25 +129,15 @@ impl BackendKind {
         BackendKind::ALL.iter().copied().find(|k| k.id() == id)
     }
 
-    /// Open, initialize, and return the adapter ready for use.
-    pub async fn open(self, timeout_ms: u32) -> Result<SharedBackend> {
+    /// Open, initialize, and return the adapter ready for use. `port` restricts
+    /// the search to the device at that USB port id (see `select::port_id`).
+    pub async fn open(self, timeout_ms: u32, port: Option<&str>) -> Result<SharedBackend> {
         match self {
             BackendKind::Agilent82357b | BackendKind::Agilent82357a => {
-                agilent_82357::open(self.agilent_model(), timeout_ms).await
+                agilent_82357::open(self.agilent_model(), timeout_ms, port).await
             }
-            BackendKind::NiUsbHs => ni_usb_hs::open(timeout_ms).await,
+            BackendKind::NiUsbHs => ni_usb_hs::open(timeout_ms, port).await,
         }
-    }
-
-    /// Whether any currently-connected USB device matches this adapter.
-    fn is_present(self) -> Result<bool> {
-        let ids = self.usb_ids();
-        for dev in nusb::list_devices().context("failed to list USB devices")? {
-            if ids.contains(&(dev.vendor_id(), dev.product_id())) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -157,42 +150,24 @@ pub fn known_ids() -> String {
         .join(", ")
 }
 
-/// Auto-detect exactly one connected supported adapter by USB VID/PID.
-/// Errors if none — or more than one — is present.
-pub fn detect() -> Result<BackendKind> {
-    let mut found = Vec::new();
-    for &kind in BackendKind::ALL {
-        if kind.is_present()? {
-            found.push(kind);
-        }
+/// Open a backend. `backend` is `None` to accept any kind, or `Some(id)` to
+/// require a specific one; `selector` picks among several attached adapters by
+/// USB port. Errors (naming the candidates) unless exactly one adapter matches.
+pub async fn open_selected(
+    selector: &UsbSelector,
+    backend: Option<&str>,
+    timeout_ms: u32,
+) -> Result<SharedBackend> {
+    if let Some(id) = backend {
+        BackendKind::from_id(id)
+            .with_context(|| format!("unknown backend {id:?} (known: {})", known_ids()))?;
     }
-    match found.as_slice() {
-        [] => anyhow::bail!(
-            "no supported USB-GPIB adapter detected (known backends: {})",
-            known_ids()
-        ),
-        [one] => Ok(*one),
-        multiple => {
-            let ids = multiple
-                .iter()
-                .map(|k| k.id())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "multiple supported adapters present ({ids}); select one with --backend <id>"
-            )
-        }
-    }
-}
-
-/// Open a backend. `selection` is `None` to auto-detect, or `Some(id)` to force
-/// a specific one.
-pub async fn open_selected(selection: Option<&str>, timeout_ms: u32) -> Result<SharedBackend> {
-    let kind = match selection {
-        None => detect()?,
-        Some(id) => BackendKind::from_id(id)
-            .with_context(|| format!("unknown backend {id:?} (known: {})", known_ids()))?,
-    };
-    info!("using backend {}", kind.id());
-    kind.open(timeout_ms).await
+    let found = select::enumerate()?;
+    let chosen = select::resolve(&found, backend, selector)?;
+    info!(
+        "using backend {} at USB port {}",
+        chosen.kind.id(),
+        chosen.port_id
+    );
+    chosen.kind.open(timeout_ms, Some(&chosen.port_id)).await
 }

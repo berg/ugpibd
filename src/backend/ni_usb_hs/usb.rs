@@ -58,8 +58,8 @@ pub struct NiUsbTransport {
 impl NiUsbTransport {
     /// Find the first connected NI GPIB-USB-HS-compatible adapter, claim its
     /// GPIB interface, and wire up the fixed endpoints.
-    pub async fn open(timeout_ms: u32) -> Result<Self> {
-        let (dev_info, pid) = find_device()?;
+    pub async fn open(timeout_ms: u32, port: Option<&str>) -> Result<Self> {
+        let (dev_info, pid) = find_device(port)?;
         let device = dev_info.open().context("failed to open NI USB device")?;
         let interface = device.claim_interface(0).context(
             "failed to claim NI GPIB interface 0 — is the kernel ni_usb driver loaded? \
@@ -84,21 +84,31 @@ impl NiUsbTransport {
     }
 }
 
-/// Locate an NI GPIB-USB-HS-compatible adapter, returning its info and PID.
-fn find_device() -> Result<(nusb::DeviceInfo, u16)> {
+/// Locate an NI GPIB-USB-HS-compatible adapter, returning its info and PID,
+/// restricted to `port` (USB port id) when given.
+fn find_device(port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
     for dev in nusb::list_devices().context("failed to list USB devices")? {
         if dev.vendor_id() != USB_VENDOR_ID_NI {
             continue;
         }
         let pid = dev.product_id();
-        if super::USB_IDS.contains(&(USB_VENDOR_ID_NI, pid)) {
-            return Ok((dev, pid));
+        if !super::USB_IDS.contains(&(USB_VENDOR_ID_NI, pid)) {
+            continue;
         }
+        if let Some(want) = port {
+            if crate::backend::select::port_id(&dev) != want {
+                continue;
+            }
+        }
+        return Ok((dev, pid));
     }
-    anyhow::bail!(
-        "no NI GPIB-USB-HS adapter found (expected VID {:#06x})",
-        USB_VENDOR_ID_NI
-    )
+    match port {
+        Some(want) => anyhow::bail!("no NI GPIB-USB-HS adapter found at USB port {want:?}"),
+        None => anyhow::bail!(
+            "no NI GPIB-USB-HS adapter found (expected VID {:#06x})",
+            USB_VENDOR_ID_NI
+        ),
+    }
 }
 
 #[async_trait::async_trait]
