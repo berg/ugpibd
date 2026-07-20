@@ -3,7 +3,7 @@
 Userspace Rust daemon for USB-to-GPIB adapters that otherwise need an
 out-of-tree kernel driver. Exposes two TCP front-ends against the same bus:
 
-- **Prologix-compatible** ASCII protocol on port 1234 (configurable)
+- **Prologix-compatible** ASCII protocol on port 1234 (opt-in via `--enable-prologix`)
 - **HiSLIP** (IVI-6.1) on port 4880 (the IANA-assigned HiSLIP port)
 
 Use HiSLIP with pyvisa/NI-VISA for proper `TCPIP::...::INSTR` resource
@@ -19,7 +19,7 @@ the ids.
 | Backend id | Adapter | Status |
 |------------|---------|--------|
 | `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
-| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | Shares the 82357B's protocol, but its firmware image is **not bundled** — a cold adapter must be firmware-loaded externally (e.g. `fxload`); an already-initialized one works |
+| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | **Experimental — firmware now bundled and uploaded automatically, but not yet tested on 82357A hardware** |
 | `ni-usb-hs` | NI GPIB-USB-HS / HS+ (and KUSB-488A, MC-USB-488 clones), VID `0x3923` | **Experimental — translated from the kernel driver, not yet tested on hardware** |
 
 ## Requirements
@@ -36,6 +36,10 @@ sudo cp contrib/99-ugpibd.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ./target/release/ugpibd
 ```
+
+By default the daemon binds to `127.0.0.1` and runs only the HiSLIP
+front-end. Pass `--bind 0.0.0.0` (or a specific interface address) for
+remote access, and `--enable-prologix` to also expose the Prologix port.
 
 For protocol-level tracing:
 
@@ -69,7 +73,7 @@ print(inst.query("*IDN?"))
 
 The HiSLIP server accepts sub-addresses of the form `hislip<N>`,
 `gpib<N>`, or a bare `<N>`. A bare `hislip0` / `gpib0` means "use the
-daemon's configured default PAD" (`--hislip-default-pad`, default 14).
+daemon's configured default PAD" (`--default-address`, default 0).
 
 Why no comma in the sub-address: pyvisa-py parses
 `hislip0,15` as `sub_address=hislip0, port=15` — it would try to open
