@@ -10,28 +10,36 @@ pub struct HexRecord {
     pub data: Vec<u8>,
 }
 
-/// The 82357B firmware blob. The 82357A uses a different image that is not
-/// bundled (see the `agilent_82357` module docs).
-pub const FX2_FIRMWARE_82357B: &[u8] = include_bytes!("../../../firmware/measat_releaseX1.8.hex");
+/// The 82357B firmware blob (Cypress FX2 part).
+pub const FIRMWARE_82357B: &[u8] = include_bytes!("../../../firmware/measat_releaseX1.8.hex");
+/// The 82357A firmware blob (first-generation EZ-USB / AN2131 part).
+pub const FIRMWARE_82357A: &[u8] = include_bytes!("../../../firmware/82357a_fw.hex");
 
-// FX2 vendor-request constants for 8051 memory access.
+// EZ-USB vendor request that writes on-chip RAM while the 8051 is held in reset.
 const ANCHOR_LOAD_INTERNAL: u8 = 0xA0;
-const CPUCS_ADDR: u16 = 0xE600;
 
-/// Upload `firmware` (Intel HEX text) to an FX2 device in pre-init state.
+/// Upload `firmware` (Intel HEX text) to an EZ-USB device in pre-init state.
 /// Holds the 8051 in reset, writes all HEX records, then releases reset.
-pub async fn upload_firmware(device: &nusb::Device, firmware: &[u8]) -> Result<()> {
+///
+/// `cpucs_addr` is the CPU control/status register that resets the 8051:
+/// `0xE600` on the FX2 (82357B), `0x7F92` on the first-gen EZ-USB / AN2131
+/// (82357A). Everything else is identical across the two parts.
+pub async fn upload_firmware(
+    device: &nusb::Device,
+    firmware: &[u8],
+    cpucs_addr: u16,
+) -> Result<()> {
     let hex_text = std::str::from_utf8(firmware).context("firmware blob is not valid UTF-8")?;
     let records = parse_hex(hex_text).context("failed to parse firmware HEX")?;
 
     tracing::info!("holding 8051 in reset");
-    fx2_control(device, CPUCS_ADDR, &[0x01])
+    anchor_load(device, cpucs_addr, &[0x01])
         .await
         .context("failed to hold 8051 in reset")?;
 
     tracing::info!(records = records.len(), "writing firmware records");
     for record in &records {
-        fx2_control(device, record.address, &record.data)
+        anchor_load(device, record.address, &record.data)
             .await
             .with_context(|| {
                 format!("failed to write firmware record at {:#06x}", record.address)
@@ -39,14 +47,14 @@ pub async fn upload_firmware(device: &nusb::Device, firmware: &[u8]) -> Result<(
     }
 
     tracing::info!("releasing 8051 from reset");
-    fx2_control(device, CPUCS_ADDR, &[0x00])
+    anchor_load(device, cpucs_addr, &[0x00])
         .await
         .context("failed to release 8051 from reset")?;
 
     Ok(())
 }
 
-async fn fx2_control(device: &nusb::Device, address: u16, data: &[u8]) -> Result<()> {
+async fn anchor_load(device: &nusb::Device, address: u16, data: &[u8]) -> Result<()> {
     let completion = device
         .control_out(ControlOut {
             control_type: ControlType::Vendor,

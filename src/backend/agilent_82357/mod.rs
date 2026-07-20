@@ -9,8 +9,10 @@
 // submodules below; a `Model` descriptor selects the per-adapter parameters.
 //
 // The 82357B is fully supported and hardware-tested. The 82357A reuses the
-// same proven protocol but its firmware image is not bundled, so a cold 82357A
-// (pre-firmware) cannot be brought up here — only one already firmware-loaded.
+// same proven protocol; both models' firmware images are bundled, so a cold
+// adapter (pre-firmware) is uploaded automatically. The only per-model wrinkle
+// is the CPU-reset register address (see `Model::cpucs_addr`) — the 82357A is a
+// first-gen EZ-USB (AN2131) part and remains untested on real hardware.
 
 pub mod firmware;
 pub mod gpib;
@@ -45,6 +47,9 @@ pub struct Model {
     pub irq_in_ep: u8,
     /// Firmware image to upload to a cold adapter, if bundled.
     pub firmware: Option<&'static [u8]>,
+    /// CPU control/status register that resets the 8051 during firmware upload:
+    /// `0xE600` on the FX2 (82357B), `0x7F92` on the first-gen EZ-USB (82357A).
+    pub cpucs_addr: u16,
 }
 
 pub const MODEL_82357B: Model = Model {
@@ -58,12 +63,13 @@ pub const MODEL_82357B: Model = Model {
     pid_ready: USB_PID_82357B,
     bulk_out_ep: EP_82357B_BULK_OUT,
     irq_in_ep: EP_82357B_IRQ_IN,
-    firmware: Some(firmware::FX2_FIRMWARE_82357B),
+    firmware: Some(firmware::FIRMWARE_82357B),
+    cpucs_addr: 0xE600,
 };
 
 pub const MODEL_82357A: Model = Model {
     id: "agilent-82357a",
-    description: "Agilent 82357A USB-GPIB adapter (experimental; firmware not bundled)",
+    description: "Agilent 82357A USB-GPIB adapter (experimental; hardware-untested)",
     usb_ids: &[
         (USB_VID_AGILENT, USB_PID_82357A_PREINIT),
         (USB_VID_AGILENT, USB_PID_82357A),
@@ -72,7 +78,8 @@ pub const MODEL_82357A: Model = Model {
     pid_ready: USB_PID_82357A,
     bulk_out_ep: EP_82357A_BULK_OUT,
     irq_in_ep: EP_82357A_IRQ_IN,
-    firmware: None,
+    firmware: Some(firmware::FIRMWARE_82357A),
+    cpucs_addr: 0x7F92,
 };
 
 /// Discover, firmware-load if needed, open, and initialize the adapter.

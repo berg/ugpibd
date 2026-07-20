@@ -13,7 +13,11 @@ use crate::backend::GpibBackend;
 use crate::prologix::{LineResult, PrologixState};
 
 /// Run the TCP server. Accepts one connection at a time.
-pub async fn run(listener: TcpListener, ctrl: Arc<Mutex<dyn GpibBackend>>) -> Result<()> {
+pub async fn run(
+    listener: TcpListener,
+    ctrl: Arc<Mutex<dyn GpibBackend>>,
+    default_pad: u8,
+) -> Result<()> {
     info!(
         "Prologix TCP server listening on {}",
         listener.local_addr()?
@@ -22,7 +26,7 @@ pub async fn run(listener: TcpListener, ctrl: Arc<Mutex<dyn GpibBackend>>) -> Re
     loop {
         let (mut stream, addr) = listener.accept().await?;
         info!(%addr, "client connected");
-        match handle_connection(&mut stream, &ctrl).await {
+        match handle_connection(&mut stream, &ctrl, default_pad).await {
             Ok(()) => info!(%addr, "client disconnected"),
             Err(e) => warn!(%addr, "client error: {e:#}"),
         }
@@ -32,10 +36,11 @@ pub async fn run(listener: TcpListener, ctrl: Arc<Mutex<dyn GpibBackend>>) -> Re
 async fn handle_connection(
     stream: &mut TcpStream,
     ctrl: &Arc<Mutex<dyn GpibBackend>>,
+    default_pad: u8,
 ) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut lines = BufReader::new(reader).lines();
-    let mut state = PrologixState::default();
+    let mut state = PrologixState::with_addr(default_pad);
 
     while let Some(line) = lines.next_line().await? {
         debug!("< {line:?}");
@@ -99,7 +104,7 @@ async fn handle_connection(
                 if let Err(e) = ctrl.lock().await.init(0).await {
                     warn!("gpib reset/init failed: {e:#}");
                 }
-                state = PrologixState::default();
+                state = PrologixState::with_addr(default_pad);
             }
         }
     }

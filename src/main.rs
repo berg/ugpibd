@@ -27,7 +27,7 @@ struct Args {
     hislip_port: u16,
 
     /// Bind address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
     /// GPIB timeout in milliseconds
@@ -39,10 +39,15 @@ struct Args {
     #[arg(long, default_value = "auto")]
     backend: String,
 
-    /// Default GPIB primary address for HiSLIP clients that do not encode
-    /// one in their subaddress (e.g. the bare "hislip0" subaddress).
-    #[arg(long, default_value_t = 14)]
-    hislip_default_pad: u8,
+    /// Enable the Prologix-compatible front-end (disabled by default).
+    #[arg(long)]
+    enable_prologix: bool,
+
+    /// Default GPIB primary address used when a request does not specify one:
+    /// the fallback PAD for HiSLIP clients using a bare "hislip0"/"gpib0"
+    /// subaddress, and the initial Prologix "++addr".
+    #[arg(long, default_value_t = 0)]
+    default_address: u8,
 
     /// Increase log verbosity: -v enables debug (dumps HiSLIP cmd/response
     /// bytes with non-printables escaped), -vv enables trace. Ignored if
@@ -65,6 +70,8 @@ async fn main() -> Result<()> {
     });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
         .with_writer(std::io::stderr)
         .init();
 
@@ -76,14 +83,24 @@ async fn main() -> Result<()> {
     }
 
     info!("ugpibd starting");
+    if !args.enable_prologix && args.hislip_port == 0 {
+        anyhow::bail!(
+            "no front-end enabled: pass --enable-prologix and/or a nonzero --hislip-port"
+        );
+    }
     let selection = match args.backend.as_str() {
         "auto" => None,
         id => Some(id),
     };
     let ctrl = ugpibd::backend::open_selected(selection, args.timeout_ms).await?;
 
-    let prologix_listener = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
-    info!("prologix listening on {}:{}", args.bind, args.port);
+    let prologix_listener = if args.enable_prologix {
+        let l = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
+        info!("prologix listening on {}:{}", args.bind, args.port);
+        Some(l)
+    } else {
+        None
+    };
 
     let hislip_listener = if args.hislip_port != 0 {
         let l = TcpListener::bind(format!("{}:{}", args.bind, args.hislip_port)).await?;
@@ -102,7 +119,14 @@ async fn main() -> Result<()> {
 
     let prologix_ctrl = ctrl.clone();
     let hislip_ctrl = ctrl.clone();
-    let default_pad = args.hislip_default_pad;
+    let default_pad = args.default_address;
+
+    let prologix_fut = async move {
+        match prologix_listener {
+            Some(listener) => ugpibd::server::run(listener, prologix_ctrl, default_pad).await,
+            None => std::future::pending::<Result<()>>().await,
+        }
+    };
 
     let hislip_fut = async move {
         match hislip_listener {
@@ -123,7 +147,7 @@ async fn main() -> Result<()> {
     };
 
     tokio::select! {
-        result = ugpibd::server::run(prologix_listener, prologix_ctrl) => result?,
+        result = prologix_fut => result?,
         result = hislip_fut => result?,
         _ = ctrl_c => info!("SIGINT received, shutting down"),
         _ = sigterm.recv() => info!("SIGTERM received, shutting down"),

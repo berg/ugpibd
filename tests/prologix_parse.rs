@@ -178,3 +178,11 @@ fn apply_eot_noop_when_disabled() {
     let out = s.apply_eot(b"hello".to_vec());
     assert_eq!(out, b"hello");
 }
+
+#[test]
+fn with_addr_sets_initial_address_and_keeps_defaults() {
+    let s = PrologixState::with_addr(12);
+    assert_eq!(s.addr, 12);
+    assert_eq!(s.eos_mode, PrologixState::default().eos_mode);
+    assert_eq!(s.eoi, PrologixState::default().eoi);
+}
