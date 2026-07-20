@@ -2,7 +2,7 @@
 
 Status: approved design (pending spec review)
 Date: 2026-07-20
-Target version: 0.3.0
+Target version: 0.2.1
 
 ## Summary
 
@@ -170,4 +170,5 @@ firmware double-upload dance.
 
 ## Version
 
-Minor bump to `0.3.0` (additive CLI; no breaking changes to existing flags).
+Patch bump to `0.2.1`: purely additive and optional — no existing flag changes,
+and the default single-adapter behavior is unchanged.
