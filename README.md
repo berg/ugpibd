@@ -20,7 +20,9 @@ the ids.
 |------------|---------|--------|
 | `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
 | `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | **Experimental — firmware now bundled and uploaded automatically, but not yet tested on 82357A hardware** |
-| `ni-usb-hs` | NI GPIB-USB-HS / HS+ (and KUSB-488A, MC-USB-488 clones), VID `0x3923` | **Experimental — translated from the kernel driver, not yet tested on hardware** |
+| `ni-usb-hs` | NI GPIB-USB-HS (USB `3923:709b`) | Supported |
+| `ni-usb-hs` | KUSB-488A (`3923:725c`), MC-USB-488 (`3923:725d`) | Untested, but byte-for-byte the same code path as the GPIB-USB-HS |
+| `ni-usb-hs` | NI GPIB-USB-HS+ (`3923:7618`) | **Experimental** — different endpoints and an extra vendor-request init, both implemented but never run on hardware |
 
 ### Multiple adapters
 
@@ -157,10 +159,17 @@ The following applies to the **Prologix** server (port 1234), not the
 
 
 Implemented: `++addr`, `++auto`, `++read`, `++eoi`, `++eos`, `++eot_enable`,
-`++eot_char`, `++read_tmo_ms`, `++clr`, `++ifc`, `++rst`, `++ver`, `++mode`.
+`++eot_char`, `++read_tmo_ms`, `++clr`, `++ifc`, `++rst`, `++ver`, `++mode`,
+`++spoll [pad]`, `++trg [pad]`, `++srq`.
 
-Stubbed (no-op or constant response): `++srq`, `++spoll`, `++llo`, `++loc`,
-`++savecfg`, `++trg`, `++status`.
+`++srq` reads the live SRQ line, so it needs a backend that can report bus
+state; on adapters that cannot (currently everything except `ni-usb-hs`) it
+logs a warning and returns nothing rather than inventing a "0".
+
+Accepted and ignored: `++llo`, `++loc`, `++savecfg`, `++status`.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining gaps, including
+asynchronous SRQ notification.
 
 ## Hardware limitations (firmware)
 

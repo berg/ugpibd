@@ -90,6 +90,26 @@ async fn handle_connection(
                     Err(e) => warn!("gpib read failed: {e:#}"),
                 }
             }
+            LineResult::SerialPoll { pad } => match ctrl.lock().await.serial_poll(pad).await {
+                Ok(stb) => {
+                    writer.write_all(format!("{stb}\n").as_bytes()).await?;
+                }
+                Err(e) => warn!("gpib serial_poll failed: {e:#}"),
+            },
+            LineResult::Trigger { pad } => {
+                if let Err(e) = ctrl.lock().await.trigger(pad).await {
+                    warn!("gpib trigger failed: {e:#}");
+                }
+            }
+            LineResult::Srq => match ctrl.lock().await.srq_asserted().await {
+                Ok(asserted) => {
+                    let v = u8::from(asserted);
+                    writer.write_all(format!("{v}\n").as_bytes()).await?;
+                }
+                // Never fall back to "0": that is indistinguishable from a
+                // healthy bus with nothing requesting service.
+                Err(e) => warn!("gpib srq check failed: {e:#}"),
+            },
             LineResult::DeviceClear { pad } => {
                 if let Err(e) = ctrl.lock().await.device_clear(pad).await {
                     warn!("gpib device_clear failed: {e:#}");

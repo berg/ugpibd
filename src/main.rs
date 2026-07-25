@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use ugpibd::hislip;
@@ -183,12 +183,24 @@ async fn main() -> Result<()> {
         }
     };
 
-    tokio::select! {
-        result = prologix_fut => result?,
-        result = hislip_fut => result?,
-        _ = ctrl_c => info!("SIGINT received, shutting down"),
-        _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+    let result = tokio::select! {
+        result = prologix_fut => result,
+        result = hislip_fut => result,
+        _ = ctrl_c => {
+            info!("SIGINT received, shutting down");
+            Ok(())
+        }
+        _ = sigterm.recv() => {
+            info!("SIGTERM received, shutting down");
+            Ok(())
+        }
+    };
+
+    // Leave the adapter clean for the next run even if a front-end failed;
+    // some adapters keep GPIB state across host restarts.
+    if let Err(e) = ctrl.lock().await.shutdown().await {
+        warn!("adapter shutdown failed: {e:#}");
     }
 
-    Ok(())
+    result
 }

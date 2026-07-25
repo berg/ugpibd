@@ -62,6 +62,17 @@ pub trait GpibBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Whether the SRQ line is currently asserted by some device on the bus.
+    ///
+    /// This is a level read of the physical line, not an event: it answers
+    /// "is anyone requesting service right now". The default reports that the
+    /// backend cannot tell, which callers must surface as an error rather than
+    /// as "no SRQ" — a fabricated "no" is indistinguishable from a working bus
+    /// and silently breaks any script that polls for service requests.
+    async fn srq_asserted(&mut self) -> Result<bool> {
+        anyhow::bail!("{} cannot read the SRQ line", self.name())
+    }
+
     /// Configure the end-of-string terminator used when reading.
     fn set_eos(&mut self, eos_char: u8, enabled: bool);
 
@@ -70,6 +81,15 @@ pub trait GpibBackend: Send + Sync {
 
     /// Stable identifier for this adapter kind (e.g. `"agilent-82357b"`).
     fn name(&self) -> &'static str;
+
+    /// Leave the adapter in a clean state before the daemon exits.
+    ///
+    /// Adapters keep their state across host process restarts, so skipping this
+    /// can leave hardware that the next session cannot talk to. Best-effort:
+    /// failures are logged, not propagated. The default does nothing.
+    async fn shutdown(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The set of adapter kinds this build knows how to drive. Each variant maps to
