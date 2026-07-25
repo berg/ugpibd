@@ -354,8 +354,8 @@ pub async fn open(timeout_ms: u32, port: Option<&str>) -> Result<SharedBackend> 
                 warn!("ni init attempt {attempt} failed: {e:#}");
                 last_err = Some(e);
                 drop(ctrl); // release the interface before reopening
-                // Escalate to re-applying the USB configuration, which resets
-                // endpoint state without re-enumerating the device.
+                            // Escalate to re-applying the USB configuration, which resets
+                            // endpoint state without re-enumerating the device.
                 if let Err(e) = usb::reset_configuration(port) {
                     warn!("ni USB configuration reset failed: {e:#}");
                 }
@@ -590,12 +590,18 @@ mod tests {
         // will talk GPIB; sending them to a plain HS would be wrong.
         let plus = init_requests_for(usb::PID_NI_USB_HS_PLUS).await;
         for req in [0x48, 0x4b, 0xf8] {
-            assert!(plus.contains(&req), "HS+ init must issue {req:#04x}: {plus:02x?}");
+            assert!(
+                plus.contains(&req),
+                "HS+ init must issue {req:#04x}: {plus:02x?}"
+            );
         }
 
         let hs = init_requests_for(usb::PID_NI_USB_HS).await;
         for req in [0x48, 0x4b, 0xf8] {
-            assert!(!hs.contains(&req), "plain HS must not issue {req:#04x}: {hs:02x?}");
+            assert!(
+                !hs.contains(&req),
+                "plain HS must not issue {req:#04x}: {hs:02x?}"
+            );
         }
 
         // The clones share the HS path exactly.
@@ -609,7 +615,11 @@ mod tests {
         // Getting these wrong is silent: transfers just never complete.
         let hs = [usb::PID_NI_USB_HS, usb::PID_KUSB_488A, usb::PID_MC_USB_488];
         for pid in hs {
-            assert_eq!(usb::endpoints_for_test(pid), (0x02, 0x84, 0x81), "pid {pid:#06x}");
+            assert_eq!(
+                usb::endpoints_for_test(pid),
+                (0x02, 0x84, 0x81),
+                "pid {pid:#06x}"
+            );
         }
         assert_eq!(
             usb::endpoints_for_test(usb::PID_NI_USB_HS_PLUS),

@@ -354,7 +354,10 @@ fn check_reply(what: &str, expected_id: u8, reply: &[u8]) {
 /// `ni_usb_set_interrupt_monitor`. The kernel issues this once with an empty
 /// mask before the init register sequence and again with the full mask after,
 /// and the adapter expects both before it will service addressed transfers.
-pub async fn set_interrupt_monitor<T: NiTransport>(transport: &T, monitored_bits: u16) -> Result<()> {
+pub async fn set_interrupt_monitor<T: NiTransport>(
+    transport: &T,
+    monitored_bits: u16,
+) -> Result<()> {
     let reply = transport
         .control_in(NI_USB_WAIT_REQUEST, 0x300, monitored_bits, 8)
         .await

@@ -7,9 +7,13 @@ pub enum LineResult {
     Response(String),
     Error(String),
     /// Serial-poll `pad` and return its status byte.
-    SerialPoll { pad: u8 },
+    SerialPoll {
+        pad: u8,
+    },
     /// Group execute trigger to `pad`.
-    Trigger { pad: u8 },
+    Trigger {
+        pad: u8,
+    },
     /// Report whether the SRQ line is currently asserted.
     Srq,
     /// Forward data to GPIB instrument.

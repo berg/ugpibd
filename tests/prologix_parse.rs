@@ -146,7 +146,10 @@ fn srq_spoll_and_trg_reach_the_bus() {
     assert_eq!(s.handle_line("++trg"), LineResult::Trigger { pad: 16 });
 
     // Explicit address overrides, without disturbing the addressed instrument.
-    assert_eq!(s.handle_line("++spoll 9"), LineResult::SerialPoll { pad: 9 });
+    assert_eq!(
+        s.handle_line("++spoll 9"),
+        LineResult::SerialPoll { pad: 9 }
+    );
     assert_eq!(s.handle_line("++trg 9"), LineResult::Trigger { pad: 9 });
     assert_eq!(s.addr, 16, "++spoll/++trg must not change the address");
 }

@@ -350,9 +350,7 @@ pub fn encode_data_write(data: &[u8], send_eoi: bool, timeout_code: u8) -> Vec<u
 pub fn parse_write_response(buf: &[u8], requested: usize) -> Result<usize> {
     let status = parse_status_block(buf)?;
     match status.error_code {
-        NIUSB_NO_ERROR | NIUSB_ABORTED_ERROR => {
-            Ok(requested.saturating_sub(status.count as usize))
-        }
+        NIUSB_NO_ERROR | NIUSB_ABORTED_ERROR => Ok(requested.saturating_sub(status.count as usize)),
         NIUSB_ATN_STATE_ERROR => bail!("ni write: ATN asserted during transfer"),
         NIUSB_ADDRESSING_ERROR => {
             bail!("ni write: addressing error (controller not in LACS/TACS)")
