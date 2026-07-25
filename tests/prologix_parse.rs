@@ -123,11 +123,41 @@ fn eot_settings() {
 #[test]
 fn stub_commands_respond() {
     let mut s = PrologixState::default();
-    for cmd in ["++srq", "++spoll", "++llo", "++loc", "++savecfg"] {
+    for cmd in ["++llo", "++loc", "++savecfg"] {
         let r = s.handle_line(cmd);
         assert!(
             !matches!(r, LineResult::Forward { .. }),
             "{cmd} should not forward"
+        );
+    }
+}
+
+/// `++srq` used to answer a hardcoded "0" and `++spoll`/`++trg` did nothing at
+/// all, so a polling script saw a healthy-looking bus that never had news. They
+/// must reach the bus now, never synthesise an answer.
+#[test]
+fn srq_spoll_and_trg_reach_the_bus() {
+    let mut s = PrologixState::default();
+    assert_eq!(s.handle_line("++srq"), LineResult::Srq);
+
+    s.handle_line("++addr 16");
+    // No argument: act on the currently addressed instrument.
+    assert_eq!(s.handle_line("++spoll"), LineResult::SerialPoll { pad: 16 });
+    assert_eq!(s.handle_line("++trg"), LineResult::Trigger { pad: 16 });
+
+    // Explicit address overrides, without disturbing the addressed instrument.
+    assert_eq!(s.handle_line("++spoll 9"), LineResult::SerialPoll { pad: 9 });
+    assert_eq!(s.handle_line("++trg 9"), LineResult::Trigger { pad: 9 });
+    assert_eq!(s.addr, 16, "++spoll/++trg must not change the address");
+}
+
+#[test]
+fn spoll_and_trg_reject_bad_addresses() {
+    let mut s = PrologixState::default();
+    for cmd in ["++spoll 31", "++spoll x", "++trg 31", "++trg -1"] {
+        assert!(
+            matches!(s.handle_line(cmd), LineResult::Error(_)),
+            "{cmd} should be rejected"
         );
     }
 }

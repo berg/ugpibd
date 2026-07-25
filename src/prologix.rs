@@ -6,6 +6,12 @@ pub enum LineResult {
     Ok,
     Response(String),
     Error(String),
+    /// Serial-poll `pad` and return its status byte.
+    SerialPoll { pad: u8 },
+    /// Group execute trigger to `pad`.
+    Trigger { pad: u8 },
+    /// Report whether the SRQ line is currently asserted.
+    Srq,
     /// Forward data to GPIB instrument.
     Forward {
         pad: u8,
@@ -26,6 +32,18 @@ pub enum LineResult {
     Ifc,
     /// Reset daemon GPIB state (not the instrument).
     Reset,
+}
+
+/// Parse an optional GPIB primary address argument, falling back to `default`
+/// (the currently addressed instrument) when the argument is empty.
+fn parse_optional_pad(args: &str, default: u8) -> Result<u8, String> {
+    if args.is_empty() {
+        return Ok(default);
+    }
+    match args.parse::<u8>() {
+        Ok(n) if n <= 30 => Ok(n),
+        _ => Err(format!("invalid address: {args}")),
+    }
 }
 
 #[derive(Debug)]
@@ -190,9 +208,22 @@ impl PrologixState {
                 ),
                 _ => LineResult::Error("++mode requires 0 or 1".into()),
             },
-            // Stubbed commands
-            "srq" => LineResult::Response("0".to_string()),
-            "spoll" | "llo" | "loc" | "trg" | "status" | "savecfg" => LineResult::Ok,
+            "srq" => LineResult::Srq,
+            // ++spoll [pad] — serial-poll the given address, or the currently
+            // addressed instrument when no argument is given.
+            "spoll" => match parse_optional_pad(args, self.addr) {
+                Ok(pad) => LineResult::SerialPoll { pad },
+                Err(e) => LineResult::Error(e),
+            },
+            // ++trg [pad] — group execute trigger.
+            "trg" => match parse_optional_pad(args, self.addr) {
+                Ok(pad) => LineResult::Trigger { pad },
+                Err(e) => LineResult::Error(e),
+            },
+            // Accepted and ignored. None of these have a reply in the real
+            // Prologix firmware, so silence is not misleading — but ++llo/++loc
+            // are real bus operations we do not perform. See docs/ROADMAP.md.
+            "llo" | "loc" | "status" | "savecfg" => LineResult::Ok,
             _ => LineResult::Error(format!("unknown command: {name}")),
         }
     }

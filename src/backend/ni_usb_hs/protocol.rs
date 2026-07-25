@@ -7,8 +7,8 @@
 // register and data operations in framed bulk blocks. All framing lives here as
 // pure encode/decode so it can be unit-tested without hardware.
 //
-// EXPERIMENTAL: translated from the C reference and validated only against the
-// byte layouts quoted there — not yet exercised on a physical adapter.
+// The encodings are unit-tested against the byte layouts in the C reference and
+// have been exercised on a physical GPIB-USB-HS.
 
 use anyhow::{bail, Result};
 
@@ -53,6 +53,18 @@ pub const REG_IMR0: u8 = 0x1d;
 pub const REG_HSSEL: u8 = 0x0d;
 pub const REG_CMDR: u8 = 0x1c; // TNT command register
 pub const REG_KEYREG: u8 = 0x17;
+pub const REG_BSR: u8 = 0x1f; // bus control/status register (live GPIB lines)
+
+// ---- BSR bits: the state of the physical GPIB control lines ----------------
+
+pub const BCSR_REN: u8 = 0x01;
+pub const BCSR_IFC: u8 = 0x02;
+pub const BCSR_SRQ: u8 = 0x04;
+pub const BCSR_EOI: u8 = 0x08;
+pub const BCSR_NRFD: u8 = 0x10;
+pub const BCSR_NDAC: u8 = 0x20;
+pub const BCSR_DAV: u8 = 0x40;
+pub const BCSR_ATN: u8 = 0x80;
 
 // ---- AUXMR command values (written to REG_AUXMR) ---------------------------
 
@@ -111,8 +123,59 @@ pub fn talk_address(pad: u8) -> u8 {
     0x40 | (pad & 0x1f)
 }
 
+// ---- ibsta status bits (as reported in the status block) -------------------
+
+pub const IBSTA_DCAS: u16 = 0x0001;
+pub const IBSTA_DTAS: u16 = 0x0002;
+pub const IBSTA_LACS: u16 = 0x0004;
+pub const IBSTA_TACS: u16 = 0x0008;
+pub const IBSTA_ATN: u16 = 0x0010;
+/// Controller-In-Charge. Clear until the system controller pulses IFC.
+pub const IBSTA_CIC: u16 = 0x0020;
+pub const IBSTA_REM: u16 = 0x0040;
+pub const IBSTA_LOK: u16 = 0x0080;
+pub const IBSTA_SRQI: u16 = 0x1000;
 /// ibsta END bit (message terminated by EOI or EOS).
 pub const IBSTA_END: u16 = 0x2000;
+pub const IBSTA_TIMO: u16 = 0x4000;
+
+/// The ibsta bits the adapter is asked to monitor (`ni_usb_ibsta_monitor_mask`).
+pub const IBSTA_MONITOR_MASK: u16 = IBSTA_SRQI
+    | IBSTA_LOK
+    | IBSTA_REM
+    | IBSTA_CIC
+    | IBSTA_ATN
+    | IBSTA_TACS
+    | IBSTA_LACS
+    | IBSTA_DTAS
+    | IBSTA_DCAS;
+
+// ---- Adapter error codes (status block byte 3) -----------------------------
+// From `enum ni_usb_error_codes` in the kernel driver.
+
+pub const NIUSB_NO_ERROR: u8 = 0;
+/// I/O interrupted early by a stop request; not a failure.
+pub const NIUSB_ABORTED_ERROR: u8 = 1;
+/// Board read attempted while ATN is asserted.
+pub const NIUSB_ATN_STATE_ERROR: u8 = 2;
+/// Board read/write as controller-in-charge while not in LACS/TACS.
+pub const NIUSB_ADDRESSING_ERROR: u8 = 3;
+/// EOS mode/char bits set without REOS — also returned for an invalid timeout
+/// code, or for more than 16 command bytes in one transfer.
+pub const NIUSB_EOSMODE_ERROR: u8 = 4;
+/// Command byte written with no devices on the bus.
+pub const NIUSB_NO_BUS_ERROR: u8 = 5;
+/// Board write as controller-in-charge with no listener addressed.
+pub const NIUSB_NO_LISTENER_ERROR: u8 = 8;
+pub const NIUSB_TIMEOUT_ERROR: u8 = 10;
+
+/// Largest single data transfer the adapter can express. The byte count travels
+/// as the 16-bit complement `!(len - 1)`, so a length of `0x10000` wraps to zero
+/// and the adapter transfers nothing at all. Callers must chunk beyond this.
+pub const MAX_TRANSFER_LEN: usize = 0xffff;
+
+/// Command bytes accepted in a single transfer; more returns an eos-mode error.
+pub const MAX_COMMAND_LEN: usize = 0x10;
 
 /// One register access: write `value` to (`device`, `address`) or read from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,10 +350,20 @@ pub fn encode_data_write(data: &[u8], send_eoi: bool, timeout_code: u8) -> Vec<u
 pub fn parse_write_response(buf: &[u8], requested: usize) -> Result<usize> {
     let status = parse_status_block(buf)?;
     match status.error_code {
-        0 | 1 => Ok(requested.saturating_sub(status.count as usize)),
-        3 => bail!("ni write: addressing error (no such device)"),
-        8 => bail!("ni write: no listener on bus"),
-        10 => bail!("ni write: timeout"),
+        NIUSB_NO_ERROR | NIUSB_ABORTED_ERROR => {
+            Ok(requested.saturating_sub(status.count as usize))
+        }
+        NIUSB_ATN_STATE_ERROR => bail!("ni write: ATN asserted during transfer"),
+        NIUSB_ADDRESSING_ERROR => {
+            bail!("ni write: addressing error (controller not in LACS/TACS)")
+        }
+        NIUSB_EOSMODE_ERROR => bail!(
+            "ni write: eos-mode error (bad eos bits, invalid timeout code, \
+             or >16 command bytes in one transfer)"
+        ),
+        NIUSB_NO_BUS_ERROR => bail!("ni write: no devices on the GPIB bus"),
+        NIUSB_NO_LISTENER_ERROR => bail!("ni write: no listener on bus"),
+        NIUSB_TIMEOUT_ERROR => bail!("ni write: timeout"),
         code => bail!("ni write: error code {code:#04x}"),
     }
 }
@@ -404,19 +477,44 @@ pub fn encode_interface_clear() -> Vec<u8> {
 
 /// Map a millisecond GPIB timeout to the adapter's timeout code byte.
 ///
-/// TRANSLATED, UNVERIFIED: the kernel `ni_usb_timeout_code` table was not
-/// captured during porting, so this uses a conservative fixed code that should
-/// give a multi-second bus timeout. Revisit against hardware.
-pub fn timeout_code(_timeout_ms: u32) -> u8 {
-    0x00
+/// Mirrors `ni_usb_timeout_code` in the kernel driver, whose table is keyed on
+/// *microseconds*. A timeout of 0 means "wait forever" (code `0xf0`). Note the
+/// codes are not monotonic: the two longest ranges wrap around to `0x01`/`0x02`.
+///
+/// There is no valid code `0x00` — sending one makes the adapter reject command
+/// and data transfers with `NIUSB_EOSMODE_ERROR`.
+pub fn timeout_code(timeout_ms: u32) -> u8 {
+    let usec = u64::from(timeout_ms) * 1000;
+    match usec {
+        0 => 0xf0,
+        u if u <= 10 => 0xf1,
+        u if u <= 30 => 0xf2,
+        u if u <= 100 => 0xf3,
+        u if u <= 300 => 0xf4,
+        u if u <= 1_000 => 0xf5,
+        u if u <= 3_000 => 0xf6,
+        u if u <= 10_000 => 0xf7,
+        u if u <= 30_000 => 0xf8,
+        u if u <= 100_000 => 0xf9,
+        u if u <= 300_000 => 0xfa,
+        u if u <= 1_000_000 => 0xfb,
+        u if u <= 3_000_000 => 0xfc,
+        u if u <= 10_000_000 => 0xfd,
+        u if u <= 30_000_000 => 0xfe,
+        u if u <= 100_000_000 => 0xff,
+        u if u <= 300_000_000 => 0x01,
+        u if u <= 1_000_000_000 => 0x02,
+        _ => 0xf0,
+    }
 }
 
 /// The 26-register init sequence bringing the TNT4882 up as system controller
 /// at primary address `pad`, with secondary addressing disabled, T1 = 500 ns,
 /// and EOS mode `eos_mode`. Transcribed from `ni_usb_setup_init`.
 ///
-/// TRANSLATED, UNVERIFIED on hardware — the ordering and values mirror the C
-/// reference but have not been exercised on a physical adapter.
+/// The ordering and values mirror the C reference and are verified on hardware.
+/// Note this only *configures* the chip: it does not put the adapter on the bus.
+/// Pulsing IFC afterwards is what makes it Controller-In-Charge — see `init`.
 pub fn setup_init(pad: u8, eos_mode: u16) -> Vec<NiRegister> {
     let tnt = SUBDEV_TNT4882;
     let auxra = AUXRA | HR_HLDA | if eos_mode & 0x0400 != 0 { HR_BIN } else { 0 };
@@ -558,6 +656,29 @@ mod tests {
         assert_eq!(&buf[11..14], &[SUBDEV_TNT4882, REG_AUXMR, AUX_HLDI]);
         assert_eq!(&buf[14..17], &[SUBDEV_TNT4882, REG_AUXMR, AUX_CLEAR_END]);
         is_4_aligned_terminated(&buf);
+    }
+
+    #[test]
+    fn timeout_codes_match_the_reference_table() {
+        // Keyed on microseconds, so the ms argument is scaled by 1000.
+        assert_eq!(timeout_code(0), 0xf0, "0 means wait forever");
+        assert_eq!(timeout_code(1), 0xf5); // 1 ms  -> 1000 us
+        assert_eq!(timeout_code(3), 0xf6); // 3 ms  -> 3000 us
+        assert_eq!(timeout_code(1000), 0xfb); // 1 s
+        assert_eq!(timeout_code(3000), 0xfc); // 3 s (the daemon default)
+        assert_eq!(timeout_code(100_000), 0xff); // 100 s
+        assert_eq!(timeout_code(300_000), 0x01); // table wraps around here
+        assert_eq!(timeout_code(1_000_000), 0x02);
+        assert_eq!(timeout_code(u32::MAX), 0xf0, "out of range falls back");
+    }
+
+    #[test]
+    fn timeout_code_is_never_zero() {
+        // 0x00 is not a valid code: the adapter answers a transfer carrying one
+        // with NIUSB_EOSMODE_ERROR, which is what broke every command byte.
+        for ms in [0, 1, 2, 5, 10, 100, 500, 3000, 10_000, 60_000, u32::MAX] {
+            assert_ne!(timeout_code(ms), 0x00, "timeout_code({ms}) must be valid");
+        }
     }
 
     #[test]
