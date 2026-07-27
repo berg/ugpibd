@@ -48,6 +48,15 @@ install -m 644 "${REPO_ROOT}/contrib/blacklist-linux-gpib.conf" \
 install -m 644 "${REPO_ROOT}/debian/copyright" \
     "${STAGE}/usr/share/doc/${PKG}/copyright"
 
+# lintian errors on a missing changelog for any package carrying a Debian
+# revision, so generate one. Shared with the daemon package: "ugpibd" is the
+# source name both binaries are built from, which is how Debian expects a single
+# changelog to serve several binary packages.
+"${REPO_ROOT}/scripts/gen-deb-changelog" "${PKG_VERSION}" \
+    "${STAGE}/usr/share/doc/${PKG}/changelog.Debian"
+gzip -9n "${STAGE}/usr/share/doc/${PKG}/changelog.Debian"
+chmod 644 "${STAGE}/usr/share/doc/${PKG}/changelog.Debian.gz"
+
 cat >"${STAGE}/DEBIAN/control" <<EOF
 Package: ${PKG}
 Version: ${PKG_VERSION}

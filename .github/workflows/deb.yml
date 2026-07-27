@@ -27,6 +27,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_DEB_VERSION: "3.7.0"
 
 jobs:
   package:
@@ -46,9 +47,19 @@ jobs:
         with:
           key: deb-${{ matrix.arch }}
 
-      - uses: taiki-e/install-action@v2
+      # Deliberately not taiki-e/install-action: the cargo-deb binary it fetches
+      # is built against glibc 2.39 and cannot run on the 22.04 runner we use to
+      # get a *low* glibc floor for our own package. Building it from source is
+      # slower, so the result is cached on a pinned version.
+      - uses: actions/cache@v4
+        id: cargo-deb-cache
         with:
-          tool: cargo-deb
+          path: ~/.cargo/bin/cargo-deb
+          key: cargo-deb-${{ env.CARGO_DEB_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-deb
+        if: steps.cargo-deb-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-deb --locked --version "${CARGO_DEB_VERSION}"
 
       - name: Build package
         run: |
@@ -59,11 +70,18 @@ jobs:
             # which is not a commit anyone can check out -- use the PR head.
             FULL_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
             DEB_VERSION="${BASE}~ci${{ github.run_number }}+g${FULL_SHA:0:8}-1"
-            echo "snapshot version: ${DEB_VERSION}"
-            DEB=$(cargo deb --deb-version "${DEB_VERSION}")
           else
-            DEB=$(cargo deb)
+            DEB_VERSION="${BASE}-1"
           fi
+          echo "building version: ${DEB_VERSION}"
+
+          # cargo-deb reads this path from [package.metadata.deb].changelog. A
+          # missing changelog is a lintian *error* for a package with a Debian
+          # revision, so it is generated for every build rather than committed.
+          mkdir -p target
+          ./scripts/gen-deb-changelog "${DEB_VERSION}" target/changelog.Debian
+
+          DEB=$(cargo deb --deb-version "${DEB_VERSION}")
 
           # Absolute, so `apt-get install` cannot mistake it for a package name.
           echo "DEB=$(realpath "${DEB}")" >> "$GITHUB_ENV"
@@ -73,10 +91,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y lintian
-          # Informational: the tags worth acting on are errors. Warnings include
-          # things a GitHub-release deb legitimately does not carry, such as a
-          # Debian changelog.
-          lintian --fail-on error --no-tag-display-limit "${DEB}"
+          # Errors fail the build; warnings are informational. The remaining
+          # warnings are Debian-archive conventions that do not apply to packages
+          # distributed via GitHub releases, e.g. initial-upload-closes-no-bugs
+          # wanting the changelog to close an ITP bug.
+          lintian --fail-on error --tag-display-limit 0 "${DEB}"
 
       - name: Install, exercise, purge
         run: |
@@ -155,7 +174,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y lintian
-          lintian --fail-on error --no-tag-display-limit ./*_all.deb
+          lintian --fail-on error --tag-display-limit 0 ./*_all.deb
           dpkg-deb -c ./*_all.deb
           # Guard against a builder umask leaking into the shipped directory
           # modes: 0775 on /usr, or 0700 on the staging root, would be applied

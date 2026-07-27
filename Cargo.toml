@@ -79,6 +79,11 @@ assets = [
     ["debian/copyright", "usr/share/doc/ugpibd/copyright", "644"],
     ["README.md", "usr/share/doc/ugpibd/README.md", "644"],
 ]
+# Generated, not committed -- run this before `cargo deb`:
+#   scripts/gen-deb-changelog <version> target/changelog.Debian
+# cargo-deb gzips it into /usr/share/doc/ugpibd/changelog.Debian.gz. lintian
+# errors (not warns) on a package with a Debian revision that lacks one.
+changelog = "target/changelog.Debian"
 conf-files = ["/etc/default/ugpibd"]
 maintainer-scripts = "debian/"
 # The units are installed as plain assets and wired up by hand in debian/postinst

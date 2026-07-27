@@ -21,7 +21,7 @@ configure)
             "$UGPIBD_USER"
     fi
 
-    if [ -x /bin/udevadm ] || [ -x /sbin/udevadm ]; then
+    if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules >/dev/null 2>&1 || true
         # Scoped to USB adds so an already-attached adapter picks up its new
         # permissions without a reboot, without re-triggering every device.
@@ -42,7 +42,7 @@ esac
 # explicit `systemctl enable ugpibd`. update-state records the unit so its
 # symlinks are cleaned up on purge.
 if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
-    if [ -x /usr/bin/deb-systemd-helper ]; then
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
         for unit in ugpibd.service ugpibd-hotplug.service; do
             deb-systemd-helper unmask "$unit" >/dev/null || true
             deb-systemd-helper update-state "$unit" >/dev/null || true
@@ -51,9 +51,10 @@ if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
     if [ -d /run/systemd/system ]; then
         systemctl --system daemon-reload >/dev/null || true
         # Pick up a changed ExecStart/hardening set on upgrade, but only if the
-        # admin already had the daemon running.
+        # admin already had the daemon running. deb-systemd-invoke rather than
+        # systemctl so that policy-rc.d is respected (chroots, containers).
         if systemctl --quiet is-active ugpibd.service 2>/dev/null; then
-            systemctl --system try-restart ugpibd.service >/dev/null || true
+            deb-systemd-invoke try-restart ugpibd.service >/dev/null || true
         fi
     fi
 fi
