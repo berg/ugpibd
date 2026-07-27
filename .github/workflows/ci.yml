@@ -43,8 +43,12 @@ jobs:
     # stamped as snapshots (0.3.0~ci42+gdeadbeef-1) so a CI artifact can never be
     # confused with -- or upgraded over -- a real release.
     #
-    # amd64 only: faster feedback, and nothing about the packaging differs per
-    # architecture beyond the libc6 dependency. release.yml builds both.
+    # Both architectures, matching release.yml. arm64 is an explicitly supported
+    # platform (64-bit Raspberry Pi OS), so it gets built and install-tested on a
+    # real arm64 runner here rather than first being exercised at tag time.
     uses: ./.github/workflows/deb.yml
     with:
       snapshot: true
+      targets: >-
+        [{"os": "ubuntu-22.04", "arch": "amd64"},
+         {"os": "ubuntu-22.04-arm", "arch": "arm64"}]

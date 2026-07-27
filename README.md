@@ -46,7 +46,7 @@ they are never used to select an adapter.
 
 ## Requirements
 
-- Linux (Ubuntu 22.04+ / Debian 12+) or macOS 12+
+- Linux (Ubuntu 22.04+, Debian 12+, or 64-bit Raspberry Pi OS) or macOS 12+
 - A supported USB-GPIB adapter (see above)
 - Rust 1.75+ to build from source
 
@@ -64,6 +64,11 @@ sudo apt install ./ugpibd_0.3.0-1_amd64.deb
 This installs `ugpibd` and `ugpibd-scpi`, the udev rules granting access to
 supported adapters, a systemd unit, and `/etc/default/ugpibd`. Packages are
 built against glibc 2.35, so they install on Ubuntu 22.04+ and Debian 12+.
+
+**Raspberry Pi:** use the `arm64` package on 64-bit Raspberry Pi OS (Bookworm
+or later — check with `dpkg --print-architecture`). The only shared-library
+dependency is glibc, since the USB layer is pure Rust with no libusb. There is
+no `armhf` package, so 32-bit Pi OS needs a build from source.
 
 **The service does not start on its own** — see [Running as a
 service](#running-as-a-service) below.

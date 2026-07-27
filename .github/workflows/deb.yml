@@ -18,10 +18,10 @@ on:
         default: false
       targets:
         description: >-
-          JSON array of {os, arch} objects to build. Release builds want both
-          architectures; the PR check defaults to amd64 only for faster
-          feedback, since nothing about the packaging differs per arch beyond
-          the libc6 dependency.
+          JSON array of {os, arch} objects to build. Both callers pass amd64 and
+          arm64; arm64 matters because 64-bit Raspberry Pi OS is a supported
+          platform. Runners must be 22.04 so the resulting package carries a
+          glibc 2.35 floor, which Pi OS Bookworm (2.36) satisfies.
         type: string
         default: '[{"os": "ubuntu-22.04", "arch": "amd64"}]'
 
