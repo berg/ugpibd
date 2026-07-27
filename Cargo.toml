@@ -1,14 +1,20 @@
 [package]
 name = "ugpibd"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 license = "GPL-3.0-or-later"
-description = "Userspace driver for Agilent/Keysight 82357B USB-GPIB adapter with Prologix TCP server"
+description = "Userspace daemon for USB-GPIB adapters, with HiSLIP and Prologix TCP front-ends"
 
 [[bin]]
 name = "ugpibd"
 path = "src/main.rs"
+
+# Named ugpibd-scpi rather than scpi: /usr/bin and Homebrew's bin are shared
+# namespaces where a bare "scpi" would be an unneighbourly collision risk.
+[[bin]]
+name = "ugpibd-scpi"
+path = "src/bin/scpi.rs"
 
 [lib]
 name = "ugpibd"
@@ -30,3 +36,56 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+
+# Debian packaging. Built with `cargo deb`; see scripts/build-blacklist-deb for
+# the companion ugpibd-blacklist-linux-gpib package.
+#
+# Maintainer is deliberately the GitHub noreply alias, matching the address in
+# the git history. Do not let this fall through to cargo-deb's default, which
+# reads `git config user.email` and so differs between a local build and CI.
+[package.metadata.deb]
+maintainer = "berg <berg@users.noreply.github.com>"
+copyright = "2026 ugpibd contributors; embedded firmware (C) Agilent/Keysight"
+section = "electronics"
+priority = "optional"
+depends = "$auto, adduser, udev, init-system-helpers (>= 1.54)"
+suggests = "ugpibd-blacklist-linux-gpib"
+extended-description = """\
+ugpibd drives USB-to-GPIB adapters entirely from userspace over usbfs, with no \
+kernel GPIB driver involved, and exposes the attached instruments over TCP via \
+a HiSLIP server (the transport pyvisa prefers) and an optional \
+Prologix-compatible line protocol.
+.
+Supported adapters: Agilent/Keysight 82357B, NI GPIB-USB-HS, and -- so far \
+untested on hardware -- the Agilent 82357A, NI GPIB-USB-HS+, KUSB-488A and \
+MC-USB-488. Firmware for the Agilent adapters is embedded and uploaded \
+automatically.
+.
+The packaged service does not start on its own. Set UGPIBD_AUTOSTART=yes in \
+/etc/default/ugpibd to start it when an adapter is plugged in, or run \
+`systemctl enable ugpibd` to start it at boot regardless of hardware.
+.
+If the kernel GPIB drivers claim the adapter first ("failed to claim interface \
+0"), the optional ugpibd-blacklist-linux-gpib package blacklists them."""
+assets = [
+    ["target/release/ugpibd", "usr/bin/", "755"],
+    ["target/release/ugpibd-scpi", "usr/bin/", "755"],
+    ["contrib/60-ugpibd.rules", "usr/lib/udev/rules.d/60-ugpibd.rules", "644"],
+    ["contrib/ugpibd.service", "usr/lib/systemd/system/ugpibd.service", "644"],
+    ["contrib/ugpibd-hotplug.service", "usr/lib/systemd/system/ugpibd-hotplug.service", "644"],
+    ["contrib/ugpibd.default", "etc/default/ugpibd", "644"],
+    ["contrib/man/ugpibd.1", "usr/share/man/man1/ugpibd.1", "644"],
+    ["contrib/man/ugpibd-scpi.1", "usr/share/man/man1/ugpibd-scpi.1", "644"],
+    ["debian/copyright", "usr/share/doc/ugpibd/copyright", "644"],
+    ["README.md", "usr/share/doc/ugpibd/README.md", "644"],
+]
+# Generated, not committed -- run this before `cargo deb`:
+#   scripts/gen-deb-changelog <version> target/changelog.Debian
+# cargo-deb gzips it into /usr/share/doc/ugpibd/changelog.Debian.gz. lintian
+# errors (not warns) on a package with a Debian revision that lacks one.
+changelog = "target/changelog.Debian"
+conf-files = ["/etc/default/ugpibd"]
+maintainer-scripts = "debian/"
+# The units are installed as plain assets and wired up by hand in debian/postinst
+# rather than via cargo-deb's systemd-units integration, because they must be
+# registered *without* being enabled -- startup is opt-in.

@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Build the optional ugpibd-blacklist-linux-gpib package.
+#
+# Hand-rolled with dpkg-deb rather than cargo-deb: the package contains no
+# compiled code, so it is Architecture: all (one .deb for every platform), which
+# cargo-deb does not produce naturally.
+#
+# Usage: scripts/build-blacklist-deb [output-dir]
+set -euo pipefail
+
+# Directory modes end up verbatim in the .deb and are applied on install, so
+# they must not inherit the builder's umask: 002 would ship /etc and /usr as
+# 0775, and mktemp -d's 0700 on the staging root would chmod / to 0700.
+umask 022
+
+PKG=ugpibd-blacklist-linux-gpib
+OUTDIR="${1:-.}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Versioned in lockstep with the daemon so a release ships a matching pair.
+# Depends is only a floor, not an exact pin: the blacklist file works with any
+# daemon version, and an exact pin would break as soon as the two packages'
+# Debian revisions drifted.
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)
+REVISION=1
+
+if [[ -z "${VERSION}" ]]; then
+    echo "error: could not read version from Cargo.toml" >&2
+    exit 1
+fi
+
+# CI snapshot builds override the package version with a run/sha stamp, e.g.
+# 0.3.0~ci42+g8507b14-1. The Depends floor deliberately keeps the plain upstream
+# version: a snapshot of this package still works against any 0.3.0 daemon, and
+# a floor carrying the ~ stamp would be satisfied by nothing sensible.
+PKG_VERSION="${DEB_VERSION:-${VERSION}-${REVISION}}"
+
+STAGE=$(mktemp -d)
+trap 'rm -rf "${STAGE}"' EXIT
+chmod 755 "${STAGE}"
+
+mkdir -p "${STAGE}/DEBIAN" \
+    "${STAGE}/etc/modprobe.d" \
+    "${STAGE}/usr/share/doc/${PKG}"
+
+install -m 644 "${REPO_ROOT}/contrib/blacklist-linux-gpib.conf" \
+    "${STAGE}/etc/modprobe.d/${PKG}.conf"
+install -m 644 "${REPO_ROOT}/debian/copyright" \
+    "${STAGE}/usr/share/doc/${PKG}/copyright"
+
+# lintian errors on a missing changelog for any package carrying a Debian
+# revision, so generate one. Shared with the daemon package: "ugpibd" is the
+# source name both binaries are built from, which is how Debian expects a single
+# changelog to serve several binary packages.
+"${REPO_ROOT}/scripts/gen-deb-changelog" "${PKG_VERSION}" \
+    "${STAGE}/usr/share/doc/${PKG}/changelog.Debian"
+gzip -9n "${STAGE}/usr/share/doc/${PKG}/changelog.Debian"
+chmod 644 "${STAGE}/usr/share/doc/${PKG}/changelog.Debian.gz"
+
+cat >"${STAGE}/DEBIAN/control" <<EOF
+Package: ${PKG}
+Version: ${PKG_VERSION}
+Architecture: all
+Maintainer: berg <berg@users.noreply.github.com>
+Depends: ugpibd (>= ${VERSION}), kmod
+Section: electronics
+Priority: optional
+Homepage: https://github.com/berg/ugpibd
+Description: blacklist kernel GPIB drivers for adapters driven by ugpibd
+ ugpibd drives USB-GPIB adapters from userspace via usbfs. The in-kernel GPIB
+ drivers (drivers/gpib, mainline since Linux 6.13, and the out-of-tree
+ linux-gpib build that predates it) claim the same USB interfaces, which shows
+ up as "failed to claim interface 0".
+ .
+ This package installs a modprobe.d snippet that blacklists the two drivers for
+ adapters ugpibd supports: agilent_82357a and ni_usb_gpib. Installing it is
+ optional -- it is only needed if a kernel driver is winning the race for your
+ adapter.
+ .
+ Note that blacklisting ni_usb_gpib also disables the kernel driver for the NI
+ GPIB-USB-B, which ugpibd does not support; module granularity is coarser than
+ device granularity, so it cannot be exempted. Do not install this package if
+ you drive a GPIB-USB-B with linux-gpib on the same machine.
+ .
+ A deliberate "modprobe agilent_82357a" still works, so switching back to
+ linux-gpib does not require removing this package.
+EOF
+
+cat >"${STAGE}/DEBIAN/conffiles" <<EOF
+/etc/modprobe.d/${PKG}.conf
+EOF
+
+cat >"${STAGE}/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # The blacklist only stops *future* autoloads, so unload anything already
+    # bound or the adapter stays claimed until reboot. A failure here is
+    # expected and harmless when the module is in use or not present.
+    for mod in agilent_82357a ni_usb_gpib; do
+        if [ -d "/sys/module/${mod}" ]; then
+            if modprobe -r "${mod}" >/dev/null 2>&1; then
+                echo "${mod}: unloaded"
+            else
+                echo "${mod}: still loaded and in use; unload it or reboot" >&2
+            fi
+        fi
+    done
+fi
+
+exit 0
+EOF
+chmod 755 "${STAGE}/DEBIAN/postinst"
+
+DEB="${OUTDIR}/${PKG}_${PKG_VERSION}_all.deb"
+mkdir -p "${OUTDIR}"
+dpkg-deb --root-owner-group --build "${STAGE}" "${DEB}"
+
+echo "built ${DEB}"

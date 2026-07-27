@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Generate a Debian changelog for the packages.
+#
+# lintian treats a missing changelog.Debian.gz as an *error* for any package with
+# a Debian revision, so both packages need one. Rather than hand-maintaining a
+# file that would duplicate the GitHub release notes and drift from Cargo.toml,
+# it is generated from the version being built and points at the release notes.
+#
+# Usage: scripts/gen-deb-changelog <version> [outfile]
+#   <version>  full Debian version, e.g. 0.3.0-1 or 0.3.0~ci42+g8507b14-1
+#   [outfile]  defaults to stdout
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <version> [outfile]" >&2
+    exit 1
+fi
+
+VERSION="$1"
+OUTFILE="${2:-}"
+MAINTAINER="berg <berg@users.noreply.github.com>"
+
+# Strip the Debian revision and any snapshot stamp to recover the upstream
+# version, so the release-notes link points at a tag that actually exists.
+UPSTREAM="${VERSION%-*}"
+UPSTREAM="${UPSTREAM%%\~*}"
+
+# A snapshot version carries a ~ci stamp; mark those UNRELEASED so nobody
+# mistakes a PR artifact for a published release.
+if [[ "${VERSION}" == *"~ci"* ]]; then
+    DISTRIBUTION="UNRELEASED"
+    DESCRIPTION="Snapshot build, not a release. Built from CI for testing only."
+else
+    DISTRIBUTION="unstable"
+    DESCRIPTION="Release ${UPSTREAM}. See the release notes at
+    https://github.com/berg/ugpibd/releases/tag/v${UPSTREAM}"
+fi
+
+# SOURCE_DATE_EPOCH support keeps the output reproducible when set.
+if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+    DATE=$(date -R -u -d "@${SOURCE_DATE_EPOCH}")
+else
+    DATE=$(date -R)
+fi
+
+# Format is strict: two spaces indenting each change line, and exactly one space
+# then two spaces around the maintainer trailer. dpkg-parsechangelog rejects
+# anything else.
+render() {
+    cat <<EOF
+ugpibd (${VERSION}) ${DISTRIBUTION}; urgency=medium
+
+  * ${DESCRIPTION}
+
+ -- ${MAINTAINER}  ${DATE}
+EOF
+}
+
+# Redirecting to /dev/stdout as a default would truncate a shared output file
+# when the caller has stdout pointed at one, so write to it only when asked.
+if [[ -n "${OUTFILE}" ]]; then
+    render >"${OUTFILE}"
+else
+    render
+fi

@@ -1,0 +1,39 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    case "$1" in
+    remove)
+        for unit in ugpibd.service ugpibd-hotplug.service; do
+            deb-systemd-helper mask "$unit" >/dev/null || true
+        done
+        ;;
+    purge)
+        for unit in ugpibd.service ugpibd-hotplug.service; do
+            deb-systemd-helper purge "$unit" >/dev/null || true
+            deb-systemd-helper unmask "$unit" >/dev/null || true
+        done
+        ;;
+    esac
+fi
+
+if [ "$1" = "purge" ]; then
+    # Safe to remove: the account owns no files (no home directory, nologin
+    # shell) and exists only to run the daemon.
+    if getent passwd ugpibd >/dev/null; then
+        deluser --system ugpibd >/dev/null 2>&1 || true
+    fi
+    if getent group ugpibd >/dev/null; then
+        delgroup --system ugpibd >/dev/null 2>&1 || true
+    fi
+
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

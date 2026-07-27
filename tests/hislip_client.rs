@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Tests for the HiSLIP client used by the `scpi` CLI. Each test drives a
+// Tests for the HiSLIP client used by the `ugpibd-scpi` CLI. Each test drives a
 // real in-process HiSLIP server (the same one `ugpibd` runs) over a loopback
 // TCP socket, so the client exercises the actual wire protocol end to end.
 

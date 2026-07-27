@@ -20,9 +20,13 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: ubuntu-latest
+          # Linux builds run on 22.04, not ubuntu-latest: the glibc a binary is
+          # linked against becomes its floor, and 24.04's 2.39 would refuse to
+          # run on Ubuntu 22.04 or Debian 12. 22.04's 2.35 covers both, plus
+          # everything newer.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
 
     steps:
@@ -44,7 +48,7 @@ jobs:
         run: |
           TAG=${GITHUB_REF_NAME}
           ARCHIVE="ugpibd-${TAG}-${{ matrix.target }}.tar.gz"
-          tar czf "${ARCHIVE}" -C target/${{ matrix.target }}/release ugpibd scpi
+          tar czf "${ARCHIVE}" -C target/${{ matrix.target }}/release ugpibd ugpibd-scpi
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - uses: actions/upload-artifact@v5
@@ -52,9 +56,20 @@ jobs:
           name: ugpibd-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
 
+  deb:
+    name: Debian package
+    # Same steps the PR check runs (see ci.yml), so a packaging break cannot
+    # first surface at tag time. Real versions here, not snapshots.
+    uses: ./.github/workflows/deb.yml
+    with:
+      snapshot: false
+      targets: >-
+        [{"os": "ubuntu-22.04", "arch": "amd64"},
+         {"os": "ubuntu-22.04-arm", "arch": "arm64"}]
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, deb]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -75,7 +90,9 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
           generate_release_notes: true
 
   update-tap:

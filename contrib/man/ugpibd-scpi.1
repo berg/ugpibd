@@ -1,0 +1,75 @@
+.TH UGPIBD-SCPI 1 "2026-07-27" "ugpibd 0.3.0" "User Commands"
+.SH NAME
+ugpibd\-scpi \- interactive SCPI client for ugpibd over HiSLIP
+.SH SYNOPSIS
+.B ugpibd\-scpi
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B ugpibd\-scpi
+is a small REPL for talking to instruments through a running
+.BR ugpibd (1).
+It speaks HiSLIP, the same transport pyvisa uses, so it does not need the
+Prologix front-end enabled.
+.PP
+Each input line is one request/response round-trip: a line containing
+.B ?
+is sent as a query and its reply printed; any other line is written without
+reading a response. Non-TTY stdin is supported, so the client can be driven
+from a pipe or a script.
+.SH OPTIONS
+.TP
+.BI \-\-host " HOST"
+Host running
+.BR ugpibd .
+Default
+.IR localhost .
+.TP
+.BI \-\-port " PORT"
+HiSLIP port. Default
+.IR 4880 .
+.TP
+.BI \-\-addr " PAD"
+GPIB primary address to talk to, encoded as the HiSLIP sub-address
+.I hislip<PAD>
+at connect time. The address is fixed for the session. Omit to use the daemon's
+default PAD.
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.SH META-COMMANDS
+Lines beginning with
+.B ++
+are mapped to HiSLIP control operations rather than sent to the instrument.
+.TP
+.B ++clr
+Selected Device Clear.
+.TP
+.B ++trg
+GPIB trigger (GET).
+.TP
+.BI ++ren " 0|1"
+Remote enable off or on.
+.TP
+.B ++status
+Print the serial-poll status byte.
+.TP
+.B ++help
+List the meta-commands.
+.SH EXAMPLES
+Query the instrument at GPIB primary address 15:
+.PP
+.RS
+.nf
+ugpibd\-scpi \-\-addr 15
+.fi
+.RE
+.PP
+Drive it from a pipe:
+.PP
+.RS
+.nf
+printf '++ren 1\\n*RST\\n*IDN?\\n' | ugpibd\-scpi \-\-addr 15
+.fi
+.RE
+.SH SEE ALSO
+.BR ugpibd (1)

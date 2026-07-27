@@ -1,15 +1,39 @@
 [Unit]
-Description=Agilent/Keysight 82357B GPIB daemon (Prologix-compatible)
+Description=ugpibd USB-GPIB daemon (HiSLIP + Prologix front-ends)
+Documentation=man:ugpibd(1)
+Documentation=https://github.com/berg/ugpibd
 After=network.target
+# The daemon exits if no supported adapter is attached. Retry a few times to
+# ride out a slow re-enumeration, then stop and stay out of the journal; a
+# later plug event issues a fresh start job, which systemd allows even from
+# the failed state.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-ExecStart=/usr/local/bin/ugpibd
+Type=exec
+EnvironmentFile=-/etc/default/ugpibd
+ExecStart=/usr/bin/ugpibd $UGPIBD_OPTS
 Restart=on-failure
-RestartSec=3
+RestartSec=2
 User=ugpibd
-Group=plugdev
-StandardOutput=journal
-StandardError=journal
+Group=ugpibd
+
+# Hardening. Note PrivateDevices must stay off: it would replace /dev with a
+# minimal devtmpfs and hide /dev/bus/usb, which is the entire point of ugpibd.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+DeviceAllow=char-usb_device rw
 
 [Install]
 WantedBy=multi-user.target

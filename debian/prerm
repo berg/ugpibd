@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ] && [ "$1" = "remove" ]; then
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke stop ugpibd.service ugpibd-hotplug.service >/dev/null || true
+    fi
+fi
+
+exit 0

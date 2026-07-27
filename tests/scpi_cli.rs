@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// End-to-end test of the `scpi` CLI binary: runs the real compiled binary in
+// End-to-end test of the `ugpibd-scpi` CLI binary: runs the real compiled binary in
 // batch (non-TTY) mode against an in-process HiSLIP echo server and asserts
 // it speaks the protocol correctly (query → reply, write, ++ meta-commands).
 
@@ -66,13 +66,13 @@ fn spawn_echo_server() -> u16 {
 fn batch_query_and_meta_commands() {
     let port = spawn_echo_server();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scpi"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ugpibd-scpi"))
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn scpi");
+        .expect("spawn ugpibd-scpi");
 
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -81,7 +81,7 @@ fn batch_query_and_meta_commands() {
         // dropping stdin closes it -> batch loop ends -> process exits.
     }
 
-    let out = child.wait_with_output().expect("wait scpi");
+    let out = child.wait_with_output().expect("wait ugpibd-scpi");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("HELLO?"),

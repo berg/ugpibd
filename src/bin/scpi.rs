@@ -22,7 +22,10 @@ use ugpibd::hislip::STANDARD_PORT;
 const CLIENT_VENDOR_ID: u16 = 0xBEEF;
 
 #[derive(Parser)]
-#[command(name = "scpi", about = "Interactive SCPI client for ugpibd (HiSLIP)")]
+#[command(
+    name = "ugpibd-scpi",
+    about = "Interactive SCPI client for ugpibd (HiSLIP)"
+)]
 struct Args {
     /// ugpibd host
     #[arg(long, default_value = "localhost")]
