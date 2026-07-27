@@ -1,0 +1,33 @@
+# Configuration for ugpibd.service. Sourced as an environment file, so use
+# plain KEY=value lines (no shell syntax).
+
+# Options passed to ugpibd. Run `ugpibd --help` for the full list.
+# Defaults if unset: HiSLIP on port 4880, bound to loopback, Prologix off.
+UGPIBD_OPTS="--bind 127.0.0.1"
+
+# Start ugpibd automatically when a supported adapter is plugged in, and at
+# boot for an adapter that is already attached.
+#
+# Disabled by default -- uncomment to enable. Takes effect on the next plug
+# event with no `systemctl daemon-reload` needed, because this file is read
+# when the service starts rather than when the unit is loaded.
+#
+# Leaving this off does not stop you running the daemon: `systemctl start
+# ugpibd` works either way, as does running ugpibd from a shell.
+#UGPIBD_AUTOSTART=yes
+
+# Notes on --bind:
+#   127.0.0.1  (default) loopback only
+#   0.0.0.0    all interfaces; works with no ordering changes
+#   <address>  a specific interface address needs the unit to wait for the
+#              network to be configured:
+#                  systemctl edit ugpibd.service
+#              and add:
+#                  [Unit]
+#                  After=network-online.target
+#                  Wants=network-online.target
+#
+# Multiple adapters: `auto` detection fails when several are attached. List
+# them with `ugpibd --list` and pin one here, e.g.
+#   UGPIBD_OPTS="--bind 127.0.0.1 --usb-port 3-1.2"
+# One service instance drives one adapter.

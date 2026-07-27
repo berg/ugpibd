@@ -1,0 +1,67 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ugpibd
+Upstream-Contact: https://github.com/berg/ugpibd/issues
+Source: https://github.com/berg/ugpibd
+
+Files: *
+Copyright: 2026 ugpibd contributors
+License: GPL-3.0-or-later
+
+Files: src/backend/*
+Copyright: 2003 Frank Mori Hess <fmhess@users.sourceforge.net>
+           2026 ugpibd contributors
+License: GPL-2.0-or-later
+Comment:
+ The USB adapter backends are a derivative work of the in-kernel drivers/gpib
+ drivers (the linux-gpib project), translated from C to Rust. Redistributed
+ here under GPL-3.0-or-later as permitted by the "or later" clause.
+
+Files: src/hislip/*
+Copyright: 2026 ugpibd contributors
+License: GPL-3.0-or-later
+Comment:
+ The HiSLIP message codec and protocol definitions are adapted from the
+ IVI Foundation HiSLIP specification.
+
+Files: firmware/measat_releaseX1.8.hex firmware/82357a_fw.hex
+Copyright: Agilent Technologies / Keysight Technologies
+License: Agilent-firmware-redistributable
+Comment:
+ These firmware images are compiled into the ugpibd binary (via include_bytes!)
+ and are therefore present in this package. They are redistributed unmodified
+ from https://github.com/fmhess/linux_gpib_firmware, which obtained them from
+ Agilent/Keysight.
+ .
+ The adapters require the firmware to be uploaded on every attach; ugpibd does
+ this itself, which is why the images are embedded rather than optional.
+
+License: Agilent-firmware-redistributable
+ The firmware itself is proprietary. Its redistribution is permitted as part of
+ drivers that operate the hardware. See the upstream repository's README files
+ for the full redistribution context.
+ .
+ This firmware is not DFSG-free. A package intended for the Debian archive
+ rather than direct distribution would need to live in non-free, or split the
+ firmware into a separate non-free package.
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation, either version 3 of the License, or (at your option) any later
+ version.
+ .
+ This program is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".
+
+License: GPL-2.0-or-later
+ This program is free software; you can redistribute it and/or modify it under
+ the terms of the GNU General Public License as published by the Free Software
+ Foundation; either version 2 of the License, or (at your option) any later
+ version.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 2 can be found in "/usr/share/common-licenses/GPL-2".

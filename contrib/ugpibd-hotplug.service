@@ -1,0 +1,19 @@
+[Unit]
+Description=Start ugpibd when a supported USB-GPIB adapter appears
+Documentation=man:ugpibd(1)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/ugpibd
+# Autostart is opt-in. An ExecCondition= command exiting 1-254 skips the rest
+# of the unit *cleanly* -- the unit is not marked failed, so a machine that has
+# not opted in stays quiet in the journal and in `systemctl --failed`.
+#
+# The gate lives on this unit rather than on ugpibd.service so that an explicit
+# `systemctl start ugpibd` always works regardless of the setting.
+#
+# $$ is a literal dollar to systemd, so the expansion is left to sh. Writing a
+# bare $UGPIBD_AUTOSTART would have systemd expand it first, with word-splitting
+# semantics that mangle the test's argument count when the value is empty.
+ExecCondition=/bin/sh -c '[ "$$UGPIBD_AUTOSTART" = yes ]'
+ExecStart=/usr/bin/systemctl --no-block start ugpibd.service

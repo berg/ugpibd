@@ -30,11 +30,11 @@ class Ugpibd < Formula
 
   def install
     bin.install "ugpibd"
-    bin.install "scpi"
+    bin.install "ugpibd-scpi"
   end
 
   test do
     assert_match "ugpibd", shell_output("#{bin}/ugpibd --help 2>&1")
-    assert_match "SCPI", shell_output("#{bin}/scpi --help 2>&1")
+    assert_match "SCPI", shell_output("#{bin}/ugpibd-scpi --help 2>&1")
   end
 end

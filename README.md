@@ -46,17 +46,56 @@ they are never used to select an adapter.
 
 ## Requirements
 
-- Linux (Ubuntu 24.04+) or macOS 12+
+- Linux (Ubuntu 22.04+ / Debian 12+) or macOS 12+
 - A supported USB-GPIB adapter (see above)
-- Rust 1.75+
+- Rust 1.75+ to build from source
+
+## Install
+
+### Debian / Ubuntu
+
+Download the `.deb` for your architecture from the
+[latest release](https://github.com/berg/ugpibd/releases/latest) and install it:
+
+```bash
+sudo apt install ./ugpibd_0.3.0-1_amd64.deb
+```
+
+This installs `ugpibd` and `ugpibd-scpi`, the udev rules granting access to
+supported adapters, a systemd unit, and `/etc/default/ugpibd`. Packages are
+built against glibc 2.35, so they install on Ubuntu 22.04+ and Debian 12+.
+
+**The service does not start on its own** — see [Running as a
+service](#running-as-a-service) below.
+
+There is also an optional `ugpibd-blacklist-linux-gpib_*_all.deb`; install it
+only if a kernel GPIB driver is claiming your adapter (see
+[below](#if-the-kernel-driver-interferes-linux)).
+
+### macOS
+
+```bash
+brew install berg/ugpibd/ugpibd
+```
+
+### From source
+
+```bash
+cargo build --release
+sudo cp contrib/60-ugpibd.rules /usr/lib/udev/rules.d/
+sudo groupadd -f ugpibd && sudo usermod -aG ugpibd "$USER"
+sudo udevadm control --reload-rules && sudo udevadm trigger
+./target/release/ugpibd
+```
+
+The rules file sets `GROUP="ugpibd"` and tags the device `uaccess`, so the user
+at the local console gets access without being in that group. Log out and back
+in after `usermod` for remote or non-console sessions.
 
 ## Quick Start
 
 ```bash
-cargo build --release
-sudo cp contrib/99-ugpibd.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-./target/release/ugpibd
+ugpibd
 ```
 
 By default the daemon binds to `127.0.0.1` and runs only the HiSLIP
@@ -66,20 +105,67 @@ remote access, and `--enable-prologix` to also expose the Prologix port.
 For protocol-level tracing:
 
 ```bash
-RUST_LOG=ugpibd=debug ./target/release/ugpibd
+RUST_LOG=ugpibd=debug ugpibd
 ```
+
+## Running as a service
+
+The packaged `ugpibd.service` is deliberately not started or enabled on
+install — grabbing a USB device and opening a TCP port is not something a
+package should do behind your back. Pick whichever of these fits:
+
+| Goal | How |
+|------|-----|
+| Run it once now | `sudo systemctl start ugpibd` |
+| Start when an adapter is plugged in | set `UGPIBD_AUTOSTART=yes` in `/etc/default/ugpibd` |
+| Start at boot regardless of hardware | `sudo systemctl enable --now ugpibd` |
+
+Daemon options go in `UGPIBD_OPTS` in `/etc/default/ugpibd`:
+
+```sh
+UGPIBD_OPTS="--bind 0.0.0.0 --enable-prologix --default-address 15"
+```
+
+Both settings take effect on the next start with no `systemctl daemon-reload`,
+because the file is read when the service starts rather than when the unit is
+loaded. `/etc/default/ugpibd` is a conffile, so your edits survive upgrades.
+
+Autostart works by a udev rule pulling in `ugpibd-hotplug.service`, which checks
+`UGPIBD_AUTOSTART` and starts the daemon only if it is set to `yes`. When it is
+not set, that unit exits cleanly rather than failing, so nothing accumulates in
+`systemctl --failed`. Startup on plug also covers adapters already attached at
+boot, since udev re-emits their `add` events during early boot.
+
+With more than one adapter attached, `auto` detection is ambiguous — pin one
+with `--usb-port` (from `ugpibd --list`) in `UGPIBD_OPTS`. One service instance
+drives one adapter.
 
 ## If the kernel driver interferes (Linux)
 
-If you see "failed to claim interface 0", the matching kernel GPIB module may be
-loaded (`agilent_82357a` for the 82357B, `ni_usb_gpib` for the NI adapters).
-Blacklist whichever applies:
+If you see "failed to claim interface 0", the matching kernel GPIB driver has
+claimed the adapter: `agilent_82357a` for the 82357A/B, `ni_usb_gpib` for the NI
+adapters. These ship in the kernel (`drivers/gpib`, mainline since Linux 6.13)
+and in out-of-tree linux-gpib builds.
+
+On Debian/Ubuntu, install the optional package:
 
 ```bash
-echo "blacklist agilent_82357a" | sudo tee /etc/modprobe.d/blacklist-gpib.conf
-echo "blacklist ni_usb_gpib" | sudo tee -a /etc/modprobe.d/blacklist-gpib.conf
+sudo apt install ./ugpibd-blacklist-linux-gpib_0.3.0-1_all.deb
+```
+
+Or do it by hand:
+
+```bash
+printf 'blacklist agilent_82357a\nblacklist ni_usb_gpib\n' \
+    | sudo tee /etc/modprobe.d/ugpibd-blacklist-linux-gpib.conf
 sudo modprobe -r agilent_82357a ni_usb_gpib
 ```
+
+A deliberate `modprobe` still works either way, so this does not permanently
+lock you out of linux-gpib. Note that blacklisting `ni_usb_gpib` also disables
+the kernel driver for the NI GPIB-USB-B, which ugpibd does **not** support —
+module granularity is coarser than device granularity, so it cannot be
+exempted.
 
 ## PyVISA usage
 
@@ -118,17 +204,17 @@ inst.write("++auto 1")
 print(inst.query("*IDN?"))
 ```
 
-## Interactive `scpi` client
+## Interactive `ugpibd-scpi` client
 
-`scpi` is a small REPL bundled with the daemon. It speaks **HiSLIP** to
+`ugpibd-scpi` is a small REPL bundled with the daemon. It speaks **HiSLIP** to
 `ugpibd` (the same transport pyvisa uses), so it does not need the Prologix
 port.
 
 ```bash
 # Talk to the instrument at GPIB primary address 15:
-scpi --addr 15
+ugpibd-scpi --addr 15
 # Or omit --addr to use the daemon's default PAD (sub-address hislip0):
-scpi --host bench-pi --port 4880
+ugpibd-scpi --host bench-pi --port 4880
 ```
 
 Each line is a request/response round-trip: a line containing `?` is sent as
@@ -149,13 +235,13 @@ Meta-commands map to HiSLIP control operations:
 Non-TTY stdin is supported for scripting:
 
 ```bash
-printf '++ren 1\n*RST\n*IDN?\n' | scpi --addr 15
+printf '++ren 1\n*RST\n*IDN?\n' | ugpibd-scpi --addr 15
 ```
 
 ## Supported `++` commands
 
 The following applies to the **Prologix** server (port 1234), not the
-`scpi` client above.
+`ugpibd-scpi` client above.
 
 
 Implemented: `++addr`, `++auto`, `++read`, `++eoi`, `++eos`, `++eot_enable`,

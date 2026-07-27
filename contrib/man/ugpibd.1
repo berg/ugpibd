@@ -1,0 +1,154 @@
+.TH UGPIBD 1 "2026-07-27" "ugpibd 0.3.0" "User Commands"
+.SH NAME
+ugpibd \- userspace daemon for USB-GPIB adapters (HiSLIP and Prologix front-ends)
+.SH SYNOPSIS
+.B ugpibd
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B ugpibd
+drives USB-to-GPIB adapters entirely from userspace over
+.IR usbfs ,
+with no kernel GPIB driver involved, and exposes the attached instruments over
+TCP. Two front-ends are available: a HiSLIP server (enabled by default, the
+transport pyvisa prefers) and a Prologix-compatible line protocol.
+.PP
+The Agilent adapters require a firmware upload on every attach.
+.B ugpibd
+performs this itself from images embedded in the binary; the adapter then
+disconnects and re-enumerates under a different USB product id.
+.SH OPTIONS
+.TP
+.BI \-\-bind " ADDRESS"
+Address to bind both servers to. Default
+.IR 127.0.0.1 .
+Use
+.I 0.0.0.0
+for all interfaces.
+.TP
+.BI \-\-hislip\-port " PORT"
+TCP port for the HiSLIP server. Default
+.IR 4880 .
+Set to
+.I 0
+to disable the HiSLIP front-end.
+.TP
+.B \-\-enable\-prologix
+Enable the Prologix-compatible front-end. Disabled by default.
+.TP
+.BI \-\-port " PORT"
+TCP port for the Prologix-compatible server. Default
+.IR 1234 .
+Only meaningful with
+.BR \-\-enable\-prologix .
+.TP
+.BI \-\-backend " ID"
+Adapter backend to use.
+.I auto
+(the default) detects a single attached adapter by USB VID/PID.
+.I list
+prints the known backend ids and exits.
+.TP
+.B \-\-list
+List attached supported adapters with their USB port ids, and exit.
+.TP
+.BI \-\-usb\-port " PORT_ID"
+Drive the adapter at this USB port id, as reported by
+.BR \-\-list .
+Required when more than one supported adapter is attached, since
+.I auto
+detection is ambiguous.
+.TP
+.BI \-\-default\-address " PAD"
+GPIB primary address used when a request does not specify one: the fallback PAD
+for HiSLIP clients connecting to a bare
+.I hislip0
+or
+.I gpib0
+sub-address, and the initial Prologix
+.IR ++addr .
+Default
+.IR 0 .
+.TP
+.BI \-\-timeout\-ms " MS"
+GPIB timeout in milliseconds. Default
+.IR 3000 .
+.TP
+.BR \-v ", " \-\-verbose
+Increase log verbosity.
+.B \-v
+enables debug logging, which dumps HiSLIP command and response bytes with
+non-printables escaped;
+.B \-vv
+enables trace. Ignored if
+.B RUST_LOG
+is set.
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Log filter directive, e.g.
+.IR ugpibd=debug .
+Overrides
+.BR \-\-verbose .
+.SH FILES
+.TP
+.I /etc/default/ugpibd
+Options for the packaged service. Sets
+.B UGPIBD_OPTS
+(passed to
+.BR ugpibd )
+and
+.BR UGPIBD_AUTOSTART ,
+which opts in to starting the daemon when an adapter is plugged in.
+.TP
+.I /usr/lib/udev/rules.d/60\-ugpibd.rules
+Grants the
+.I ugpibd
+group access to supported adapters, and triggers
+.I ugpibd\-hotplug.service
+on attach.
+.TP
+.I /etc/modprobe.d/ugpibd\-blacklist\-linux\-gpib.conf
+Shipped by the optional
+.I ugpibd\-blacklist\-linux\-gpib
+package. Stops the kernel GPIB drivers claiming these adapters.
+.SH STARTING THE DAEMON
+The packaged service does not start on its own. Three options:
+.TP
+.B one-off
+.B systemctl start ugpibd
+\- works regardless of the autostart setting.
+.TP
+.B on plug
+Set
+.B UGPIBD_AUTOSTART=yes
+in
+.IR /etc/default/ugpibd .
+The daemon then starts when a supported adapter appears, and at boot for an
+adapter that is already attached.
+.TP
+.B always
+.B systemctl enable ugpibd
+\- starts at boot whether or not an adapter is present. The service fails and
+gives up if none is found.
+.SH DIAGNOSTICS
+.TP
+.B failed to claim interface 0
+A kernel GPIB driver has claimed the adapter. Install the
+.I ugpibd\-blacklist\-linux\-gpib
+package, or blacklist
+.I agilent_82357a
+and
+.I ni_usb_gpib
+by hand.
+.SH BUGS
+Report bugs at https://github.com/berg/ugpibd/issues \- never to the linux-gpib
+project or the kernel
+.I drivers/gpib
+maintainers, whose drivers this daemon replaces rather than uses.
+.SH SEE ALSO
+.BR ugpibd\-scpi (1),
+.BR udev (7),
+.BR systemd.service (5)

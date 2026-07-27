@@ -20,6 +20,8 @@ matched), 1 on mismatch, 2 on connection/transport failure.
 from __future__ import annotations
 
 import argparse
+import pathlib
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -100,6 +102,50 @@ def test_prologix(host: str, port: int, pad: int, query: Optional[str], timeout_
         return Result(idn=None, query_response=None, error=str(e))
 
 
+# Kernel GPIB drivers for the adapters ugpibd supports. Names taken from
+# drivers/gpib/*/Makefile; both bind exactly these adapters per their USB device
+# tables. The blacklist package in contrib/blacklist-linux-gpib.conf lists the
+# same two, so this check is what catches a name drifting upstream: a blacklist
+# entry for a module that does not exist is silently ignored, which would leave
+# the adapter claimable with no error anywhere.
+GPIB_MODULES = ("agilent_82357a", "ni_usb_gpib")
+
+
+def check_kernel_modules() -> list[str]:
+    """Warn if a kernel GPIB driver is present or loaded. Linux only; advisory."""
+    if not sys.platform.startswith("linux"):
+        return []
+
+    warnings = []
+    for mod in GPIB_MODULES:
+        if pathlib.Path("/sys/module", mod).is_dir():
+            warnings.append(
+                f"{mod} is loaded and may claim the adapter; "
+                f"install ugpibd-blacklist-linux-gpib or `modprobe -r {mod}`"
+            )
+            continue
+
+        # Not loaded. Confirm the name still resolves to a real module, so a
+        # rename upstream does not silently invalidate the blacklist.
+        try:
+            proc = subprocess.run(
+                ["modinfo", "-F", "name", mod],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            continue  # no modinfo (container, or module tools absent)
+        if proc.returncode != 0:
+            warnings.append(
+                f"{mod} is not a known module on this kernel. Expected if "
+                f"neither drivers/gpib (Linux 6.13+) nor out-of-tree linux-gpib "
+                f"is installed. If it *should* be present, the name may have "
+                f"drifted upstream, which silently voids the blacklist entry."
+            )
+    return warnings
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ugpibd smoke test")
     ap.add_argument("--host", default="127.0.0.1")
@@ -110,6 +156,9 @@ def main() -> int:
     ap.add_argument("--query", help="Additional SCPI query to run after *IDN?")
     ap.add_argument("--timeout-ms", type=int, default=5000)
     args = ap.parse_args()
+
+    for warning in check_kernel_modules():
+        print(f"[kernel]   WARN: {warning}", file=sys.stderr)
 
     run_hislip = args.only != "prologix"
     run_prologix = args.only != "hislip"
