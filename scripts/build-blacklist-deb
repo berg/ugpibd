@@ -29,6 +29,12 @@ if [[ -z "${VERSION}" ]]; then
     exit 1
 fi
 
+# CI snapshot builds override the package version with a run/sha stamp, e.g.
+# 0.3.0~ci42+g8507b14-1. The Depends floor deliberately keeps the plain upstream
+# version: a snapshot of this package still works against any 0.3.0 daemon, and
+# a floor carrying the ~ stamp would be satisfied by nothing sensible.
+PKG_VERSION="${DEB_VERSION:-${VERSION}-${REVISION}}"
+
 STAGE=$(mktemp -d)
 trap 'rm -rf "${STAGE}"' EXIT
 chmod 755 "${STAGE}"
@@ -44,7 +50,7 @@ install -m 644 "${REPO_ROOT}/debian/copyright" \
 
 cat >"${STAGE}/DEBIAN/control" <<EOF
 Package: ${PKG}
-Version: ${VERSION}-${REVISION}
+Version: ${PKG_VERSION}
 Architecture: all
 Maintainer: berg <berg@users.noreply.github.com>
 Depends: ugpibd (>= ${VERSION}), kmod
@@ -98,7 +104,7 @@ exit 0
 EOF
 chmod 755 "${STAGE}/DEBIAN/postinst"
 
-DEB="${OUTDIR}/${PKG}_${VERSION}-${REVISION}_all.deb"
+DEB="${OUTDIR}/${PKG}_${PKG_VERSION}_all.deb"
 mkdir -p "${OUTDIR}"
 dpkg-deb --root-owner-group --build "${STAGE}" "${DEB}"
 

@@ -35,3 +35,16 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - run: cargo test
+
+  deb:
+    name: Debian package
+    # Builds and install-tests the packages on every PR, so maintainer-script
+    # and packaging breakage surfaces here rather than at tag time. Versions are
+    # stamped as snapshots (0.3.0~ci42+gdeadbeef-1) so a CI artifact can never be
+    # confused with -- or upgraded over -- a real release.
+    #
+    # amd64 only: faster feedback, and nothing about the packaging differs per
+    # architecture beyond the libc6 dependency. release.yml builds both.
+    uses: ./.github/workflows/deb.yml
+    with:
+      snapshot: true
