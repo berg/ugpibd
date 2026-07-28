@@ -24,7 +24,9 @@ const CLIENT_VENDOR_ID: u16 = 0xBEEF;
 #[derive(Parser)]
 #[command(
     name = "ugpibd-scpi",
-    about = "Interactive SCPI client for ugpibd (HiSLIP)"
+    version,
+    about = "Interactive SCPI client for ugpibd (HiSLIP)",
+    help_template = ugpibd::HELP_TEMPLATE
 )]
 struct Args {
     /// ugpibd host

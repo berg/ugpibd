@@ -15,7 +15,9 @@ use ugpibd::hislip;
 #[derive(Parser, Debug)]
 #[command(
     name = "ugpibd",
-    about = "Agilent/Keysight 82357B USB-GPIB daemon (Prologix + HiSLIP compatible)"
+    version,
+    about = "USB-GPIB daemon with HiSLIP and Prologix TCP front-ends",
+    help_template = ugpibd::HELP_TEMPLATE
 )]
 struct Args {
     /// TCP port for the Prologix-compatible server
@@ -115,7 +117,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    info!("ugpibd starting");
+    // Logged unconditionally at info: journalctl output for a service is usually
+    // the only evidence available when triaging a report, and knowing which build
+    // produced it is the first question.
+    info!("ugpibd {} starting", ugpibd::VERSION);
     if !args.enable_prologix && args.hislip_port == 0 {
         anyhow::bail!(
             "no front-end enabled: pass --enable-prologix and/or a nonzero --hislip-port"
