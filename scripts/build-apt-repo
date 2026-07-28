@@ -73,7 +73,12 @@ cd "${OUT_DIR}"
 # is what apt resolves against the sources.list URI.
 for arch in "${ARCHES[@]}"; do
     d="dists/${SUITE}/${COMPONENT}/binary-${arch}"
-    dpkg-scanpackages --arch "${arch}" pool/ >"${d}/Packages" 2>/dev/null
+
+    # --multiversion is required, not cosmetic: without it dpkg-scanpackages
+    # emits only the newest version of each package, so every older release
+    # would sit in the pool unreferenced by any index and be uninstallable.
+    # `apt install ugpibd=<older>` and rollback depend on this flag.
+    dpkg-scanpackages --multiversion --arch "${arch}" pool/ >"${d}/Packages" 2>/dev/null
 
     # apt prefers Packages.gz and ignores the plain file when both are listed in
     # Release, so the two must always be generated together from the same input.
