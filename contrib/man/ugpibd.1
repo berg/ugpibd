@@ -1,4 +1,4 @@
-.TH UGPIBD 1 "2026-07-27" "ugpibd 0.3.0" "User Commands"
+.TH UGPIBD 1 "2026-07-28" "ugpibd 0.3.1" "User Commands"
 .SH NAME
 ugpibd \- userspace daemon for USB-GPIB adapters (HiSLIP and Prologix front-ends)
 .SH SYNOPSIS
@@ -84,7 +84,10 @@ enables trace. Ignored if
 is set.
 .TP
 .BR \-h ", " \-\-help
-Print help and exit.
+Print help and exit. The first line carries the version.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
 .SH ENVIRONMENT
 .TP
 .B RUST_LOG
