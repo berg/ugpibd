@@ -62,10 +62,19 @@ systemd units, and `/etc/default/ugpibd`.
 brew install berg/ugpibd/ugpibd
 ```
 
-That taps [berg/homebrew-ugpibd](https://github.com/berg/homebrew-ugpibd)
-automatically; `brew upgrade ugpibd` picks up later releases. The formula
-installs prebuilt binaries straight from the release tarballs, so there is
-nothing to compile.
+One command is enough: the fully qualified name taps
+[berg/homebrew-ugpibd](https://github.com/berg/homebrew-ugpibd) automatically,
+and trusts this formula alone rather than the whole tap. The formula installs
+prebuilt binaries straight from the release tarballs, so there is nothing to
+compile.
+
+Later releases arrive with `brew upgrade`. Note that the *short* name is not
+trusted, so `brew install ugpibd` and `brew upgrade ugpibd` will not resolve —
+use the qualified name, or opt in once:
+
+```bash
+brew trust --formula berg/ugpibd/ugpibd
+```
 
 Homebrew installs the binaries only — no udev rules, no systemd unit. On Linux
 that means you either run the daemon as a user with access to the adapter, or use
