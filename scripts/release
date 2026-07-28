@@ -34,11 +34,22 @@ echo "Releasing v${VERSION}..."
 sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
 rm -f Cargo.toml.bak
 
+# The man pages carry the version and date in their .TH header, which nothing
+# derives from Cargo.toml -- bump them here so they cannot silently go stale a
+# release or two behind the binary they document.
+TODAY=$(date -u +%Y-%m-%d)
+for man in contrib/man/*.1; do
+    sed -i.bak \
+        "s/^\(\.TH [^ ]* 1 \)\"[^\"]*\" \"ugpibd [^\"]*\"/\1\"${TODAY}\" \"ugpibd ${VERSION}\"/" \
+        "${man}"
+    rm -f "${man}.bak"
+done
+
 # Regenerate Cargo.lock
 cargo check --quiet
 
 # Commit only if anything changed (version may already be set)
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock contrib/man
 if ! git diff --cached --quiet; then
     git commit -m "Release v${VERSION}"
     git push origin main
