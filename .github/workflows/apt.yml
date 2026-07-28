@@ -1,0 +1,190 @@
+name: apt repository
+
+# Publishes a signed apt repository to GitHub Pages at
+# https://berg.github.io/ugpibd/apt
+#
+# Called by release.yml after the release job rather than triggered by the
+# `release: published` event: action-gh-release creates the release and *then*
+# uploads assets, so the event can fire before the .deb files are attached, and
+# the pool would come out empty or partial.
+#
+# workflow_dispatch is for rebuilding the repository without cutting a release --
+# after rotating the signing key, or to pick up a manually attached asset.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+# The repository is rebuilt from scratch every run, so two concurrent deploys
+# would race to publish different views of the same pool.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          # apt-ftparchive comes from apt-utils, dpkg-scanpackages from dpkg-dev.
+          sudo apt-get install -y apt-utils dpkg-dev
+
+      - name: Collect .deb assets from published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p pool-in
+
+          # Every published release, so users can pin or roll back to an older
+          # version. Drafts and pre-releases are excluded: this suite is
+          # "stable", and a pre-release deb sorting above the current release
+          # would silently upgrade people onto it.
+          mapfile -t TAGS < <(
+            gh release list --limit 100 \
+              --exclude-drafts --exclude-pre-releases \
+              --json tagName --jq '.[].tagName'
+          )
+
+          if [ ${#TAGS[@]} -eq 0 ]; then
+            echo "::error::No published releases found, so there are no .deb assets to publish."
+            exit 1
+          fi
+
+          for tag in "${TAGS[@]}"; do
+            echo "::group::${tag}"
+            # Releases predating deb packaging have no .deb assets; skip them
+            # rather than failing the whole run.
+            gh release download "$tag" --pattern '*.deb' --dir pool-in --clobber \
+              || echo "no .deb assets on ${tag}, skipping"
+            echo "::endgroup::"
+          done
+
+          echo "collected:"
+          ls -1 pool-in/ || true
+
+      - name: Import signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "${APT_GPG_PRIVATE_KEY}" ]; then
+            echo "::error::APT_GPG_PRIVATE_KEY secret is not set. Generate a signing key and add it: gpg --armor --export-secret-keys <KEYID> | gh secret set APT_GPG_PRIVATE_KEY"
+            exit 1
+          fi
+
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          install -d -m 700 "${GNUPGHOME}"
+          echo "GNUPGHOME=${GNUPGHOME}" >> "$GITHUB_ENV"
+
+          printf '%s\n' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --quiet --import
+
+          KEY=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ -z "${KEY}" ]; then
+            echo "::error::No secret key found after import. Is the secret an ASCII-armored *private* key (gpg --armor --export-secret-keys)?"
+            exit 1
+          fi
+          echo "APT_SIGN_KEY=${KEY}" >> "$GITHUB_ENV"
+          echo "imported ${KEY}"
+
+          # Prove the key can actually sign before building anything. An expired
+          # key, or a passphrase-protected one with no passphrase supplied, fails
+          # here with a clear message instead of producing a repository whose
+          # InRelease is missing or unverifiable.
+          GPG_TEST=(--batch --yes --local-user "${KEY}")
+          if [ -n "${{ secrets.APT_GPG_PASSPHRASE }}" ]; then
+            GPG_TEST+=(--pinentry-mode loopback --passphrase "${{ secrets.APT_GPG_PASSPHRASE }}")
+          fi
+          if ! echo test | gpg "${GPG_TEST[@]}" --clearsign >/dev/null 2>sign-err.txt; then
+            echo "::error::Signing key cannot sign. Check that it has not expired and that APT_GPG_PASSPHRASE is set if the key is protected."
+            cat sign-err.txt >&2
+            exit 1
+          fi
+          gpg --list-keys --with-colons | awk -F: '/^pub:/ {
+            if ($7 != "") print "  key expires: " strftime("%Y-%m-%d", $7);
+            else print "  key does not expire"
+          }'
+
+      - name: Build signed repository
+        env:
+          APT_SIGN_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          # Served from /apt so the Pages root stays free for project docs.
+          ./scripts/build-apt-repo pool-in site/apt
+
+      - name: Landing page
+        run: ./scripts/gen-apt-index > site/index.html
+
+      - name: Verify the repository actually works
+        run: |
+          # A malformed Release or an inconsistent Packages/Packages.gz pair
+          # breaks every user at once, and looks fine on inspection. So install
+          # from the built repository on the oldest supported distro of each
+          # family before publishing it.
+          for image in debian:bookworm ubuntu:22.04; do
+            echo "::group::${image}"
+            docker run --rm -v "${PWD}/site/apt:/repo:ro" "${image}" bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              install -d /etc/apt/keyrings
+              cp /repo/ugpibd-archive-keyring.asc /etc/apt/keyrings/ugpibd.asc
+              printf "Types: deb\nURIs: file:///repo\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/ugpibd.asc\n" \
+                > /etc/apt/sources.list.d/ugpibd.sources
+              apt-get update
+              apt-get install -y ugpibd ugpibd-blacklist-linux-gpib
+              dpkg -l ugpibd ugpibd-blacklist-linux-gpib
+              test -f /etc/modprobe.d/ugpibd-blacklist-linux-gpib.conf
+              ugpibd --help > /dev/null
+              ugpibd --backend list
+            '
+            echo "::endgroup::"
+          done
+
+      - name: Confirm signature verification is enforced
+        run: |
+          # Tamper with the index after signing and confirm apt refuses it. Guards
+          # against a future change that publishes an unsigned repository, or one
+          # whose Release no longer covers the Packages files -- both of which
+          # would leave the install test above passing.
+          cp -r site/apt tampered
+          d=tampered/dists/stable/main/binary-amd64
+          sed -i 's|^Filename: pool/|Filename: pool/evil-|' "$d/Packages"
+          gzip -9nc "$d/Packages" > "$d/Packages.gz"
+
+          if docker run --rm -v "${PWD}/tampered:/repo:ro" debian:bookworm bash -c '
+              install -d /etc/apt/keyrings
+              cp /repo/ugpibd-archive-keyring.asc /etc/apt/keyrings/ugpibd.asc
+              printf "Types: deb\nURIs: file:///repo\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/ugpibd.asc\n" \
+                > /etc/apt/sources.list.d/ugpibd.sources
+              rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources
+              apt-get update
+          '; then
+            echo "::error::apt accepted a tampered index -- the repository is not being verified."
+            exit 1
+          fi
+          echo "tampered index correctly rejected"
+          rm -rf tampered
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site/
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

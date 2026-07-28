@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Build a signed apt repository from a directory of .deb files.
+#
+# Deliberately stateless: the whole repository is regenerated from whatever
+# .debs are handed to it, with no reprepro/aptly database to persist between
+# runs and desync from the pool. The published GitHub releases are the state.
+#
+# Usage: scripts/build-apt-repo <deb-dir> <output-dir>
+# Env:
+#   APT_SIGN_KEY  gpg key id or fingerprint to sign with. If unset the indices
+#                 are still generated but left unsigned, which apt will refuse
+#                 to use -- only useful for inspecting the layout.
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <deb-dir> <output-dir>" >&2
+    exit 1
+fi
+
+DEB_DIR="$(cd "$1" && pwd)"
+OUT_DIR="$2"
+
+SUITE=stable
+COMPONENT=main
+ORIGIN=ugpibd
+POOL="pool/${COMPONENT}/u/ugpibd"
+
+for tool in dpkg-scanpackages apt-ftparchive dpkg-deb; do
+    command -v "$tool" >/dev/null || {
+        echo "error: ${tool} not found (apt-utils and dpkg-dev provide these)" >&2
+        exit 1
+    }
+done
+
+mapfile -t DEBS < <(find "${DEB_DIR}" -maxdepth 1 -name '*.deb' -print | sort)
+if [[ ${#DEBS[@]} -eq 0 ]]; then
+    echo "error: no .deb files in ${DEB_DIR}" >&2
+    echo "  The pool is populated from published GitHub releases, so this is" >&2
+    echo "  expected until a release carrying .deb assets exists." >&2
+    exit 1
+fi
+
+# Architectures are discovered from the packages rather than hardcoded, so
+# adding an arch to the release build does not silently omit it here.
+# Architecture: all packages are handled separately -- they belong in *every*
+# architecture's index, which dpkg-scanpackages --arch does for us.
+ARCHES=()
+for deb in "${DEBS[@]}"; do
+    arch=$(dpkg-deb -f "${deb}" Architecture)
+    [[ "${arch}" == "all" ]] && continue
+    # shellcheck disable=SC2076
+    [[ " ${ARCHES[*]} " =~ " ${arch} " ]] || ARCHES+=("${arch}")
+done
+if [[ ${#ARCHES[@]} -eq 0 ]]; then
+    echo "error: only Architecture: all packages found; need at least one real arch" >&2
+    exit 1
+fi
+
+echo "packages:      ${#DEBS[@]}"
+echo "architectures: ${ARCHES[*]}"
+
+rm -rf "${OUT_DIR}"
+mkdir -p "${OUT_DIR}/${POOL}"
+for arch in "${ARCHES[@]}"; do
+    mkdir -p "${OUT_DIR}/dists/${SUITE}/${COMPONENT}/binary-${arch}"
+done
+
+cp "${DEBS[@]}" "${OUT_DIR}/${POOL}/"
+
+cd "${OUT_DIR}"
+
+# Run from the repository root so the Filename: fields are root-relative, which
+# is what apt resolves against the sources.list URI.
+for arch in "${ARCHES[@]}"; do
+    d="dists/${SUITE}/${COMPONENT}/binary-${arch}"
+    dpkg-scanpackages --arch "${arch}" pool/ >"${d}/Packages" 2>/dev/null
+
+    # apt prefers Packages.gz and ignores the plain file when both are listed in
+    # Release, so the two must always be generated together from the same input.
+    # An inconsistent pair produces a repo that looks fine and serves stale
+    # metadata.
+    gzip -9nc "${d}/Packages" >"${d}/Packages.gz"
+
+    echo "  ${arch}: $(grep -c '^Package:' "${d}/Packages") packages"
+done
+
+# Valid-Until is deliberately omitted. It is replay protection, but it makes the
+# repository *expire*: publishing only on release means any quiet period longer
+# than the window would break apt update for every user. Revisit with a
+# scheduled re-signing job if that tradeoff stops being acceptable.
+#
+# Written to a temp file and moved into place: redirecting straight to
+# dists/*/Release truncates it before apt-ftparchive scans the directory, and it
+# then hashes the empty file, listing Release inside its own checksums.
+RELEASE_TMP="$(mktemp)"
+apt-ftparchive \
+    -o APT::FTPArchive::Release::Origin="${ORIGIN}" \
+    -o APT::FTPArchive::Release::Label="${ORIGIN}" \
+    -o APT::FTPArchive::Release::Suite="${SUITE}" \
+    -o APT::FTPArchive::Release::Codename="${SUITE}" \
+    -o APT::FTPArchive::Release::Architectures="${ARCHES[*]}" \
+    -o APT::FTPArchive::Release::Components="${COMPONENT}" \
+    -o APT::FTPArchive::Release::Description="ugpibd packages for Debian, Ubuntu and Raspberry Pi OS" \
+    release "dists/${SUITE}" >"${RELEASE_TMP}"
+mv "${RELEASE_TMP}" "dists/${SUITE}/Release"
+
+if [[ -z "${APT_SIGN_KEY:-}" ]]; then
+    echo "warning: APT_SIGN_KEY unset, repository is UNSIGNED and apt will reject it" >&2
+    exit 0
+fi
+
+GPG_OPTS=(--batch --yes --local-user "${APT_SIGN_KEY}")
+PASSFILE=""
+if [[ -n "${APT_SIGN_PASSPHRASE:-}" ]]; then
+    # Via a 0600 file rather than --passphrase, which would expose the
+    # passphrase in the process list to anything else on the builder.
+    PASSFILE="$(mktemp)"
+    chmod 600 "${PASSFILE}"
+    printf '%s' "${APT_SIGN_PASSPHRASE}" >"${PASSFILE}"
+    trap 'rm -f "${PASSFILE}"' EXIT
+    GPG_OPTS+=(--pinentry-mode loopback --passphrase-file "${PASSFILE}")
+fi
+
+# InRelease (inline signature) is what modern apt fetches; Release.gpg is kept
+# for older clients that only look for the detached form.
+gpg "${GPG_OPTS[@]}" \
+    --clearsign -o "dists/${SUITE}/InRelease" "dists/${SUITE}/Release"
+gpg "${GPG_OPTS[@]}" \
+    -abs -o "dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release"
+
+# Armored, so it can be dropped straight into /etc/apt/keyrings/*.asc without
+# dearmoring. Supported by apt >= 2.4, i.e. Ubuntu 22.04 and Debian 12 onward.
+gpg --batch --yes --armor --export "${APT_SIGN_KEY}" >ugpibd-archive-keyring.asc
+
+echo "signed with ${APT_SIGN_KEY}"

@@ -52,18 +52,42 @@ they are never used to select an adapter.
 
 ## Install
 
-### Debian / Ubuntu
+### Debian / Ubuntu / Raspberry Pi OS (apt)
 
-Download the `.deb` for your architecture from the
-[latest release](https://github.com/berg/ugpibd/releases/latest) and install it:
+```bash
+sudo install -d /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
+  https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc
+
+sudo tee /etc/apt/sources.list.d/ugpibd.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://berg.github.io/ugpibd/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/ugpibd.asc
+EOF
+
+sudo apt update
+sudo apt install ugpibd
+```
+
+Every published release stays in the pool, so `apt install ugpibd=<version>`
+can pin an older one. Setup details and package list:
+<https://berg.github.io/ugpibd/>
+
+### Debian / Ubuntu (single .deb)
+
+If you would rather not add a repository, the `.deb` files are attached to every
+[release](https://github.com/berg/ugpibd/releases/latest):
 
 ```bash
 sudo apt install ./ugpibd_0.3.0-1_amd64.deb
 ```
 
-This installs `ugpibd` and `ugpibd-scpi`, the udev rules granting access to
-supported adapters, a systemd unit, and `/etc/default/ugpibd`. Packages are
-built against glibc 2.35, so they install on Ubuntu 22.04+ and Debian 12+.
+Either way you get `ugpibd` and `ugpibd-scpi`, the udev rules granting access to
+supported adapters, systemd units, and `/etc/default/ugpibd`. Packages depend
+only on glibc 2.34+, so they install on Ubuntu 22.04+ and Debian 12+.
 
 **Raspberry Pi:** use the `arm64` package on 64-bit Raspberry Pi OS (Bookworm
 or later — check with `dpkg --print-architecture`). The only shared-library
@@ -155,7 +179,7 @@ and in out-of-tree linux-gpib builds.
 On Debian/Ubuntu, install the optional package:
 
 ```bash
-sudo apt install ./ugpibd-blacklist-linux-gpib_0.3.0-1_all.deb
+sudo apt install ugpibd-blacklist-linux-gpib
 ```
 
 Or do it by hand:

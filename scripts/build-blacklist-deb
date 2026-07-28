@@ -18,9 +18,6 @@ OUTDIR="${1:-.}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Versioned in lockstep with the daemon so a release ships a matching pair.
-# Depends is only a floor, not an exact pin: the blacklist file works with any
-# daemon version, and an exact pin would break as soon as the two packages'
-# Debian revisions drifted.
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "${REPO_ROOT}/Cargo.toml" | head -1)
 REVISION=1
 
@@ -30,10 +27,18 @@ if [[ -z "${VERSION}" ]]; then
 fi
 
 # CI snapshot builds override the package version with a run/sha stamp, e.g.
-# 0.3.0~ci42+g8507b14-1. The Depends floor deliberately keeps the plain upstream
-# version: a snapshot of this package still works against any 0.3.0 daemon, and
-# a floor carrying the ~ stamp would be satisfied by nothing sensible.
+# 0.3.0~ci42+g8507b14-1.
 PKG_VERSION="${DEB_VERSION:-${VERSION}-${REVISION}}"
+
+# The Depends floor tracks whatever version is being built, minus the Debian
+# revision. For a release that is the plain upstream version; for a snapshot it
+# is the stamped one.
+#
+# It cannot be hardcoded to ${VERSION}: a ~ci stamp sorts *below* the plain
+# version it was built from (that is the point of the ~), so a snapshot pair
+# would declare Depends: ugpibd (>= 0.3.0) while shipping ugpibd 0.3.0~ci42...,
+# leaving the two mutually uninstallable.
+DEPENDS_FLOOR="${PKG_VERSION%-*}"
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "${STAGE}"' EXIT
@@ -62,7 +67,7 @@ Package: ${PKG}
 Version: ${PKG_VERSION}
 Architecture: all
 Maintainer: berg <berg@users.noreply.github.com>
-Depends: ugpibd (>= ${VERSION}), kmod
+Depends: ugpibd (>= ${DEPENDS_FLOOR}), kmod
 Section: electronics
 Priority: optional
 Homepage: https://github.com/berg/ugpibd

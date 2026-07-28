@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Emit the GitHub Pages landing page for the apt repository, to stdout.
+#
+# The Pages artifact is the entire site, so this page is what a visitor to
+# https://berg.github.io/ugpibd/ sees. Its whole job is to hand over the
+# copy-pasteable setup snippet.
+set -euo pipefail
+
+cat <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ugpibd apt repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    max-width: 46rem; margin: 0 auto; padding: 2rem 1.25rem 4rem;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  .sub { opacity: 0.7; margin-top: 0; }
+  pre {
+    padding: 0.9rem 1rem; border-radius: 6px; overflow-x: auto;
+    background: #f4f4f5; border: 1px solid #e4e4e7;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #e4e4e7; }
+  @media (prefers-color-scheme: dark) {
+    pre { background: #1c1c1f; border-color: #2e2e33; }
+    th, td { border-color: #2e2e33; }
+  }
+</style>
+
+<h1>ugpibd apt repository</h1>
+<p class="sub">
+  Userspace daemon for USB-GPIB adapters, with HiSLIP and Prologix TCP
+  front-ends. &middot;
+  <a href="https://github.com/berg/ugpibd">source</a>
+</p>
+
+<h2>Install</h2>
+<pre><code>sudo install -d /etc/apt/keyrings
+sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
+  https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc
+
+sudo tee /etc/apt/sources.list.d/ugpibd.sources &gt;/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://berg.github.io/ugpibd/apt
+Suites: stable
+Components: main
+Architectures: amd64 arm64
+Signed-By: /etc/apt/keyrings/ugpibd.asc
+EOF
+
+sudo apt update
+sudo apt install ugpibd</code></pre>
+
+<p>
+  The service does not start on its own. Set <code>UGPIBD_AUTOSTART=yes</code> in
+  <code>/etc/default/ugpibd</code> to start it when an adapter is plugged
+  in, or run <code>sudo systemctl enable --now ugpibd</code> to start it at boot
+  regardless of hardware. See <code>man ugpibd</code>.
+</p>
+
+<h2>Packages</h2>
+<table>
+  <tr><th>Package</th><th>Contents</th></tr>
+  <tr>
+    <td><code>ugpibd</code></td>
+    <td>The daemon and the <code>ugpibd-scpi</code> client, udev rules, systemd units.</td>
+  </tr>
+  <tr>
+    <td><code>ugpibd-blacklist-linux-gpib</code></td>
+    <td>
+      Optional. Blacklists the kernel GPIB drivers, for when they claim the
+      adapter first &mdash; the symptom is
+      <code>failed to claim interface 0</code>.
+    </td>
+  </tr>
+</table>
+
+<h2>Supported distributions</h2>
+<p>
+  <code>amd64</code> and <code>arm64</code>, for Ubuntu 22.04 and later, Debian 12
+  and later, and 64-bit Raspberry Pi OS. The packages depend only on glibc 2.34
+  or newer, since the USB layer is pure Rust with no libusb. There is no
+  <code>armhf</code> package; 32-bit Raspberry Pi OS needs a build from source.
+</p>
+
+<h2>Notes</h2>
+<ul>
+  <li>
+    Every published release stays in the pool, so a specific version can be
+    installed with <code>apt install ugpibd=&lt;version&gt;</code>.
+  </li>
+  <li>
+    The <code>Release</code> file carries no <code>Valid-Until</code>, so the
+    repository does not expire between releases.
+  </li>
+  <li>
+    Individual <code>.deb</code> files are also attached to each
+    <a href="https://github.com/berg/ugpibd/releases">GitHub release</a> if you
+    would rather not add a repository.
+  </li>
+</ul>
+HTML
