@@ -133,7 +133,16 @@ jobs:
             -e "s/__SHA256_ARM_MACOS__/${SHA_ARM_MACOS}/g" \
             -e "s/__SHA256_X86_LINUX__/${SHA_X86_LINUX}/g" \
             -e "s/__SHA256_ARM_LINUX__/${SHA_ARM_LINUX}/g" \
+            -e "/^# This file is a template/,/^# The rendered version lives/d" \
             Formula/ugpibd.rb > rendered_formula.rb
+
+          # A leftover placeholder would push a formula that cannot resolve, and
+          # the tap has no CI of its own to catch it.
+          if grep -q '__[A-Z0-9_]*__' rendered_formula.rb; then
+            echo "::error::Unrendered placeholders remain in the formula:"
+            grep -n '__[A-Z0-9_]*__' rendered_formula.rb
+            exit 1
+          fi
 
       - name: Push to tap repo
         env:

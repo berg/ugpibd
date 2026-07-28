@@ -52,6 +52,34 @@ they are never used to select an adapter.
 
 ## Install
 
+Installing gets you two binaries — the `ugpibd` daemon and the `ugpibd-scpi`
+client. The Linux packages additionally set up udev rules for adapter access,
+systemd units, and `/etc/default/ugpibd`.
+
+### Homebrew (macOS and Linux)
+
+```bash
+brew install berg/ugpibd/ugpibd
+```
+
+One command is enough: the fully qualified name taps
+[berg/homebrew-ugpibd](https://github.com/berg/homebrew-ugpibd) automatically,
+and trusts this formula alone rather than the whole tap. The formula installs
+prebuilt binaries straight from the release tarballs, so there is nothing to
+compile.
+
+Later releases arrive with `brew upgrade`. Note that the *short* name is not
+trusted, so `brew install ugpibd` and `brew upgrade ugpibd` will not resolve —
+use the qualified name, or opt in once:
+
+```bash
+brew trust --formula berg/ugpibd/ugpibd
+```
+
+Homebrew installs the binaries only — no udev rules, no systemd unit. On Linux
+that means you either run the daemon as a user with access to the adapter, or use
+the apt packages below, which wire all of that up.
+
 ### Debian / Ubuntu / Raspberry Pi OS (apt)
 
 Add the repository and install, in one command:
@@ -78,44 +106,41 @@ ugpibd --list          # is the adapter visible?
 sudo systemctl start ugpibd
 ```
 
+Packages depend only on glibc 2.34+, so they install on Ubuntu 22.04+ and
+Debian 12+. Every published release stays in the pool, so you can pin or roll
+back:
+
+```bash
+apt list -a ugpibd                 # versions available
+sudo apt install ugpibd=<version>  # pin one
+```
+
+Package list and the deb822 (`.sources`) form of the setup:
+<https://berg.github.io/ugpibd/>
+
+**Raspberry Pi:** use 64-bit Raspberry Pi OS, Bookworm or later — check with
+`dpkg --print-architecture`, which should report `arm64`. The only
+shared-library dependency is glibc, since the USB layer is pure Rust with no
+libusb. There is no `armhf` package, so 32-bit Pi OS needs a build from source.
+
 The daemon package is all you need. If a kernel GPIB driver turns out to be
 claiming your adapter, there is a separate opt-in package for that — see [If the
 kernel driver interferes](#if-the-kernel-driver-interferes-linux).
 
-Every published release stays in the pool, so `apt install ugpibd=0.3.0-1` can
-pin or roll back to a specific version. Package list and the deb822
-(`.sources`) form of the setup: <https://berg.github.io/ugpibd/>
+**The service does not start on its own** — see [Running as a
+service](#running-as-a-service) below.
 
-### Debian / Ubuntu (single .deb)
+### Single .deb
 
 If you would rather not add a repository, the `.deb` files are attached to every
 [release](https://github.com/berg/ugpibd/releases/latest):
 
 ```bash
-sudo apt install ./ugpibd_0.3.0-1_amd64.deb
+sudo apt install ./ugpibd_*_amd64.deb
 ```
 
-Either way you get `ugpibd` and `ugpibd-scpi`, the udev rules granting access to
-supported adapters, systemd units, and `/etc/default/ugpibd`. Packages depend
-only on glibc 2.34+, so they install on Ubuntu 22.04+ and Debian 12+.
-
-**Raspberry Pi:** use the `arm64` package on 64-bit Raspberry Pi OS (Bookworm
-or later — check with `dpkg --print-architecture`). The only shared-library
-dependency is glibc, since the USB layer is pure Rust with no libusb. There is
-no `armhf` package, so 32-bit Pi OS needs a build from source.
-
-**The service does not start on its own** — see [Running as a
-service](#running-as-a-service) below.
-
-There is also an optional `ugpibd-blacklist-linux-gpib_*_all.deb`; install it
-only if a kernel GPIB driver is claiming your adapter (see
-[below](#if-the-kernel-driver-interferes-linux)).
-
-### macOS
-
-```bash
-brew install berg/ugpibd/ugpibd
-```
+Use `apt install ./…` rather than `dpkg -i`, so dependencies are resolved. The
+optional `ugpibd-blacklist-linux-gpib_*_all.deb` is attached to the same release.
 
 ### From source
 
