@@ -54,27 +54,37 @@ they are never used to select an adapter.
 
 ### Debian / Ubuntu / Raspberry Pi OS (apt)
 
+Add the repository and install, in one command:
+
 ```bash
-sudo install -d /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
-  https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc
-
-sudo tee /etc/apt/sources.list.d/ugpibd.sources >/dev/null <<'EOF'
-Types: deb
-URIs: https://berg.github.io/ugpibd/apt
-Suites: stable
-Components: main
-Architectures: amd64 arm64
-Signed-By: /etc/apt/keyrings/ugpibd.asc
-EOF
-
-sudo apt update
-sudo apt install ugpibd
+sudo install -d /etc/apt/keyrings \
+  && sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
+       https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc \
+  && echo "deb [signed-by=/etc/apt/keyrings/ugpibd.asc] https://berg.github.io/ugpibd/apt stable main" \
+       | sudo tee /etc/apt/sources.list.d/ugpibd.list >/dev/null \
+  && sudo apt update \
+  && sudo apt install -y ugpibd
 ```
 
-Every published release stays in the pool, so `apt install ugpibd=<version>`
-can pin an older one. Setup details and package list:
-<https://berg.github.io/ugpibd/>
+That fetches the signing key into `/etc/apt/keyrings/`, registers the repository
+with `signed-by=` so the key is trusted for this repository only — never
+system-wide, which is what the deprecated `apt-key add` used to do — and
+installs the daemon. Upgrades then arrive through `apt upgrade` as normal.
+
+Afterwards:
+
+```bash
+ugpibd --list          # is the adapter visible?
+sudo systemctl start ugpibd
+```
+
+The daemon package is all you need. If a kernel GPIB driver turns out to be
+claiming your adapter, there is a separate opt-in package for that — see [If the
+kernel driver interferes](#if-the-kernel-driver-interferes-linux).
+
+Every published release stays in the pool, so `apt install ugpibd=0.3.0-1` can
+pin or roll back to a specific version. Package list and the deb822
+(`.sources`) form of the setup: <https://berg.github.io/ugpibd/>
 
 ### Debian / Ubuntu (single .deb)
 
