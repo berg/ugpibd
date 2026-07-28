@@ -40,21 +40,30 @@ cat <<'HTML'
 </p>
 
 <h2>Install</h2>
-<pre><code>sudo install -d /etc/apt/keyrings
-sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
-  https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc
+<pre><code>sudo install -d /etc/apt/keyrings \
+  &amp;&amp; sudo curl -fsSLo /etc/apt/keyrings/ugpibd.asc \
+       https://berg.github.io/ugpibd/apt/ugpibd-archive-keyring.asc \
+  &amp;&amp; echo "deb [signed-by=/etc/apt/keyrings/ugpibd.asc] https://berg.github.io/ugpibd/apt stable main" \
+       | sudo tee /etc/apt/sources.list.d/ugpibd.list &gt;/dev/null \
+  &amp;&amp; sudo apt update \
+  &amp;&amp; sudo apt install -y ugpibd</code></pre>
 
-sudo tee /etc/apt/sources.list.d/ugpibd.sources &gt;/dev/null &lt;&lt;'EOF'
+<p>
+  The key is registered with <code>signed-by=</code>, so it is trusted for this
+  repository only rather than system-wide.
+</p>
+
+<details>
+  <summary>deb822 <code>.sources</code> form, if you prefer it</summary>
+<pre><code>sudo tee /etc/apt/sources.list.d/ugpibd.sources &gt;/dev/null &lt;&lt;'EOF'
 Types: deb
 URIs: https://berg.github.io/ugpibd/apt
 Suites: stable
 Components: main
 Architectures: amd64 arm64
 Signed-By: /etc/apt/keyrings/ugpibd.asc
-EOF
-
-sudo apt update
-sudo apt install ugpibd</code></pre>
+EOF</code></pre>
+</details>
 
 <p>
   The service does not start on its own. Set <code>UGPIBD_AUTOSTART=yes</code> in
