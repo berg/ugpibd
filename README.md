@@ -107,9 +107,15 @@ sudo systemctl start ugpibd
 ```
 
 Packages depend only on glibc 2.34+, so they install on Ubuntu 22.04+ and
-Debian 12+. Every published release stays in the pool, so
-`apt install ugpibd=0.3.0-1` can pin or roll back to a specific version. Package
-list and the deb822 (`.sources`) form of the setup:
+Debian 12+. Every published release stays in the pool, so you can pin or roll
+back:
+
+```bash
+apt list -a ugpibd                 # versions available
+sudo apt install ugpibd=<version>  # pin one
+```
+
+Package list and the deb822 (`.sources`) form of the setup:
 <https://berg.github.io/ugpibd/>
 
 **Raspberry Pi:** use 64-bit Raspberry Pi OS, Bookworm or later — check with
@@ -130,7 +136,7 @@ If you would rather not add a repository, the `.deb` files are attached to every
 [release](https://github.com/berg/ugpibd/releases/latest):
 
 ```bash
-sudo apt install ./ugpibd_0.3.0-1_amd64.deb
+sudo apt install ./ugpibd_*_amd64.deb
 ```
 
 Use `apt install ./…` rather than `dpkg -i`, so dependencies are resolved. The
