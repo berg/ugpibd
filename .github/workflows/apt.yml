@@ -3,16 +3,29 @@ name: apt repository
 # Publishes a signed apt repository to GitHub Pages at
 # https://berg.github.io/ugpibd/apt
 #
-# Called by release.yml after the release job rather than triggered by the
-# `release: published` event: action-gh-release creates the release and *then*
-# uploads assets, so the event can fire before the .deb files are attached, and
-# the pool would come out empty or partial.
+# Triggered by the Release workflow *completing*, rather than called from inside
+# it. Two constraints pin this down:
+#
+#   - It cannot be the `release: published` event: action-gh-release creates the
+#     release and *then* uploads assets, so that event can fire before the .deb
+#     files are attached and the pool would come out empty or partial. Waiting
+#     for the whole Release workflow guarantees the upload finished.
+#
+#   - It cannot be `workflow_call` from release.yml either. That runs at the tag
+#     ref (refs/tags/v0.3.0), and the github-pages environment only permits
+#     deployments from `main`, so the deploy job is rejected by environment
+#     protection. A workflow_run event runs at the default branch instead.
+#
+# The protection is worth keeping rather than widening to allow tags: it means
+# only the workflow definition on main can ever publish to the Pages site.
 #
 # workflow_dispatch is for rebuilding the repository without cutting a release --
 # after rotating the signing key, or to pick up a manually attached asset.
 
 on:
-  workflow_call:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
 
 # The repository is rebuilt from scratch every run, so two concurrent deploys
@@ -24,6 +37,11 @@ concurrency:
 jobs:
   build:
     name: Build repository
+    # A failed Release still fires workflow_run, so don't rebuild the repository
+    # from a release that may be missing assets.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -95,18 +95,10 @@ jobs:
             artifacts/*.deb
           generate_release_notes: true
 
-  apt:
-    name: Publish apt repository
-    # After `release`, not on the `release: published` event: action-gh-release
-    # creates the release and then uploads assets, so the event can fire before
-    # the .deb files are attached and the pool would come out empty.
-    needs: release
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    secrets: inherit
-    uses: ./.github/workflows/apt.yml
+  # The apt repository is published by apt.yml, which triggers on this workflow
+  # completing rather than being called from it. See the comment there: a
+  # workflow_call would run at the tag ref, and the github-pages environment only
+  # allows deployments from main.
 
   update-tap:
     name: Update Homebrew tap
