@@ -55,12 +55,15 @@ pub trait GpibBackend: Send + Sync {
     /// Assert or deassert Remote Enable.
     async fn ren(&mut self, enable: bool) -> Result<()>;
 
-    /// Serial-poll the instrument at `pad` and return its status byte. The
-    /// default returns 0 for adapters that don't implement serial poll yet;
-    /// this backs the HiSLIP `get_status` operation.
-    async fn serial_poll(&mut self, _pad: u8) -> Result<u8> {
-        Ok(0)
-    }
+    /// Serial-poll the instrument at `pad` and return its status byte. This
+    /// backs both the Prologix `++spoll` and the HiSLIP `get_status` operation.
+    ///
+    /// There is deliberately no default: a status byte of 0 means "no bits set,
+    /// nothing to report", so a backend that silently returned one would be
+    /// indistinguishable from a working serial poll and would hang any script
+    /// that polls until a bit sets. A backend that cannot serial-poll must say
+    /// so, exactly as `srq_asserted` does below.
+    async fn serial_poll(&mut self, pad: u8) -> Result<u8>;
 
     /// Whether the SRQ line is currently asserted by some device on the bus.
     ///

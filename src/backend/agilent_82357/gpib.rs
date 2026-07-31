@@ -229,22 +229,22 @@ impl<T: Transport> GpibController<T> {
         self.write_registers(&reg).await
     }
 
-    /// Send Selected Device Clear to `pad` (SDC = 0x04, preceded by addressing).
+    /// Send Selected Device Clear to `pad` (SDC, preceded by addressing).
     pub async fn device_clear(&mut self, pad: u8) -> Result<()> {
-        let cmd = [0x3f_u8, 0x40 + pad, 0x04]; // UNL, TAD(pad), SDC
+        let cmd = [GPIB_UNL, talk_address(pad), GPIB_SDC];
         self.send_command_bytes(&cmd).await
     }
 
-    /// Send Group Execute Trigger to `pad` (GET = 0x08, addressed as listener).
+    /// Send Group Execute Trigger to `pad` (GET, addressed as listener).
     pub async fn trigger(&mut self, pad: u8) -> Result<()> {
-        let cmd = [0x3f_u8, 0x20 + pad, 0x08]; // UNL, LAD(pad), GET
+        let cmd = [GPIB_UNL, listen_address(pad), GPIB_GET];
         self.send_command_bytes(&cmd).await
     }
 
     /// Write `data` to instrument at `pad`. Handles GPIB addressing internally.
     pub async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
         // Address: UNT, MTA(0), LAD(pad)
-        let addr_cmd = [0x5f_u8, 0x40_u8, 0x20 + pad];
+        let addr_cmd = [GPIB_UNT, talk_address(0), listen_address(pad)];
         self.send_command_bytes(&addr_cmd).await?;
         self.send_data_bytes(data, send_eoi).await
     }
@@ -254,7 +254,7 @@ impl<T: Transport> GpibController<T> {
     /// bus participants to idle — otherwise a device left addressed as talker
     /// will hang the next transaction.
     pub async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
-        let addr_cmd = [0x3f_u8, 0x20_u8, 0x40 + pad];
+        let addr_cmd = [GPIB_UNL, listen_address(0), talk_address(pad)];
         self.send_command_bytes(&addr_cmd).await?;
         let gts = [RegisterPairlet {
             address: TMS_AUXCR,
@@ -275,6 +275,60 @@ impl<T: Transport> GpibController<T> {
             Err(_) => {
                 self.recover_from_stall().await;
                 anyhow::bail!("gpib read timed out after {} ms", self.timeout_ms)
+            }
+        }
+    }
+
+    /// Serial-poll the instrument at `pad` and return its status byte.
+    ///
+    /// Addresses the instrument as talker and ourselves as listener with Serial
+    /// Poll Enable asserted, drops to standby so it can drive the byte, reads
+    /// exactly one byte, then restores the bus with Serial Poll Disable and
+    /// untalk. The status byte is binary, so this read must not terminate on the
+    /// EOS character — a status of 0x0a would otherwise look like a terminator.
+    ///
+    /// SPD/UNT is sent even when the read fails, so a non-responding instrument
+    /// cannot leave the whole bus stuck in serial-poll mode.
+    pub async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
+        let enable = [
+            GPIB_UNL,
+            GPIB_SPE,
+            talk_address(pad),
+            listen_address(0), // we are the controller at pad 0
+        ];
+        self.send_command_bytes(&enable).await?;
+
+        let gts = [RegisterPairlet {
+            address: TMS_AUXCR,
+            value: AUX_GTS,
+        }];
+        self.write_registers(&gts).await?;
+
+        let pkt = encode_gpib_read(1, false, 0);
+        self.transport.write_bulk(&pkt).await?;
+
+        // One data byte plus the trailing flags byte.
+        let read_fut = self.transport.read_bulk(2);
+        let timeout = std::time::Duration::from_millis(self.timeout_ms as u64);
+        let outcome = match tokio::time::timeout(timeout, read_fut).await {
+            Ok(Ok(raw)) => Ok(decode_gpib_read_response(&raw).0),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow::anyhow!(
+                "serial poll of pad {pad} timed out after {} ms",
+                self.timeout_ms
+            )),
+        };
+
+        match outcome {
+            Ok(data) => {
+                self.send_command_bytes(&[GPIB_SPD, GPIB_UNT]).await?;
+                data.first().copied().ok_or_else(|| {
+                    anyhow::anyhow!("serial poll of pad {pad} returned no status byte")
+                })
+            }
+            Err(e) => {
+                self.recover_from_stall().await;
+                Err(e)
             }
         }
     }
@@ -413,6 +467,9 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     }
     async fn ren(&mut self, enable: bool) -> Result<()> {
         self.ren(enable).await
+    }
+    async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
+        self.serial_poll(pad).await
     }
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
         self.eos_char = eos_char;
@@ -596,6 +653,69 @@ mod tests {
         assert!(cmd_bytes.contains(&0x3f), "cmd_bytes={cmd_bytes:?}"); // UNL
         assert!(cmd_bytes.contains(&0x20)); // MLA(0)
         assert!(cmd_bytes.contains(&(0x40 + 15))); // TAD(15)
+    }
+
+    /// Extract the GPIB bytes carried by a DATA_PIPE_CMD_WRITE packet.
+    fn cmd_payload(pkt: &[u8]) -> &[u8] {
+        let len = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]) as usize;
+        &pkt[8..8 + len]
+    }
+
+    #[tokio::test]
+    async fn serial_poll_addresses_polls_then_restores_bus() {
+        let t = MockTransport::new();
+        t.push_control(xfer_status(4)); // SPE addressing
+        t.push_control(xfer_status(2)); // SPD/UNT
+        t.push_response(wr_regs_ok()); // GTS register write
+        t.push_response(vec![0x51, ATRF_EOI]); // status byte + trailing flags
+        let mut ctrl = GpibController::new(t, 3000);
+
+        let stb = ctrl.serial_poll(23).await.unwrap();
+        assert_eq!(stb, 0x51);
+
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        assert_eq!(
+            cmd_payload(&writes[0]),
+            [GPIB_UNL, GPIB_SPE, talk_address(23), listen_address(0)]
+        );
+        // The bus must be taken back out of serial-poll mode afterwards.
+        assert_eq!(cmd_payload(writes.last().unwrap()), [GPIB_SPD, GPIB_UNT]);
+    }
+
+    #[tokio::test]
+    async fn serial_poll_read_ignores_the_eos_terminator() {
+        let t = MockTransport::new();
+        t.push_control(xfer_status(4));
+        t.push_control(xfer_status(2));
+        t.push_response(wr_regs_ok());
+        // A status byte that happens to equal the configured EOS character.
+        t.push_response(vec![b'\n', ATRF_EOI]);
+        let mut ctrl = GpibController::new(t, 3000);
+        ctrl.eos_char = b'\n';
+        ctrl.eos_enabled = true;
+
+        assert_eq!(ctrl.serial_poll(5).await.unwrap(), b'\n');
+
+        // writes[2] is the read request; terminating on EOS would truncate a
+        // binary status byte, so that flag must stay clear regardless of eos.
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        assert_eq!(writes[2][3] & ReadFlag::EndOnEosChar as u8, 0);
+    }
+
+    #[tokio::test]
+    async fn serial_poll_reports_a_missing_status_byte_as_an_error() {
+        let t = MockTransport::new();
+        t.push_control(xfer_status(4));
+        t.push_control(xfer_status(2));
+        t.push_response(wr_regs_ok());
+        t.push_response(vec![ATRF_EOI]); // trailing flags only, no data byte
+        let mut ctrl = GpibController::new(t, 3000);
+
+        let err = ctrl.serial_poll(9).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no status byte"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
