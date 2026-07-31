@@ -92,6 +92,42 @@ impl UsbTransport {
     pub fn subscribe_srq(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.srq.subscribe()
     }
+
+    /// Clear residual halts and discard any bulk-in data a previous session
+    /// left queued.
+    ///
+    /// Every operation is a bulk-out followed by the bulk-in carrying its
+    /// status. A process that died between the two leaves that reply queued,
+    /// and the next session reads it in place of its own — from then on every
+    /// reply answers the previous request.
+    pub async fn quiesce_bulk(&self) {
+        let mut io = self.io.lock().await;
+        let _ = MaybeFuture::wait(io.out.clear_halt());
+        let _ = MaybeFuture::wait(io.r#in.clear_halt());
+
+        // Retry a few times in case the data arrives slightly delayed.
+        for _ in 0..3 {
+            let mps = io.r#in.max_packet_size().max(1);
+            io.r#in.submit(Buffer::new(0x40usize.div_ceil(mps) * mps));
+            let got = match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                io.r#in.next_complete(),
+            )
+            .await
+            {
+                Ok(c) if c.status.is_ok() && !c.buffer.is_empty() => {
+                    debug!(len = c.buffer.len(), "drained stale bulk-in data");
+                    true
+                }
+                // Timed out: the read stays pending and is picked up by the
+                // next one, which is what the endpoint being persistent buys.
+                _ => false,
+            };
+            if !got {
+                break;
+            }
+        }
+    }
 }
 
 /// What the interrupt poller should do after a failed transfer.
@@ -317,47 +353,22 @@ pub async fn open_transport(
          See blacklist instructions in README.md",
     )?;
 
-    // Clear residual halt conditions on the bulk pipes before first use.
-    let mut drain_ep = interface
-        .endpoint::<Bulk, In>(EP_BULK_IN)
-        .context("open bulk-in endpoint for drain")?;
-    let _ = MaybeFuture::wait(drain_ep.clear_halt());
-    if let Ok(mut out) = interface.endpoint::<Bulk, Out>(model.bulk_out_ep) {
-        let _ = MaybeFuture::wait(out.clear_halt());
-    }
-
-    // Drain any stale bulk-in data left over from a prior session. Retry a few
-    // times in case the data arrives slightly delayed. Each submit that times
-    // out is simply cancelled when its Queue drops.
-    for _ in 0..3 {
-        let drain = async {
-            let mps = drain_ep.max_packet_size().max(1);
-            drain_ep.submit(Buffer::new(0x40usize.div_ceil(mps) * mps));
-            let completion = drain_ep.next_complete().await;
-            if let Ok(()) = completion.status {
-                if !completion.buffer.is_empty() {
-                    debug!(len = completion.buffer.len(), "drained stale bulk-in data");
-                    return true;
-                }
-            }
-            false
-        };
-        let got_data = tokio::time::timeout(std::time::Duration::from_millis(100), drain)
-            .await
-            .unwrap_or(false);
-        if !got_data {
-            break;
-        }
-    }
-
-    UsbTransport::new(
+    let transport = UsbTransport::new(
         device,
         interface,
         model.bulk_out_ep,
         EP_BULK_IN,
         model.irq_in_ep,
         timeout_ms,
-    )
+    )?;
+
+    // Clear residual halts and drain stale bulk-in data left by a prior
+    // session, using the transport's own endpoints. Opening a second endpoint
+    // on the same address to do this fails: an endpoint is exclusively owned,
+    // and a drain read that times out is still pending when it drops, so the
+    // address stays claimed and the transport cannot open it.
+    transport.quiesce_bulk().await;
+    Ok(transport)
 }
 
 /// Poll for a device with the given PID to appear, up to `timeout`.
