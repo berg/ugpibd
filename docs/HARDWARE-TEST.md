@@ -17,6 +17,19 @@ Tests drive the HiSLIP front-end with the bundled `ugpibd-scpi` client, which
 is what `ugpibd` serves by default. The Prologix front-end is opt-in and is
 covered separately at the end.
 
+Most of this checklist is automated in `contrib/`, and running those first will
+save going through it by hand:
+
+```bash
+contrib/hardware_exercise.py --pad <PAD>      # Tests 3-8, one instrument
+contrib/multidev_srq.py --a <PAD> --b <PAD>   # two instruments, SRQ + isolation
+```
+
+Test with **two instruments on the bus** whenever you can. A single-device bus
+cannot show addressing faults at all — it is structurally incapable of it — and
+that blind spot hid writes being delivered to every previously-addressed
+listener until a second instrument was attached.
+
 Throughout, `<PAD>` is the instrument's GPIB primary address. Read it off the
 instrument's own configuration menu rather than scanning for it: writing to an
 empty address stalls the GPIB source handshake for the full timeout, so a sweep
@@ -68,7 +81,20 @@ of the bus is slow and tells you nothing the front panel doesn't.
 
    Confirm 5 readings come back — `FETC?` returning nothing means the GET
    never reached the instrument.
-2. `++clr`, and confirm the instrument shows its device-clear behaviour.
+2. Device clear. Confirm it has an *effect* — that the instrument still
+   answers afterwards proves nothing, since a clear that does nothing at all
+   leaves it answering perfectly well. That is exactly how a device clear
+   addressed to the wrong role went unnoticed. On a 34401A, an initiated
+   measurement rejects a second `INIT` with `-213,"Init ignored"`, and a
+   working clear aborts it so the second `INIT` succeeds:
+
+   ```
+   CONF:VOLT:DC 10 / TRIG:SOUR BUS / INIT / INIT / SYST:ERR?   -> -213  (control)
+   CONF:VOLT:DC 10 / TRIG:SOUR BUS / INIT / ++clr / INIT / SYST:ERR?  -> +0
+   ```
+
+   The control arm matters: without it a probe that can never fail looks like
+   a pass.
 3. `++ren 0` then `++ren 1`, and confirm the REMOTE annunciator follows.
 
 ## Test 6: Serial poll (status byte)
@@ -151,13 +177,22 @@ exercises both front-ends and reports any mismatch between them.
 
 ## Validated configurations
 
-- **82357B** — the original bring-up target.
-- **82357A** + HP 34401A at PAD 23, on macOS: Tests 1–9 pass. Firmware upload
-  from cold succeeded on the first attempt (487 records), twice, including once
-  after an unplug/replug mid-session. A soak of 300 short queries, 20 long
-  reads, and 30 session open/closes completed with no failures.
+- **82357B** (`MY47100427`) + HP 34401A at PAD 23 and HP 53132A at PAD 3, on
+  macOS: Tests 1–9 pass, `hardware_exercise.py` 12/12, `multidev_srq.py` 9/9.
+  Writes reach only their addressed instrument in both directions.
+- **82357A** (`MY45181868`) + the same two instruments, on macOS: same results.
+  Firmware upload from cold succeeded on the first attempt (487 records),
+  twice, including once after an unplug/replug mid-session. A soak of 300 short
+  queries, 20 long reads, and 30 session open/closes completed with no
+  failures.
 - **NI GPIB-USB-HS** + SR620 at PAD 16. Note this adapter has no asynchronous
   SRQ path, so Test 7 does not apply to it.
+
+Known gap: when two instruments assert SRQ at almost the same moment, the
+second one's request can be missed. SRQ is a wired-OR line and the adapter
+notifies on a transition, so a device that asserts while the line is already
+low produces no new edge. Handling this needs a level read of the SRQ line
+(`srq_asserted`), which the 82357 backend does not yet implement.
 
 ## A note on VISA clients
 
