@@ -46,8 +46,8 @@ impl Device for ProbeDevice {
         self.remote.store(remote, Ordering::SeqCst);
         Ok(())
     }
-    async fn get_status(&self) -> u8 {
-        self.status.load(Ordering::SeqCst)
+    async fn get_status(&self) -> Result<u8> {
+        Ok(self.status.load(Ordering::SeqCst))
     }
 }
 

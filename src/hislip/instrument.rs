@@ -56,4 +56,9 @@ impl Device for GpibInstrument {
         let mut ctrl = self.ctrl.lock().await;
         ctrl.ren(remote).await
     }
+
+    async fn get_status(&self) -> Result<u8> {
+        let mut ctrl = self.ctrl.lock().await;
+        ctrl.serial_poll(self.pad).await
+    }
 }

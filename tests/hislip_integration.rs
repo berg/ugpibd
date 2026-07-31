@@ -36,6 +36,9 @@ impl Device for EchoDevice {
     async fn set_remote(&self, _remote: bool) -> Result<()> {
         Ok(())
     }
+    async fn get_status(&self) -> Result<u8> {
+        Ok(0)
+    }
 }
 
 async fn start_server() -> Result<std::net::SocketAddr> {
