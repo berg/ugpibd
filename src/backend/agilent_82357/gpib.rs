@@ -237,8 +237,12 @@ impl<T: Transport> GpibController<T> {
     }
 
     /// Send Selected Device Clear to `pad` (SDC, preceded by addressing).
+    ///
+    /// SDC is an addressed command, and addressed commands act on devices
+    /// addressed to *listen*. Addressing the target as a talker leaves SDC with
+    /// no listener to act on, so the clear is silently a no-op.
     pub async fn device_clear(&mut self, pad: u8) -> Result<()> {
-        let cmd = [GPIB_UNL, talk_address(pad), GPIB_SDC];
+        let cmd = [GPIB_UNL, listen_address(pad), GPIB_SDC];
         self.send_command_bytes(&cmd).await
     }
 
@@ -779,11 +783,11 @@ mod tests {
         let mut ctrl = GpibController::new(t, 3000);
         ctrl.device_clear(7).await.unwrap();
         let writes = ctrl.transport.written.lock().unwrap().clone();
-        let cmd_len =
-            u32::from_le_bytes([writes[0][4], writes[0][5], writes[0][6], writes[0][7]]) as usize;
-        let cmd_bytes = &writes[0][8..8 + cmd_len];
-        assert!(cmd_bytes.contains(&0x3f)); // UNL
-        assert!(cmd_bytes.contains(&(0x40 + 7))); // TAD(7)
-        assert!(cmd_bytes.contains(&0x04)); // SDC
+        // SDC acts on listeners. Addressing pad 7 to talk instead would leave
+        // the command with nothing to act on and silently clear nothing.
+        assert_eq!(
+            cmd_payload(&writes[0]),
+            [GPIB_UNL, listen_address(7), GPIB_SDC]
+        );
     }
 }
