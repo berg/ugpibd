@@ -109,6 +109,24 @@ pub const HR_SRQIE: u8 = 0x02;
 // ADR register
 pub const ADDRESS_MASK: u8 = 0x1f;
 
+// IEEE-488 bus command bytes, sent with ATN asserted.
+pub const GPIB_UNL: u8 = 0x3f;
+pub const GPIB_UNT: u8 = 0x5f;
+pub const GPIB_SDC: u8 = 0x04;
+pub const GPIB_GET: u8 = 0x08;
+pub const GPIB_SPE: u8 = 0x18;
+pub const GPIB_SPD: u8 = 0x19;
+
+/// Listen address for primary address `pad` (our own pad gives MLA).
+pub fn listen_address(pad: u8) -> u8 {
+    0x20 | (pad & ADDRESS_MASK)
+}
+
+/// Talk address for primary address `pad` (our own pad gives MTA).
+pub fn talk_address(pad: u8) -> u8 {
+    0x40 | (pad & ADDRESS_MASK)
+}
+
 // Interrupt endpoint notification bits
 pub const AIF_SRQ_BN: u8 = 0;
 pub const AIF_WRITE_COMPLETE_BN: u8 = 1;

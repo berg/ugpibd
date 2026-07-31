@@ -37,6 +37,9 @@ impl Device for EchoDevice {
     async fn set_remote(&self, _remote: bool) -> Result<()> {
         Ok(())
     }
+    async fn get_status(&self) -> Result<u8> {
+        Ok(0)
+    }
 }
 
 /// Start an echo server on a background thread with its own runtime and return

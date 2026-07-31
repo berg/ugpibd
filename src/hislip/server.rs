@@ -53,10 +53,12 @@ pub trait Device: Send + Sync + 'static {
     /// Drive REN on/off.
     async fn set_remote(&self, remote: bool) -> Result<()>;
 
-    /// Read serial-poll status byte. Return 0 if unsupported.
-    async fn get_status(&self) -> u8 {
-        0
-    }
+    /// Read the instrument's serial-poll status byte.
+    ///
+    /// No default: 0 is a meaningful status ("nothing to report"), so an
+    /// implementation that has no way to poll must return an error rather than
+    /// a value the caller cannot distinguish from a real reading.
+    async fn get_status(&self) -> Result<u8>;
 }
 
 #[derive(Debug, Clone)]
@@ -585,7 +587,17 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncStatusQuery => {
-                let stb = entry.device.get_status().await;
+                // HiSLIP has no error reply for a status query — the response
+                // carries a status byte and nothing else — so a failed poll can
+                // only be reported as 0. Log it, so it is at least visible as a
+                // failure rather than passing for a genuine "nothing to report".
+                let stb = match entry.device.get_status().await {
+                    Ok(stb) => stb,
+                    Err(e) => {
+                        warn!("hislip status query failed, reporting 0: {e:#}");
+                        0
+                    }
+                };
                 MessageType::AsyncStatusResponse
                     .message_params(stb, 0)
                     .no_payload()

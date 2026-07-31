@@ -81,13 +81,26 @@ pub fn enumerate() -> Result<Vec<DiscoveredAdapter>> {
             .copied()
             .find(|k| k.usb_ids().contains(&ids))
         {
+            // A pre-firmware adapter carries no strings of its own; anything the
+            // OS reports is a neighbour's (typically the parent hub). Show
+            // nothing rather than something misleading — the pre-firmware pid in
+            // the vid:pid column already says what state the adapter is in.
+            let preinit = kind.is_preinit_pid(dev.product_id());
             out.push(DiscoveredAdapter {
                 kind,
                 port_id: port_id(&dev),
                 vid: dev.vendor_id(),
                 pid: dev.product_id(),
-                product: dev.product_string().map(str::to_owned),
-                serial: dev.serial_number().map(str::to_owned),
+                product: if preinit {
+                    None
+                } else {
+                    dev.product_string().map(str::to_owned)
+                },
+                serial: if preinit {
+                    None
+                } else {
+                    dev.serial_number().map(str::to_owned)
+                },
             });
         }
     }

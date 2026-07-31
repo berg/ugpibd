@@ -8,11 +8,10 @@
 // protocol, firmware upload, USB discovery, and controller logic live in the
 // submodules below; a `Model` descriptor selects the per-adapter parameters.
 //
-// The 82357B is fully supported and hardware-tested. The 82357A reuses the
-// same proven protocol; both models' firmware images are bundled, so a cold
-// adapter (pre-firmware) is uploaded automatically. The only per-model wrinkle
-// is the CPU-reset register address (see `Model::cpucs_addr`) — the 82357A is a
-// first-gen EZ-USB (AN2131) part and remains untested on real hardware.
+// Both models are hardware-tested. They share the same protocol, and both
+// firmware images are bundled, so a cold adapter (pre-firmware) is uploaded
+// automatically. The only per-model wrinkle is the CPU-reset register address
+// (see `Model::cpucs_addr`) — the 82357A is a first-gen EZ-USB (AN2131) part.
 
 pub mod firmware;
 pub mod gpib;
@@ -69,7 +68,7 @@ pub const MODEL_82357B: Model = Model {
 
 pub const MODEL_82357A: Model = Model {
     id: "agilent-82357a",
-    description: "Agilent 82357A USB-GPIB adapter (experimental; hardware-untested)",
+    description: "Agilent 82357A USB-GPIB adapter",
     usb_ids: &[
         (USB_VID_AGILENT, USB_PID_82357A_PREINIT),
         (USB_VID_AGILENT, USB_PID_82357A),

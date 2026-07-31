@@ -19,7 +19,7 @@ the ids.
 | Backend id | Adapter | Status |
 |------------|---------|--------|
 | `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
-| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | **Experimental — firmware now bundled and uploaded automatically, but not yet tested on 82357A hardware** |
+| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | Supported — firmware is bundled and uploaded automatically |
 | `ni-usb-hs` | NI GPIB-USB-HS (USB `3923:709b`) | Supported |
 | `ni-usb-hs` | KUSB-488A (`3923:725c`), MC-USB-488 (`3923:725d`) | Untested, but byte-for-byte the same code path as the GPIB-USB-HS |
 | `ni-usb-hs` | NI GPIB-USB-HS+ (`3923:7618`) | **Experimental** — different endpoints and an extra vendor-request init, both implemented but never run on hardware |
