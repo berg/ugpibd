@@ -25,6 +25,13 @@ pub trait Transport {
     /// await_write_complete only sees interrupts that fire from now on.
     /// Called during error recovery to re-synchronize with the firmware.
     fn drain_write_complete(&self) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Receiver for service-request notifications, when the transport has a
+    /// path that reports them. `None` means this transport cannot observe SRQ,
+    /// which callers must treat as "unknown", never as "no SRQ".
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
 }
 
 pub struct GpibController<T: Transport> {
@@ -470,6 +477,9 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     }
     async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
         self.serial_poll(pad).await
+    }
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        self.transport.subscribe_srq()
     }
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
         self.eos_char = eos_char;
