@@ -346,6 +346,24 @@ impl<T: Transport> GpibController<T> {
         }
     }
 
+    /// Whether some device on the bus is currently asserting SRQ.
+    ///
+    /// A live read of the physical line, not an event. The interrupt endpoint
+    /// reports SRQ as an *edge*, which is not enough on a shared bus: SRQ is
+    /// wired-OR, so a device that asserts while another is already holding the
+    /// line low produces no edge and is never announced. Callers use this to
+    /// tell "still asserted, keep looking" from "released, nothing pending".
+    pub async fn srq_asserted(&mut self) -> Result<bool> {
+        let mut regs = [RegisterPairlet {
+            address: TMS_BSR,
+            value: 0,
+        }];
+        self.read_registers(&mut regs).await?;
+        let bsr = regs[0].value;
+        tracing::debug!(bsr = ?format_args!("{bsr:#04x}"), "bus status");
+        Ok(bsr & BSR_SRQ != 0)
+    }
+
     /// Best-effort recovery after a stalled transfer: flush the in-flight USB
     /// transfer, drain any partial bulk-in data and any late write-complete
     /// interrupts, finalize the abort, then pulse IFC to reset the GPIB bus.
@@ -483,6 +501,9 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     }
     async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
         self.serial_poll(pad).await
+    }
+    async fn srq_asserted(&mut self) -> Result<bool> {
+        self.srq_asserted().await
     }
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()
