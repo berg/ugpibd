@@ -66,4 +66,9 @@ impl Device for GpibInstrument {
         let ctrl = self.ctrl.lock().await;
         ctrl.subscribe_srq()
     }
+
+    async fn srq_asserted(&self) -> Result<bool> {
+        let mut ctrl = self.ctrl.lock().await;
+        ctrl.srq_asserted().await
+    }
 }

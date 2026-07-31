@@ -75,6 +75,26 @@ pub const WRITE_COMPLETE_INTERRUPT_EN: u8 = 0x01;
 // Reset bits
 pub const RESET_SPACEBALL: u8 = 0x01;
 
+// TMS9914 *read* register addresses. These are a different register space from
+// the write addresses below: offset 3 is AUXCR when written and the bus status
+// register when read. Reading ISR0/ISR1 (0 and 1) clears pending interrupt
+// status and would steal notifications from the interrupt endpoint, so only the
+// side-effect-free bus status register is exposed here.
+pub const TMS_BSR: u8 = 0x03;
+
+// Bus status register bits — a live read of the physical GPIB lines. Bit order
+// established on hardware rather than from a datasheet: an idle bus reads 0x29
+// and the same bus with an instrument asserting SRQ reads 0x2d, so SRQ is 0x04.
+// REN corroborates it — the daemon asserts REN at init and never drops it, and
+// bit 0x01 is set in every reading.
+//
+//   bit 7 ATN   bit 6 DAV   bit 5 NDAC  bit 4 NRFD
+//   bit 3 EOI   bit 2 SRQ   bit 1 IFC   bit 0 REN
+//
+// Watch out for NDAC (0x20): idle listeners hold it asserted, so mistaking it
+// for SRQ reads as "someone is always requesting service".
+pub const BSR_SRQ: u8 = 0x04;
+
 // TMS9914 write register addresses
 pub const TMS_IMR0: u8 = 0x00;
 pub const TMS_IMR1: u8 = 0x01;

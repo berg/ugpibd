@@ -22,6 +22,11 @@ struct ProbeDevice {
     status: AtomicU8,
     /// Set to hand out an SRQ subscription; `raise_srq` then fires one.
     srq: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Live state of the wired-OR SRQ line. `None` models an adapter that
+    /// cannot read it.
+    line_asserted: Option<AtomicBool>,
+    /// Serial polls answered so far, so a test can make RQS appear late.
+    polls: AtomicU8,
 }
 
 impl ProbeDevice {
@@ -33,8 +38,27 @@ impl ProbeDevice {
         }
     }
 
+    /// A device on a bus whose SRQ line the adapter can read.
+    fn with_srq_line() -> Self {
+        Self {
+            line_asserted: Some(AtomicBool::new(false)),
+            ..Self::with_srq()
+        }
+    }
+
     fn raise_srq(&self) {
         let _ = self.srq.as_ref().expect("no srq channel").send(());
+    }
+
+    fn set_line(&self, asserted: bool) {
+        self.line_asserted
+            .as_ref()
+            .expect("no srq line")
+            .store(asserted, Ordering::SeqCst);
+    }
+
+    fn poll_count(&self) -> u8 {
+        self.polls.load(Ordering::SeqCst)
     }
 }
 
@@ -63,10 +87,17 @@ impl Device for ProbeDevice {
         Ok(())
     }
     async fn get_status(&self) -> Result<u8> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(self.status.load(Ordering::SeqCst))
     }
     async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.srq.as_ref().map(|tx| tx.subscribe())
+    }
+    async fn srq_asserted(&self) -> Result<bool> {
+        match self.line_asserted {
+            Some(ref v) => Ok(v.load(Ordering::SeqCst)),
+            None => anyhow::bail!("probe cannot read the SRQ line"),
+        }
     }
 }
 
@@ -184,6 +215,85 @@ async fn service_request_is_pushed_and_does_not_desync_the_channel() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(seen, Some(0x60), "no service request was pushed");
+}
+
+#[tokio::test]
+async fn service_request_arriving_without_an_edge_is_still_forwarded() {
+    // The device has not raised RQS when the notification lands -- another
+    // instrument pulled the wired-OR line first. Ours asserts a moment later,
+    // producing no edge of its own and so no second notification. Re-polling
+    // while the line stays asserted is the only way to see it.
+    let dev = Arc::new(ProbeDevice::with_srq_line());
+    dev.set_line(true);
+    dev.status.store(0x00, Ordering::SeqCst);
+    let addr = start_server(dev.clone()).await.unwrap();
+    let mut client = connect(addr).await.unwrap();
+
+    dev.raise_srq();
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert!(
+        dev.poll_count() > 1,
+        "forwarder gave up after one poll while SRQ was still asserted"
+    );
+
+    // Now our device raises RQS, with no further notification.
+    dev.status.store(0x60, Ordering::SeqCst);
+
+    let mut seen = None;
+    for _ in 0..40 {
+        assert_eq!(client.status().await.unwrap(), 0x60);
+        if let Some(srq) = client.take_service_request() {
+            seen = Some(srq);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        seen,
+        Some(0x60),
+        "request that arrived without an edge was lost"
+    );
+}
+
+#[tokio::test]
+async fn recheck_stops_once_the_srq_line_is_released() {
+    // Nothing is requesting service and the line is idle: the forwarder must
+    // poll once and stop, not spin.
+    let dev = Arc::new(ProbeDevice::with_srq_line());
+    dev.set_line(false);
+    dev.status.store(0x00, Ordering::SeqCst);
+    let addr = start_server(dev.clone()).await.unwrap();
+    let _client = connect(addr).await.unwrap();
+
+    dev.raise_srq();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        dev.poll_count(),
+        1,
+        "forwarder kept polling after the SRQ line went idle"
+    );
+}
+
+#[tokio::test]
+async fn recheck_is_bounded_when_the_line_stays_asserted() {
+    // A device with no session bound to it is requesting service that nothing
+    // here can clear, so the line never releases. The retry must give up
+    // rather than poll the bus forever.
+    let dev = Arc::new(ProbeDevice::with_srq_line());
+    dev.set_line(true);
+    dev.status.store(0x00, Ordering::SeqCst);
+    let addr = start_server(dev.clone()).await.unwrap();
+    let _client = connect(addr).await.unwrap();
+
+    dev.raise_srq();
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    let settled = dev.poll_count();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        dev.poll_count(),
+        settled,
+        "forwarder is still polling well past the recheck budget"
+    );
 }
 
 #[tokio::test]
