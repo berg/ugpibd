@@ -72,6 +72,15 @@ pub trait Device: Send + Sync + 'static {
     async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         None
     }
+
+    /// Whether any device on the bus is currently asserting SRQ — a level read,
+    /// not an event.
+    ///
+    /// Errors when the adapter cannot tell. Callers must not read that as "no
+    /// SRQ": a fabricated no is indistinguishable from a quiet bus.
+    async fn srq_asserted(&self) -> Result<bool> {
+        anyhow::bail!("this device cannot read the SRQ line")
+    }
 }
 
 /// IEEE-488 status byte bit 6: the device is requesting service. Set in the
@@ -83,6 +92,16 @@ const STB_RQS: u8 = 0x40;
 /// holds it to service one request — so this firing means something is wedged.
 /// It only logs; the forwarder keeps waiting.
 const WRITE_LOCK_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to keep re-polling this session's device while the SRQ line stays
+/// asserted. Bounded because the line can legitimately stay low indefinitely —
+/// a device with no session bound to it can request service that nothing will
+/// ever clear, and that must not become a busy loop.
+const SRQ_RECHECK_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Gap between those re-polls. Each one is a bus transaction, so this trades
+/// how fast an overlapping request is noticed against bus traffic.
+const SRQ_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -524,6 +543,62 @@ impl Drop for TaskGuard {
 /// comment claimed: `Device::get_status` takes the bus mutex and drops it before
 /// returning, so nothing is ever held across the two acquisitions and there is
 /// no hold-and-wait cycle to deadlock on.
+/// Poll this session's device for a service request, retrying while the SRQ
+/// line stays asserted. `None` means this session has nothing to forward.
+///
+/// One poll per notification is not enough. A notification is an *edge*, but
+/// SRQ is a wired-OR *level*: when a second device asserts while the first is
+/// still holding the line low, there is no edge, so no notification, and its
+/// request would never be seen. Observed on a two-instrument bus, where two
+/// devices asked for service at almost the same moment and only the one that
+/// happened to assert first was ever reported.
+///
+/// So while the line is still asserted, keep asking — either our device is
+/// about to raise RQS, or somebody else's request is outstanding.
+///
+/// The retry is bounded. The line can legitimately stay low forever: a device
+/// with no session bound to it can request service that nothing will ever
+/// clear, and that must not turn into a busy loop.
+async fn poll_for_service_request(entry: &SessionEntry) -> Option<u8> {
+    let deadline = std::time::Instant::now() + SRQ_RECHECK_BUDGET;
+    loop {
+        match entry.device.get_status().await {
+            Ok(stb) if stb & STB_RQS != 0 => return Some(stb),
+            Ok(stb) => {
+                // Not ours — at least not yet.
+                match entry.device.srq_asserted().await {
+                    Ok(true) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(SRQ_RECHECK_INTERVAL).await;
+                    }
+                    Ok(true) => {
+                        debug!(
+                            stb,
+                            "srq still asserted after {:?}; another device is holding it \
+                             and no session here can clear it",
+                            SRQ_RECHECK_BUDGET
+                        );
+                        return None;
+                    }
+                    Ok(false) => {
+                        debug!(stb, "srq released, nothing to forward");
+                        return None;
+                    }
+                    // No level read available: fall back to the single poll
+                    // this function used to do.
+                    Err(e) => {
+                        debug!(stb, "cannot read the srq line ({e:#}), not forwarding");
+                        return None;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("srq raised but serial poll failed, not forwarding: {e:#}");
+                return None;
+            }
+        }
+    }
+}
+
 async fn srq_forwarder<W>(
     mut srq: tokio::sync::broadcast::Receiver<()>,
     writer: Arc<Mutex<W>>,
@@ -541,20 +616,9 @@ async fn srq_forwarder<W>(
             Err(RecvError::Closed) => return,
         }
 
-        let stb = match entry.device.get_status().await {
-            Ok(stb) => stb,
-            Err(e) => {
-                warn!("srq raised but serial poll failed, not forwarding: {e:#}");
-                continue;
-            }
-        };
-        if stb & STB_RQS == 0 {
-            debug!(
-                stb,
-                "srq raised by another device on the bus, not forwarding"
-            );
+        let Some(stb) = poll_for_service_request(&entry).await else {
             continue;
-        }
+        };
 
         // Bound only the *acquisition*, and only to log: abandoning a wait for
         // a lock costs nothing, so a slow acquisition is reported and then
