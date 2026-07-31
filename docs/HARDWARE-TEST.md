@@ -164,9 +164,22 @@ read the SRQ line for `++srq` but has no asynchronous path.
 ## Test 9: Disconnect mid-session
 
 1. Start `ugpibd` and connect a client.
-2. Unplug the adapter while idle.
-3. Confirm the daemon logs the disconnect and exits cleanly (exit code 0 or 1,
-   no panic).
+2. Unplug the adapter **while idle** — the interesting case, because nothing is
+   in flight to fail and notice.
+3. Confirm the daemon logs `was unplugged, shutting down` within a second or so
+   and exits with status **0**, no panic.
+4. Replug and start it again; on an 82357 this re-uploads firmware from cold.
+
+Exit status 0 is deliberate rather than incidental. `contrib/ugpibd.service`
+sets `Restart=on-failure`, so a clean exit stops systemd restarting the daemon
+into an adapter that is not there, while the udev rule in
+`contrib/60-ugpibd.rules` (`ACTION=="add"`) starts it again when one is plugged
+in. Exiting non-zero here would produce a restart loop for as long as the
+adapter stayed unplugged.
+
+The daemon deliberately does not try to tidy up the adapter on this path — every
+transfer would fail, and warning about failing to reset hardware that has been
+removed is only noise.
 
 ## Optional: Prologix front-end
 

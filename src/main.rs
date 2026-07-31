@@ -134,7 +134,8 @@ async fn main() -> Result<()> {
         Some(ref port) => ugpibd::backend::select::UsbSelector::Port(port.clone()),
         None => ugpibd::backend::select::UsbSelector::Auto,
     };
-    let ctrl = ugpibd::backend::open_selected(&selector, backend, args.timeout_ms).await?;
+    let (ctrl, adapter_port) =
+        ugpibd::backend::open_selected(&selector, backend, args.timeout_ms).await?;
 
     let prologix_listener = if args.enable_prologix {
         let l = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
@@ -188,9 +189,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Watch the USB port the adapter is on. Waiting for a transfer to fail
+    // would never fire while the daemon is idle, leaving it running against
+    // hardware that is no longer there and answering clients with errors it
+    // cannot recover from.
+    let removal = ugpibd::backend::select::wait_for_removal(&adapter_port);
+
+    let mut adapter_gone = false;
     let result = tokio::select! {
         result = prologix_fut => result,
         result = hislip_fut => result,
+        _ = removal => {
+            info!("adapter at USB port {adapter_port} was unplugged, shutting down");
+            adapter_gone = true;
+            Ok(())
+        }
         _ = ctrl_c => {
             info!("SIGINT received, shutting down");
             Ok(())
@@ -202,8 +215,12 @@ async fn main() -> Result<()> {
     };
 
     // Leave the adapter clean for the next run even if a front-end failed;
-    // some adapters keep GPIB state across host restarts.
-    if let Err(e) = ctrl.lock().await.shutdown().await {
+    // some adapters keep GPIB state across host restarts. Skip it when the
+    // adapter has been unplugged: every transfer would fail, and warning about
+    // failing to tidy up hardware that is gone is just noise.
+    if adapter_gone {
+        info!("skipping adapter shutdown, it is no longer attached");
+    } else if let Err(e) = ctrl.lock().await.shutdown().await {
         warn!("adapter shutdown failed: {e:#}");
     }
 

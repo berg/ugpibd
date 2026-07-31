@@ -203,11 +203,14 @@ pub fn known_ids() -> String {
 /// Open a backend. `backend` is `None` to accept any kind, or `Some(id)` to
 /// require a specific one; `selector` picks among several attached adapters by
 /// USB port. Errors (naming the candidates) unless exactly one adapter matches.
+///
+/// Returns the opened adapter and the USB port id it is bound to, so the caller
+/// can watch for that adapter being unplugged.
 pub async fn open_selected(
     selector: &UsbSelector,
     backend: Option<&str>,
     timeout_ms: u32,
-) -> Result<SharedBackend> {
+) -> Result<(SharedBackend, String)> {
     if let Some(id) = backend {
         BackendKind::from_id(id)
             .with_context(|| format!("unknown backend {id:?} (known: {})", known_ids()))?;
@@ -219,7 +222,9 @@ pub async fn open_selected(
         chosen.kind.id(),
         chosen.port_id
     );
-    chosen.kind.open(timeout_ms, Some(&chosen.port_id)).await
+    let port_id = chosen.port_id.clone();
+    let opened = chosen.kind.open(timeout_ms, Some(&port_id)).await?;
+    Ok((opened, port_id))
 }
 
 #[cfg(test)]
