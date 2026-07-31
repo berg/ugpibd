@@ -8,6 +8,7 @@
 // surfaced for humans in `--list`.
 
 use anyhow::{Context, Result};
+use nusb::MaybeFuture;
 
 use super::BackendKind;
 
@@ -55,7 +56,7 @@ pub fn port_id(dev: &nusb::DeviceInfo) -> String {
             .sysfs_path()
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("bus{}-addr{}", dev.bus_number(), dev.device_address()));
+            .unwrap_or_else(|| format!("{}-addr{}", dev.bus_id(), dev.device_address()));
     }
     #[cfg(target_os = "macos")]
     {
@@ -67,14 +68,17 @@ pub fn port_id(dev: &nusb::DeviceInfo) -> String {
     }
     #[allow(unreachable_code)]
     {
-        format!("bus{}-addr{}", dev.bus_number(), dev.device_address())
+        format!("{}-addr{}", dev.bus_id(), dev.device_address())
     }
 }
 
 /// Enumerate every attached *supported* adapter, in `BackendKind::ALL` order.
 pub fn enumerate() -> Result<Vec<DiscoveredAdapter>> {
     let mut out = Vec::new();
-    for dev in nusb::list_devices().context("failed to list USB devices")? {
+    for dev in nusb::list_devices()
+        .wait()
+        .context("failed to list USB devices")?
+    {
         let ids = (dev.vendor_id(), dev.product_id());
         if let Some(kind) = BackendKind::ALL
             .iter()

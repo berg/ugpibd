@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nusb::transfer::{ControlIn, ControlType, Recipient, RequestBuffer};
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlType, In, Interrupt, Out, Recipient};
+use nusb::{Endpoint, MaybeFuture};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -17,11 +18,27 @@ use super::Model;
 /// requested service, so a small buffer is plenty and lagging is harmless.
 const SRQ_CHANNEL_CAPACITY: usize = 16;
 
+/// Cap on vendor control transfers. These are short handshake exchanges, so
+/// anything approaching this means the adapter has stopped answering.
+const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The bulk endpoints, held open for the life of the transport.
+///
+/// nusb 0.2 makes an endpoint a persistent object rather than something
+/// recreated per transfer, which removes the reopen race and lets a stalled
+/// transfer be cleared without tearing anything down. They live behind one
+/// mutex so a request and its reply cannot be interleaved with anything else.
+struct BulkIo {
+    out: Endpoint<Bulk, Out>,
+    r#in: Endpoint<Bulk, In>,
+}
+
 pub struct UsbTransport {
-    interface: nusb::Interface,
+    /// Held only to keep the interface claimed for the transport's lifetime;
+    /// all I/O goes through the endpoints opened from it.
+    _interface: nusb::Interface,
     device: nusb::Device,
-    bulk_out_ep: u8,
-    bulk_in_ep: u8,
+    io: tokio::sync::Mutex<BulkIo>,
     write_complete: Arc<Notify>,
     srq: tokio::sync::broadcast::Sender<()>,
     timeout_ms: u32,
@@ -36,27 +53,38 @@ impl UsbTransport {
         bulk_in_ep: u8,
         irq_in_ep: u8,
         timeout_ms: u32,
-    ) -> Self {
+    ) -> Result<Self> {
         let write_complete = Arc::new(Notify::new());
         let notify = write_complete.clone();
         let irq_iface = interface.clone();
         let (srq, _) = tokio::sync::broadcast::channel(SRQ_CHANNEL_CAPACITY);
         let srq_tx = srq.clone();
 
+        let irq_ep = irq_iface
+            .endpoint::<Interrupt, In>(irq_in_ep)
+            .with_context(|| format!("open interrupt endpoint {irq_in_ep:#04x}"))?;
         let irq_task = tokio::spawn(async move {
-            interrupt_poller(irq_iface, irq_in_ep, notify, srq_tx).await;
+            interrupt_poller(irq_ep, notify, srq_tx).await;
         });
 
-        Self {
-            interface,
+        let io = tokio::sync::Mutex::new(BulkIo {
+            out: interface
+                .endpoint::<Bulk, Out>(bulk_out_ep)
+                .with_context(|| format!("open bulk-out endpoint {bulk_out_ep:#04x}"))?,
+            r#in: interface
+                .endpoint::<Bulk, In>(bulk_in_ep)
+                .with_context(|| format!("open bulk-in endpoint {bulk_in_ep:#04x}"))?,
+        });
+
+        Ok(Self {
+            _interface: interface,
             device,
-            bulk_out_ep,
-            bulk_in_ep,
+            io,
             write_complete,
             srq,
             timeout_ms,
             _irq_task: irq_task,
-        }
+        })
     }
 
     /// Receiver for service-request notifications raised by the adapter's
@@ -83,8 +111,10 @@ fn classify_error(e: &nusb::transfer::TransferError) -> PollerAction {
     match e {
         Cancelled | Disconnected => PollerAction::Stop,
         // `Unknown` is the macOS IOKit catch-all (e.g. kIOReturnNotResponding
-        // after the bus goes idle); `Stall`/`Fault` clear with a halt reset.
-        Stall | Fault | Unknown => PollerAction::Recover,
+        // after the bus goes idle) and carries the raw code; `Stall`/`Fault`
+        // clear with a halt reset. Anything new upstream adds is treated as
+        // recoverable rather than fatal.
+        _ => PollerAction::Recover,
     }
 }
 
@@ -95,21 +125,24 @@ const IRQ_RECOVER_MIN: std::time::Duration = std::time::Duration::from_millis(50
 const IRQ_RECOVER_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn interrupt_poller(
-    interface: nusb::Interface,
-    endpoint: u8,
+    mut endpoint: Endpoint<Interrupt, In>,
     notify: Arc<Notify>,
     srq: tokio::sync::broadcast::Sender<()>,
 ) {
     let mut backoff = IRQ_RECOVER_MIN;
+    // An IN transfer must request a whole number of max-size packets.
+    let buf_len = {
+        let mps = endpoint.max_packet_size().max(1);
+        INTERRUPT_BUF_LEN.div_ceil(mps) * mps
+    };
     'recover: loop {
-        let mut queue = interface.interrupt_in_queue(endpoint);
         loop {
-            queue.submit(RequestBuffer::new(INTERRUPT_BUF_LEN));
-            let completion = queue.next_complete().await;
+            endpoint.submit(Buffer::new(buf_len));
+            let completion = endpoint.next_complete().await;
             match completion.status {
                 Ok(_) => {
                     backoff = IRQ_RECOVER_MIN; // healthy again; reset backoff
-                    let flags = completion.data.first().copied().unwrap_or(0);
+                    let flags = completion.buffer.first().copied().unwrap_or(0);
                     debug!(flags = ?format_args!("{:#04x}", flags), "interrupt");
                     if flags & (1 << AIF_WRITE_COMPLETE_BN) != 0 {
                         notify.notify_one();
@@ -127,15 +160,15 @@ async fn interrupt_poller(
                     }
                     PollerAction::Recover => {
                         warn!("interrupt endpoint error: {e} — recovering in {backoff:?}");
-                        break; // drop the queue, then clear halt + back off
+                        break; // clear halt + back off, then resubmit
                     }
                 },
             }
         }
 
-        // Recovery: drop the stale queue (done above), clear any halt the
-        // device may have raised, wait out the backoff, then resubmit.
-        let _ = interface.clear_halt(endpoint);
+        // Recovery: clear any halt the device raised, wait out the backoff,
+        // then resubmit on the same endpoint.
+        let _ = MaybeFuture::wait(endpoint.clear_halt());
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(IRQ_RECOVER_MAX);
     }
@@ -148,9 +181,9 @@ impl Transport for UsbTransport {
 
     async fn write_bulk(&self, data: &[u8]) -> Result<()> {
         debug!(len = data.len(), first = ?&data[..data.len().min(8)], "bulk-out");
-        let mut queue = self.interface.bulk_out_queue(self.bulk_out_ep);
-        queue.submit(data.to_vec());
-        let completion = queue.next_complete().await;
+        let mut io = self.io.lock().await;
+        io.out.submit(data.to_vec().into());
+        let completion = io.out.next_complete().await;
         completion
             .status
             .map_err(|e| anyhow::anyhow!("bulk-out failed: {e}"))?;
@@ -158,18 +191,35 @@ impl Transport for UsbTransport {
     }
 
     async fn read_bulk(&self, max_len: usize) -> Result<Vec<u8>> {
-        let mut queue = self.interface.bulk_in_queue(self.bulk_in_ep);
-        queue.submit(RequestBuffer::new(max_len));
-        let completion = queue.next_complete().await;
-        completion
-            .status
-            .map_err(|e| anyhow::anyhow!("bulk-in failed: {e}"))?;
+        let mut io = self.io.lock().await;
+        // A bulk IN transfer ends at a short packet, so a reply longer than one
+        // max-size packet arrives as several completions and must be
+        // reassembled; a single read would return just the first packet. Each
+        // request is rounded up to a whole number of packets, as the API needs.
+        let mps = io.r#in.max_packet_size().max(1);
+        let mut data: Vec<u8> = Vec::with_capacity(max_len);
+
+        while data.len() < max_len {
+            let want = (max_len - data.len()).max(1).div_ceil(mps) * mps;
+            io.r#in.submit(Buffer::new(want));
+            let completion = io.r#in.next_complete().await;
+            completion
+                .status
+                .map_err(|e| anyhow::anyhow!("bulk-in failed: {e}"))?;
+            let chunk = completion.buffer;
+            let short = chunk.len() % mps != 0 || chunk.is_empty();
+            data.extend_from_slice(&chunk);
+            if short {
+                break;
+            }
+        }
+
         debug!(
-            len = completion.data.len(),
-            first = ?&completion.data[..completion.data.len().min(8)],
+            len = data.len(),
+            first = ?&data[..data.len().min(8)],
             "bulk-in"
         );
-        Ok(completion.data)
+        Ok(data)
     }
 
     async fn control_in(
@@ -181,19 +231,20 @@ impl Transport for UsbTransport {
     ) -> Result<Vec<u8>> {
         let completion = self
             .device
-            .control_in(ControlIn {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Device,
-                request,
-                value,
-                index,
-                length: max_len as u16,
-            })
-            .await;
-        let data = completion
-            .into_result()
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request,
+                    value,
+                    index,
+                    length: max_len as u16,
+                },
+                CONTROL_TIMEOUT,
+            )
+            .await
             .map_err(|e| anyhow::anyhow!("control-in failed: {e}"))?;
-        Ok(data)
+        Ok(completion)
     }
 
     async fn await_write_complete(&self) -> Result<()> {
@@ -221,7 +272,9 @@ impl Transport for UsbTransport {
 /// Find an adapter of `model` in either pre-firmware or post-firmware state,
 /// restricted to `port` (USB port id) when given.
 pub fn find_device(model: &Model, port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
-    let devices = nusb::list_devices().context("failed to list USB devices")?;
+    let devices = nusb::list_devices()
+        .wait()
+        .context("failed to list USB devices")?;
     for dev in devices {
         if dev.vendor_id() != USB_VID_AGILENT {
             continue;
@@ -255,27 +308,35 @@ pub async fn open_transport(
     dev_info: nusb::DeviceInfo,
     timeout_ms: u32,
 ) -> Result<UsbTransport> {
-    let device = dev_info.open().context("failed to open USB device")?;
-    let interface = device.claim_interface(0).context(
+    let device = dev_info
+        .open()
+        .wait()
+        .context("failed to open USB device")?;
+    let interface = device.claim_interface(0).wait().context(
         "failed to claim interface 0 — is the kernel driver loaded? \
          See blacklist instructions in README.md",
     )?;
 
     // Clear residual halt conditions on the bulk pipes before first use.
-    let _ = interface.clear_halt(EP_BULK_IN);
-    let _ = interface.clear_halt(model.bulk_out_ep);
+    let mut drain_ep = interface
+        .endpoint::<Bulk, In>(EP_BULK_IN)
+        .context("open bulk-in endpoint for drain")?;
+    let _ = MaybeFuture::wait(drain_ep.clear_halt());
+    if let Ok(mut out) = interface.endpoint::<Bulk, Out>(model.bulk_out_ep) {
+        let _ = MaybeFuture::wait(out.clear_halt());
+    }
 
     // Drain any stale bulk-in data left over from a prior session. Retry a few
     // times in case the data arrives slightly delayed. Each submit that times
     // out is simply cancelled when its Queue drops.
     for _ in 0..3 {
         let drain = async {
-            let mut queue = interface.bulk_in_queue(EP_BULK_IN);
-            queue.submit(nusb::transfer::RequestBuffer::new(0x40));
-            let completion = queue.next_complete().await;
+            let mps = drain_ep.max_packet_size().max(1);
+            drain_ep.submit(Buffer::new(0x40usize.div_ceil(mps) * mps));
+            let completion = drain_ep.next_complete().await;
             if let Ok(()) = completion.status {
-                if !completion.data.is_empty() {
-                    debug!(len = completion.data.len(), "drained stale bulk-in data");
+                if !completion.buffer.is_empty() {
+                    debug!(len = completion.buffer.len(), "drained stale bulk-in data");
                     return true;
                 }
             }
@@ -289,21 +350,23 @@ pub async fn open_transport(
         }
     }
 
-    Ok(UsbTransport::new(
+    UsbTransport::new(
         device,
         interface,
         model.bulk_out_ep,
         EP_BULK_IN,
         model.irq_in_ep,
         timeout_ms,
-    ))
+    )
 }
 
 /// Poll for a device with the given PID to appear, up to `timeout`.
 pub async fn wait_for_pid(pid: u16, timeout: std::time::Duration) -> Result<nusb::DeviceInfo> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let devices = nusb::list_devices().context("failed to list USB devices")?;
+        let devices = nusb::list_devices()
+            .wait()
+            .context("failed to list USB devices")?;
         if let Some(dev) = devices
             .into_iter()
             .find(|d| d.vendor_id() == USB_VID_AGILENT && d.product_id() == pid)
@@ -350,11 +413,12 @@ pub async fn initialize_device(
 
     let mut current = dev_info;
     for attempt in 1..=2u32 {
-        let old_bus = current.bus_number();
+        let old_bus = current.bus_id().to_string();
         let old_addr = current.device_address();
 
         let device = current
             .open()
+            .wait()
             .with_context(|| format!("failed to open pre-init device (attempt {attempt})"))?;
         super::firmware::upload_firmware(&device, firmware, model.cpucs_addr)
             .await
@@ -401,18 +465,19 @@ pub async fn initialize_device(
 async fn wait_for_renumeration(
     model: &Model,
     port: Option<&str>,
-    old_bus: u8,
+    old_bus: String,
     old_addr: u8,
 ) -> Result<(nusb::DeviceInfo, u16)> {
     // Phase 1: wait until the old device address is gone (or at minimum 200ms settle)
     let phase1_start = std::time::Instant::now();
     loop {
         let devices: Vec<_> = nusb::list_devices()
+            .wait()
             .context("failed to list USB devices")?
             .collect();
         let still_present = devices
             .iter()
-            .any(|d| d.bus_number() == old_bus && d.device_address() == old_addr);
+            .any(|d| d.bus_id() == old_bus.as_str() && d.device_address() == old_addr);
         if !still_present {
             break;
         }
@@ -427,7 +492,9 @@ async fn wait_for_renumeration(
 
     // Phase 2: wait for any PID of this model to appear.
     loop {
-        let devices = nusb::list_devices().context("failed to list USB devices")?;
+        let devices = nusb::list_devices()
+            .wait()
+            .context("failed to list USB devices")?;
         for dev in devices {
             if dev.vendor_id() == USB_VID_AGILENT {
                 let pid = dev.product_id();
@@ -457,7 +524,7 @@ mod tests {
         // clearing the halt and resubmitting. None of these may kill the
         // poller — that's the "must restart ugpibd after idle" bug.
         assert_eq!(
-            classify_error(&TransferError::Unknown),
+            classify_error(&TransferError::Unknown(0)),
             PollerAction::Recover
         );
         assert_eq!(classify_error(&TransferError::Stall), PollerAction::Recover);

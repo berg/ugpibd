@@ -139,6 +139,22 @@ pub const IBSTA_SRQI: u16 = 0x1000;
 pub const IBSTA_END: u16 = 0x2000;
 pub const IBSTA_TIMO: u16 = 0x4000;
 
+/// Every bit that means something in an ibsta word. A status carrying anything
+/// outside this did not come from the status machinery: arming the monitor is
+/// acknowledged on the interrupt endpoint with a block parsing as `0xff00`,
+/// which has SRQI set and would otherwise read as a service request nobody made.
+pub const IBSTA_DEFINED_BITS: u16 = IBSTA_DCAS
+    | IBSTA_DTAS
+    | IBSTA_LACS
+    | IBSTA_TACS
+    | IBSTA_ATN
+    | IBSTA_CIC
+    | IBSTA_REM
+    | IBSTA_LOK
+    | IBSTA_SRQI
+    | IBSTA_END
+    | IBSTA_TIMO;
+
 /// The ibsta bits the adapter is asked to monitor (`ni_usb_ibsta_monitor_mask`).
 pub const IBSTA_MONITOR_MASK: u16 = IBSTA_SRQI
     | IBSTA_LOK

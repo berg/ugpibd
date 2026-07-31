@@ -69,6 +69,35 @@ pub trait NiTransport: Send + Sync {
 
     /// USB product id, used to select the model-specific bring-up steps.
     fn product_id(&self) -> u16;
+
+    /// Send a request and read its reply as one indivisible exchange.
+    ///
+    /// Every adapter operation is a bulk-out followed by the bulk-in carrying
+    /// its status, and the two must not be separated: anything else touching
+    /// the adapter in between leaves the reply to be read by the next request,
+    /// and every reply from then on answers the one before. Real transports
+    /// override this to hold their I/O lock across the pair; the default is the
+    /// naive version, which is all a single-threaded mock needs.
+    async fn transact(&self, req: &[u8], resp_len: usize) -> Result<Vec<u8>> {
+        self.bulk_out(req).await?;
+        self.bulk_in(resp_len).await
+    }
+
+    /// Receiver for service-request notifications, when the transport reads the
+    /// adapter's interrupt endpoint. `None` means it cannot observe SRQ, which
+    /// callers must treat as "unknown", never as "no SRQ".
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
+
+    /// Re-arm the adapter's interrupt monitor for `mask`.
+    ///
+    /// Separate from `control_in` because it must be serialised against whole
+    /// bulk transactions, which only the transport can do. The default is a
+    /// no-op for transports that cannot report SRQ.
+    async fn rearm_srq(&self, _mask: u16) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// GPIB-USB-HS controller. The controller's own primary address is fixed at 0;
@@ -105,8 +134,7 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
     /// Send a bulk request and read a fixed-size response, surfacing transport
     /// errors. The response is returned for the caller to parse.
     async fn transact(&self, req: &[u8], resp_len: usize) -> Result<Vec<u8>> {
-        self.transport.bulk_out(req).await?;
-        self.transport.bulk_in(resp_len).await
+        self.transport.transact(req, resp_len).await
     }
 
     /// Take control (assert ATN), send command bytes, then optionally return to
@@ -156,22 +184,22 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // Monitor nothing while the chip is being reconfigured, per the kernel
         // driver's attach ordering.
         //
-        // Unlike the kernel we then leave monitoring *off*. Enabling it makes
-        // the adapter push an ibsta report onto its interrupt endpoint on every
-        // status change; the kernel keeps an URB permanently submitted to drain
-        // those, but this daemon is synchronous request/response and has no
-        // reader. The backlog builds over a session and stalls the adapter's
-        // bulk transfers on the next one — reliably hanging the first IFC after
-        // a restart, recoverable only by physically replugging.
-        //
-        // If async SRQ notification is ever added, re-enable it *and* add a task
-        // that continuously drains `interrupt_in_ep`; do not enable one without
-        // the other. See `IBSTA_MONITOR_MASK` for the bits the kernel watches.
         // The HS+ wants three more vendor reads before it will talk GPIB.
         if self.transport.product_id() == usb::PID_NI_USB_HS_PLUS {
             usb::hs_plus_extra_init(&self.transport).await?;
         }
-        usb::set_interrupt_monitor(&self.transport, 0).await?;
+        // Arm the interrupt monitor for service requests, and nothing else.
+        //
+        // Safe only because the transport reads the interrupt endpoint from the
+        // moment it opens: a reported bit nobody reads backs up and stalls the
+        // adapter's bulk transfers on the *next* session, recoverable only by
+        // replugging. `shutdown` disarms, keeping that promise on a clean exit.
+        //
+        // SRQ alone, never `IBSTA_MONITOR_MASK`. The adapter reports a monitored
+        // bit that is already set straight away, and most of that mask — CIC,
+        // TACS, ATN — is true nearly always, so arming with it yields a
+        // continuous stream of reports carrying no news.
+        usb::set_interrupt_monitor(&self.transport, IBSTA_SRQI).await?;
         let regs = setup_init(my_pad, self.eos_mode());
         self.register_write(&regs)
             .await
@@ -315,10 +343,25 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         let resp = self.transact(&req, 0x40).await?;
         let (data, _end) = parse_data_read_response(&resp, 1)?;
         self.send_command(&[GPIB_SPD, GPIB_UNT], false).await?;
+
+        // Re-arm here, because this is exactly the point where a service
+        // request has been dealt with. The adapter's monitor is one-shot per
+        // bit — the kernel clears each reported bit from the set it waits on —
+        // so without this the first report is the only one ever delivered.
+        // Re-arming from the reader task instead would race: it is a control
+        // transfer, and one landing between a bulk-out and its bulk-in
+        // desynchronises every reply that follows.
+        if let Err(e) = self.transport.rearm_srq(IBSTA_SRQI).await {
+            debug!("ni: re-arming the srq monitor failed: {e:#}");
+        }
         Ok(data.first().copied().unwrap_or(0))
     }
 
     /// Read the TNT4882 bus status register and report the live SRQ line.
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        self.transport.subscribe_srq()
+    }
+
     async fn srq_asserted(&mut self) -> Result<bool> {
         let vals = self
             .register_read(&[(SUBDEV_TNT4882, REG_BSR)])
@@ -476,8 +519,9 @@ mod tests {
             reg_write_ok(26),
             op_ok(),         // IFC
             reg_write_ok(1), // REN
-            op_ok(),         // priming cycle: take control
-            op_ok(),         // priming cycle: command bytes
+            op_ok(),         // priming: take control
+            op_ok(),         // priming: UNL + MTA
+            op_ok(),         // priming: the discarded data write
         ]
     }
 
@@ -708,9 +752,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_leaves_interrupt_monitoring_disabled() {
-        // Enabling it without a reader lets ibsta reports pile up on the
-        // interrupt endpoint and stalls the adapter on the next session.
+    async fn init_arms_srq_only_and_shutdown_disarms() {
+        // Monitoring is safe only while something reads the interrupt endpoint,
+        // which the transport starts when it opens. What this pins is the rest
+        // of the bargain. Arming must name SRQ alone: the adapter reports an
+        // already-set bit immediately, and CIC/TACS/ATN are set nearly always,
+        // so the full mask yields a continuous stream of reports about nothing.
+        // And shutdown must disarm, or the next session inherits an adapter
+        // reporting to nobody.
         let monitor_masks = std::sync::Arc::new(Mutex::new(Vec::new()));
         struct Recorder(std::sync::Arc<Mutex<Vec<u16>>>, MockTransport);
         #[async_trait::async_trait]
@@ -740,14 +789,23 @@ mod tests {
                 self.1.product_id()
             }
         }
-        let t = Recorder(monitor_masks.clone(), MockTransport::new(init_responses()));
+        let mut responses = init_responses();
+        responses.push(reg_write_ok(2)); // shutdown's register write
+        let t = Recorder(monitor_masks.clone(), MockTransport::new(responses));
         let mut be = NiUsbHsBackend::new(t, 3000);
+
         be.init(0).await.unwrap();
-        let masks = monitor_masks.lock().unwrap().clone();
-        assert!(!masks.is_empty(), "monitoring should be explicitly set");
-        assert!(
-            masks.iter().all(|&m| m == 0),
-            "every monitor mask must be 0, got {masks:?}"
+        assert_eq!(
+            monitor_masks.lock().unwrap().clone(),
+            vec![IBSTA_SRQI],
+            "init must arm for SRQ alone, never the whole monitor mask"
+        );
+
+        be.shutdown().await.unwrap();
+        assert_eq!(
+            monitor_masks.lock().unwrap().clone(),
+            vec![IBSTA_SRQI, 0],
+            "shutdown must disarm the monitor"
         );
     }
 
