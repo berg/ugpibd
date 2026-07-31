@@ -18,7 +18,7 @@ pub mod protocol;
 pub mod usb;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::backend::{GpibBackend, SharedBackend};
 use protocol::*;
@@ -185,6 +185,44 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // backend's init.
         self.ifc().await.context("ni init: interface clear")?;
         self.ren(true).await.context("ni init: assert REN")?;
+
+        // Make ourselves the addressed talker before any client traffic.
+        //
+        // A freshly plugged adapter comes up without TACS, and its first
+        // transfer then fails: the addressing is reported as sent, and the data
+        // write that follows times out having placed zero bytes, because
+        // nothing was ever really addressed to listen. The tell is the
+        // take-control status — a cold adapter reports CIC+ATN (0x30) where one
+        // that has been used reports CIC+ATN+TACS (0x38). It is invisible on a
+        // warm adapter because this hardware keeps its GPIB state across host
+        // restarts, so only the first session after a replug pays for it, and
+        // only for its first transfer.
+        //
+        // UNL leaves nobody addressed to listen and MTA makes us the talker, so
+        // this changes nothing on the bus beyond leaving it idle — which is
+        // where init should leave it anyway — while establishing the state whose
+        // absence causes the failure. Untalking here instead would be worse
+        // than useless: it clears the very bit we need.
+        self.send_command(&[GPIB_UNL, talk_address(my_pad)], false)
+            .await
+            .context("ni init: address self as talker")?;
+
+        // Spend the first data write here, because a freshly plugged adapter
+        // loses it. Its command path is fine — addressing is accepted and
+        // reported as sent — but the first NIUSB_DATA_WRITE_OP after a replug
+        // times out having placed zero bytes, and every one after it succeeds.
+        // The adapter reports identical status throughout (CIC/TACS/ATN all as
+        // expected), so there is nothing to test for and nothing to wait on;
+        // the only way found to clear it is to perform one and discard it.
+        //
+        // Safe because of the UNL just above: with nothing addressed to listen,
+        // this byte is never handshaken by any instrument. Do not reorder it
+        // ahead of that command. A short timeout keeps init quick, since with
+        // no listener the write is expected to fail.
+        let doomed = encode_data_write(&[0x00], false, timeout_code(10));
+        if let Err(e) = self.transact(&doomed, OP_RESP_LEN).await {
+            debug!("ni init: priming data write did not complete: {e}");
+        }
 
         info!("NI GPIB-USB-HS initialized at pad {my_pad}");
         Ok(())
@@ -434,7 +472,13 @@ mod tests {
     /// The bulk responses `init()` consumes after the readiness handshake:
     /// the 26-register init write, the IFC pulse, and the REN register write.
     fn init_responses() -> Vec<Vec<u8>> {
-        vec![reg_write_ok(26), op_ok(), reg_write_ok(1)]
+        vec![
+            reg_write_ok(26),
+            op_ok(),         // IFC
+            reg_write_ok(1), // REN
+            op_ok(),         // priming cycle: take control
+            op_ok(),         // priming cycle: command bytes
+        ]
     }
 
     fn reg_write_ok(completed: u8) -> Vec<u8> {
@@ -455,7 +499,21 @@ mod tests {
         let mut be = NiUsbHsBackend::new(t, 3000);
         be.init(0).await.unwrap();
         let writes = be.transport.written.lock().unwrap().clone();
-        assert_eq!(writes.len(), 3, "init: register sequence, IFC, REN");
+        assert_eq!(
+            writes.len(),
+            6,
+            "init: register sequence, IFC, REN, take control, address self, \
+             then the discarded data write"
+        );
+
+        // MTA is the point: a cold adapter has no TACS, and its first transfer
+        // fails without it. Untalking here would clear the very bit this is
+        // establishing. UNL keeps the bus idle by leaving nobody listening.
+        assert_eq!(
+            &writes[4][4..6],
+            [GPIB_UNL, talk_address(0)],
+            "init must unlisten and address itself as talker, never untalk"
+        );
 
         assert_eq!(writes[0][0], NIUSB_REG_WRITE_ID);
         assert_eq!(writes[0][1], 26, "26 register writes");
