@@ -25,6 +25,13 @@ pub trait Transport {
     /// await_write_complete only sees interrupts that fire from now on.
     /// Called during error recovery to re-synchronize with the firmware.
     fn drain_write_complete(&self) -> impl std::future::Future<Output = ()> + Send;
+
+    /// Receiver for service-request notifications, when the transport has a
+    /// path that reports them. `None` means this transport cannot observe SRQ,
+    /// which callers must treat as "unknown", never as "no SRQ".
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
 }
 
 pub struct GpibController<T: Transport> {
@@ -242,9 +249,15 @@ impl<T: Transport> GpibController<T> {
     }
 
     /// Write `data` to instrument at `pad`. Handles GPIB addressing internally.
+    ///
+    /// The sequence must begin with UNL. Listener addressing is cumulative: a
+    /// device told to listen stays listening until something unaddresses it, so
+    /// without UNL every device addressed by an earlier write would still be
+    /// listening and would receive this one too. Untalk does not help — it
+    /// clears talkers, not listeners. Making ourselves the talker with MTA is
+    /// what unaddresses any previous talker, since there can only be one.
     pub async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
-        // Address: UNT, MTA(0), LAD(pad)
-        let addr_cmd = [GPIB_UNT, talk_address(0), listen_address(pad)];
+        let addr_cmd = [GPIB_UNL, talk_address(0), listen_address(pad)];
         self.send_command_bytes(&addr_cmd).await?;
         self.send_data_bytes(data, send_eoi).await
     }
@@ -471,6 +484,9 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
         self.serial_poll(pad).await
     }
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        self.transport.subscribe_srq()
+    }
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
         self.eos_char = eos_char;
         self.eos_enabled = enabled;
@@ -618,16 +634,42 @@ mod tests {
         assert_eq!(writes[0][0], BulkCmd::Write as u8);
         let cmd_flags = writes[0][3];
         assert!(cmd_flags & WriteFlag::Atn as u8 != 0);
-        let cmd_len =
-            u32::from_le_bytes([writes[0][4], writes[0][5], writes[0][6], writes[0][7]]) as usize;
-        let cmd_bytes = &writes[0][8..8 + cmd_len];
-        assert!(cmd_bytes.contains(&0x5f), "cmd_bytes={cmd_bytes:?}"); // UNT
-        assert!(cmd_bytes.contains(&0x40)); // MTA(0)
-        assert!(cmd_bytes.contains(&(0x20 + 15))); // LAD(15)
+        assert_eq!(
+            cmd_payload(&writes[0]),
+            [GPIB_UNL, talk_address(0), listen_address(15)]
+        );
         assert_eq!(writes[1][0], BulkCmd::Write as u8);
         let data_flags = writes[1][3];
         assert!(data_flags & WriteFlag::NoAddress as u8 != 0);
         assert!(data_flags & WriteFlag::SendEoi as u8 != 0);
+    }
+
+    /// Listener addressing is cumulative, so every write must unaddress the
+    /// previous one's listener. Without the leading UNL a write to pad 3 is
+    /// also delivered to pad 23 — observed on a real two-instrument bus, where
+    /// a command sent to a 34401A also reached a 53132A.
+    #[tokio::test]
+    async fn consecutive_writes_to_different_pads_each_unlisten_first() {
+        let t = MockTransport::new();
+        for _ in 0..4 {
+            t.push_control(xfer_status(3));
+        }
+        let mut ctrl = GpibController::new(t, 3000);
+
+        ctrl.write(23, b"A", true).await.unwrap();
+        ctrl.write(3, b"B", true).await.unwrap();
+
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        // writes[0]/[2] are the addressing commands, [1]/[3] the data.
+        assert_eq!(
+            cmd_payload(&writes[0]),
+            [GPIB_UNL, talk_address(0), listen_address(23)]
+        );
+        assert_eq!(
+            cmd_payload(&writes[2]),
+            [GPIB_UNL, talk_address(0), listen_address(3)],
+            "second write must unlisten pad 23 before addressing pad 3"
+        );
     }
 
     #[tokio::test]

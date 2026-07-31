@@ -76,6 +76,17 @@ pub trait GpibBackend: Send + Sync {
         anyhow::bail!("{} cannot read the SRQ line", self.name())
     }
 
+    /// Subscribe to service-request notifications, for adapters that can report
+    /// SRQ asynchronously. This is what lets a front-end *push* a service
+    /// request to a client instead of making it poll.
+    ///
+    /// `None` means this backend has no notification path — distinct from
+    /// "subscribed, and no SRQ has happened". Callers must not present it as
+    /// the latter.
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
+
     /// Configure the end-of-string terminator used when reading.
     fn set_eos(&mut self, eos_char: u8, enabled: bool);
 

@@ -12,12 +12,18 @@ use super::gpib::Transport;
 use super::protocol::*;
 use super::Model;
 
+/// How many service-request notifications to buffer. SRQ is a level, not a
+/// count: a subscriber that lags only needs to learn that *some* device
+/// requested service, so a small buffer is plenty and lagging is harmless.
+const SRQ_CHANNEL_CAPACITY: usize = 16;
+
 pub struct UsbTransport {
     interface: nusb::Interface,
     device: nusb::Device,
     bulk_out_ep: u8,
     bulk_in_ep: u8,
     write_complete: Arc<Notify>,
+    srq: tokio::sync::broadcast::Sender<()>,
     timeout_ms: u32,
     _irq_task: tokio::task::JoinHandle<()>,
 }
@@ -34,9 +40,11 @@ impl UsbTransport {
         let write_complete = Arc::new(Notify::new());
         let notify = write_complete.clone();
         let irq_iface = interface.clone();
+        let (srq, _) = tokio::sync::broadcast::channel(SRQ_CHANNEL_CAPACITY);
+        let srq_tx = srq.clone();
 
         let irq_task = tokio::spawn(async move {
-            interrupt_poller(irq_iface, irq_in_ep, notify).await;
+            interrupt_poller(irq_iface, irq_in_ep, notify, srq_tx).await;
         });
 
         Self {
@@ -45,9 +53,16 @@ impl UsbTransport {
             bulk_out_ep,
             bulk_in_ep,
             write_complete,
+            srq,
             timeout_ms,
             _irq_task: irq_task,
         }
+    }
+
+    /// Receiver for service-request notifications raised by the adapter's
+    /// interrupt endpoint.
+    pub fn subscribe_srq(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.srq.subscribe()
     }
 }
 
@@ -79,7 +94,12 @@ fn classify_error(e: &nusb::transfer::TransferError) -> PollerAction {
 const IRQ_RECOVER_MIN: std::time::Duration = std::time::Duration::from_millis(50);
 const IRQ_RECOVER_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
-async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, notify: Arc<Notify>) {
+async fn interrupt_poller(
+    interface: nusb::Interface,
+    endpoint: u8,
+    notify: Arc<Notify>,
+    srq: tokio::sync::broadcast::Sender<()>,
+) {
     let mut backoff = IRQ_RECOVER_MIN;
     'recover: loop {
         let mut queue = interface.interrupt_in_queue(endpoint);
@@ -93,6 +113,11 @@ async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, notify: Arc<
                     debug!(flags = ?format_args!("{:#04x}", flags), "interrupt");
                     if flags & (1 << AIF_WRITE_COMPLETE_BN) != 0 {
                         notify.notify_one();
+                    }
+                    if flags & (1 << AIF_SRQ_BN) != 0 {
+                        // No subscribers is the normal case (nothing is
+                        // watching for SRQ), so a send error is not a problem.
+                        let _ = srq.send(());
                     }
                 }
                 Err(e) => match classify_error(&e) {
@@ -117,6 +142,10 @@ async fn interrupt_poller(interface: nusb::Interface, endpoint: u8, notify: Arc<
 }
 
 impl Transport for UsbTransport {
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(UsbTransport::subscribe_srq(self))
+    }
+
     async fn write_bulk(&self, data: &[u8]) -> Result<()> {
         debug!(len = data.len(), first = ?&data[..data.len().min(8)], "bulk-out");
         let mut queue = self.interface.bulk_out_queue(self.bulk_out_ep);

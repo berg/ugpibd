@@ -95,7 +95,39 @@ reaching the bus. Note that serial-polling an address with *no* device returns
 0 promptly rather than timing out, because undriven GPIB lines read as zero —
 an absent instrument and a status of 0 are not distinguishable this way.
 
-## Test 7: Timeout and bus recovery
+## Test 7: Service request (SRQ)
+
+Unlike every other test here, this one checks a message the daemon sends
+*unsolicited*. It needs a client that can wait on a VISA service-request event;
+released `pyvisa-py` cannot, so use a build whose HiSLIP backend implements it.
+
+1. Configure the instrument to request service, and wait for the event. On a
+   34401A, `*ESE 32` summarises a command error into ESB and `*SRE 32` turns
+   that summary into SRQ:
+
+   ```python
+   import pyvisa
+   SRQ = pyvisa.constants.EventType.service_request
+   inst = pyvisa.ResourceManager("@py").open_resource(
+       "TCPIP::127.0.0.1::hislip<PAD>::INSTR")
+   inst.write("*CLS"); inst.write("*ESE 32"); inst.write("*SRE 32")
+   inst.enable_event(SRQ, pyvisa.constants.EventMechanism.queue)
+   inst.write("BOGUSCMD")            # provoke the error -> SRQ
+   inst.wait_on_event(SRQ, 5000)     # should return promptly
+   ```
+
+2. Confirm the event arrives (well under the 5 s timeout).
+3. With `RUST_LOG=ugpibd=debug`, confirm the daemon logs `forwarding service
+   request` with a status byte that has bit 6 (RQS, `0x40`) set — `stb=96` for
+   the sequence above, which is RQS + ESB.
+
+If the log instead says `srq raised by another device on the bus`, the poll
+came back without RQS: the SRQ was someone else's, which is exactly the case
+the forwarder is meant to filter out. `adapter cannot report SRQ` means the
+backend has no notification path — currently true of the NI adapter, which can
+read the SRQ line for `++srq` but has no asynchronous path.
+
+## Test 8: Timeout and bus recovery
 
 1. Query an address with nothing attached: `echo '*IDN?' | ugpibd-scpi --addr 5`
 2. Confirm a timeout is logged and the daemon stays up.
@@ -103,7 +135,7 @@ an absent instrument and a status of 0 are not distinguishable this way.
    Repeat the dead-address query a few times first — a failed transfer must not
    leave a device addressed as talker and wedge the next transaction.
 
-## Test 8: Disconnect mid-session
+## Test 9: Disconnect mid-session
 
 1. Start `ugpibd` and connect a client.
 2. Unplug the adapter while idle.
@@ -120,12 +152,23 @@ exercises both front-ends and reports any mismatch between them.
 ## Validated configurations
 
 - **82357B** — the original bring-up target.
-- **82357A** + HP 34401A at PAD 23, on macOS: Tests 1–8 pass. Firmware upload
-  from cold succeeded on the first attempt (487 records). A soak of 300 short
-  queries, 20 long reads, and 30 session open/closes completed with no
-  failures.
-- **NI GPIB-USB-HS** + SR620 at PAD 16.
+- **82357A** + HP 34401A at PAD 23, on macOS: Tests 1–9 pass. Firmware upload
+  from cold succeeded on the first attempt (487 records), twice, including once
+  after an unplug/replug mid-session. A soak of 300 short queries, 20 long
+  reads, and 30 session open/closes completed with no failures.
+- **NI GPIB-USB-HS** + SR620 at PAD 16. Note this adapter has no asynchronous
+  SRQ path, so Test 7 does not apply to it.
 
-Note that `pyvisa-py` does not implement `read_stb` or `assert_trigger` over
-HiSLIP, so those two operations cannot be exercised through pyvisa — use
-`ugpibd-scpi`'s `++status` and `++trg` as above.
+## A note on VISA clients
+
+Released `pyvisa-py` does not implement `read_stb`, `assert_trigger`, or
+service-request events over HiSLIP — it raises `VI_ERROR_NSUP_OPER` or
+`NotImplementedError`. Tests 5–7 therefore cannot be run through a stock
+pyvisa install. Either use `ugpibd-scpi` (`++status`, `++trg`), or a pyvisa-py
+build whose HiSLIP backend implements them.
+
+A HiSLIP write completes when the bytes are handshaken onto the bus, not when
+the instrument has parsed them. Reading the status byte immediately after a
+write can therefore observe the state from *before* that write. Poll until the
+expected bit appears rather than asserting on a single read — a real script
+would poll anyway.

@@ -9,8 +9,13 @@
 //
 // For single-bus / single-instrument deployments we skip the full locking
 // and multi-device machinery of the spec. Lock requests always succeed
-// (there is only ever one client competing for one bus), SRQ is not
-// forwarded, and TLS/SASL handshakes are rejected.
+// (there is only ever one client competing for one bus) and TLS/SASL
+// handshakes are rejected.
+//
+// Service requests are forwarded: when the adapter reports SRQ, a per-session
+// task serial-polls the device and pushes an AsyncServiceRequest carrying the
+// status byte. That is the only message the server sends unsolicited, so it is
+// also the only one a client must be prepared to see mid-round-trip.
 
 use std::collections::HashMap;
 use std::io;
@@ -59,7 +64,19 @@ pub trait Device: Send + Sync + 'static {
     /// implementation that has no way to poll must return an error rather than
     /// a value the caller cannot distinguish from a real reading.
     async fn get_status(&self) -> Result<u8>;
+
+    /// Subscribe to service requests raised by this device, so the session can
+    /// forward them to the client as `AsyncServiceRequest`. `None` means the
+    /// underlying adapter has no way to report SRQ, and the session simply
+    /// never pushes one.
+    async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
 }
+
+/// IEEE-488 status byte bit 6: the device is requesting service. Set in the
+/// byte returned by a serial poll of whichever device pulled SRQ.
+const STB_RQS: u8 = 0x40;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -269,7 +286,7 @@ async fn init_async<R, W>(
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let session_id = (init.message_parameter & 0xFFFF) as u16;
     let entry = {
@@ -315,7 +332,7 @@ where
         .await?;
     wr.flush().await?;
 
-    async_loop(&mut rd, &mut wr, entry, config).await
+    async_loop(&mut rd, wr, entry, config).await
 }
 
 struct RegistrationGuard {
@@ -476,18 +493,110 @@ where
     }
 }
 
+/// Aborts the SRQ forwarder when the async channel goes away.
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Forward bus service requests to the client as `AsyncServiceRequest`.
+///
+/// On notification we serial-poll to learn the status byte, which the HiSLIP
+/// message carries and which the poll also clears, so the device stops
+/// asserting SRQ. Only a status with RQS set is forwarded: SRQ is a wired-OR
+/// across the whole bus, so without that check another instrument pulling the
+/// line would raise a spurious service request against this session's device.
+///
+/// The writer lock is taken *before* the serial poll, matching the order the
+/// async loop uses. Polling first and locking after would invert the two locks
+/// against each other and can deadlock.
+async fn srq_forwarder<W>(
+    mut srq: tokio::sync::broadcast::Receiver<()>,
+    writer: Arc<Mutex<W>>,
+    entry: Arc<SessionEntry>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match srq.recv().await {
+            Ok(()) => {}
+            // SRQ is a level, not a count: coalescing missed notifications
+            // into one poll loses nothing.
+            Err(RecvError::Lagged(n)) => debug!("srq notifications lagged by {n}"),
+            Err(RecvError::Closed) => return,
+        }
+
+        let mut guard = writer.lock().await;
+        let stb = match entry.device.get_status().await {
+            Ok(stb) => stb,
+            Err(e) => {
+                warn!("srq raised but serial poll failed, not forwarding: {e:#}");
+                continue;
+            }
+        };
+        if stb & STB_RQS == 0 {
+            debug!(
+                stb,
+                "srq raised by another device on the bus, not forwarding"
+            );
+            continue;
+        }
+
+        debug!(stb, "forwarding service request");
+        let write = async {
+            MessageType::AsyncServiceRequest
+                .message_params(stb, 0)
+                .no_payload()
+                .write_to(&mut *guard)
+                .await?;
+            (*guard).flush().await
+        };
+        if let Err(e) = write.await {
+            debug!("srq forward failed, client likely gone: {e}");
+            return;
+        }
+    }
+}
+
 async fn async_loop<R, W>(
     rd: &mut R,
-    wr: &mut W,
+    wr: W,
     entry: Arc<SessionEntry>,
     config: Config,
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let writer = Arc::new(Mutex::new(wr));
+
+    // Push service requests from a separate task: the loop below spends most
+    // of its life parked in a read, and `Message::read_from` is not
+    // cancel-safe, so it cannot be raced against the SRQ channel in a select.
+    let _srq_task = match entry.device.subscribe_srq().await {
+        Some(rx) => Some(TaskGuard(tokio::spawn(srq_forwarder(
+            rx,
+            writer.clone(),
+            entry.clone(),
+        )))),
+        None => {
+            debug!("adapter cannot report SRQ; service requests will not be pushed");
+            None
+        }
+    };
+
     loop {
-        let msg = match Message::read_from(rd, config.max_message_size).await? {
+        // Read with the writer unlocked, so the forwarder can push meanwhile.
+        let incoming = Message::read_from(rd, config.max_message_size).await?;
+
+        let mut guard = writer.lock().await;
+        let wr = &mut *guard;
+
+        let msg = match incoming {
             Ok(m) => m,
             Err(e) => {
                 let fatal = e.is_fatal();

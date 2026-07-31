@@ -20,6 +20,22 @@ struct ProbeDevice {
     cleared: AtomicBool,
     remote: AtomicBool,
     status: AtomicU8,
+    /// Set to hand out an SRQ subscription; `raise_srq` then fires one.
+    srq: Option<tokio::sync::broadcast::Sender<()>>,
+}
+
+impl ProbeDevice {
+    fn with_srq() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(8);
+        Self {
+            srq: Some(tx),
+            ..Default::default()
+        }
+    }
+
+    fn raise_srq(&self) {
+        let _ = self.srq.as_ref().expect("no srq channel").send(());
+    }
 }
 
 #[async_trait::async_trait]
@@ -48,6 +64,9 @@ impl Device for ProbeDevice {
     }
     async fn get_status(&self) -> Result<u8> {
         Ok(self.status.load(Ordering::SeqCst))
+    }
+    async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        self.srq.as_ref().map(|tx| tx.subscribe())
     }
 }
 
@@ -138,6 +157,55 @@ async fn remote_toggles_ren() {
     assert!(dev.remote.load(Ordering::SeqCst));
     client.remote(false).await.unwrap();
     assert!(!dev.remote.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn service_request_is_pushed_and_does_not_desync_the_channel() {
+    let dev = Arc::new(ProbeDevice::with_srq());
+    // RQS (0x40) must be set or the forwarder treats the SRQ as another
+    // device's and drops it.
+    dev.status.store(0x40 | 0x20, Ordering::SeqCst);
+    let addr = start_server(dev.clone()).await.unwrap();
+    let mut client = connect(addr).await.unwrap();
+
+    dev.raise_srq();
+
+    // The service request arrives unsolicited, so it can land in the middle of
+    // this round-trip. The status call must still get its own reply, and the
+    // pushed status byte must be recorded rather than discarded.
+    let mut seen = None;
+    for _ in 0..20 {
+        let stb = client.status().await.unwrap();
+        assert_eq!(stb, 0x60, "status round-trip desynced");
+        if let Some(srq) = client.take_service_request() {
+            seen = Some(srq);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, Some(0x60), "no service request was pushed");
+}
+
+#[tokio::test]
+async fn service_request_without_rqs_is_not_forwarded() {
+    let dev = Arc::new(ProbeDevice::with_srq());
+    // Another instrument pulled the wired-OR SRQ line: our device's poll comes
+    // back with RQS clear, so nothing should be pushed for this session.
+    dev.status.store(0x10, Ordering::SeqCst);
+    let addr = start_server(dev.clone()).await.unwrap();
+    let mut client = connect(addr).await.unwrap();
+
+    dev.raise_srq();
+
+    for _ in 0..10 {
+        assert_eq!(client.status().await.unwrap(), 0x10);
+        assert_eq!(
+            client.take_service_request(),
+            None,
+            "forwarded a service request for a device that was not requesting"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
