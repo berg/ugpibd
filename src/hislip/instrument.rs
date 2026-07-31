@@ -61,4 +61,9 @@ impl Device for GpibInstrument {
         let mut ctrl = self.ctrl.lock().await;
         ctrl.serial_poll(self.pad).await
     }
+
+    async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        let ctrl = self.ctrl.lock().await;
+        ctrl.subscribe_srq()
+    }
 }

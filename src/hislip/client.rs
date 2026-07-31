@@ -6,9 +6,11 @@
 // asynchronous channel for device-clear / REN / status. Used by the `scpi`
 // CLI.
 //
-// The server does not forward SRQ, so every server reply is solicited: each
-// method here is a self-contained request/response round-trip and no
-// background reader is needed.
+// Every method here is a self-contained request/response round-trip, so no
+// background reader is needed. The one message the server sends unsolicited is
+// AsyncServiceRequest, which may land in the middle of any async round-trip;
+// `async_request` skips past those rather than mistaking one for its reply,
+// and remembers the status byte for `take_service_request`.
 
 use anyhow::{bail, Context, Result};
 use byteorder::{ByteOrder, NetworkEndian};
@@ -34,6 +36,9 @@ pub struct HislipClient {
     async_rd: Reader,
     async_wr: Writer,
     message_id: u32,
+    /// Status byte from the most recent service request the server pushed, if
+    /// one arrived and has not been consumed yet.
+    last_srq: Option<u8>,
 }
 
 impl HislipClient {
@@ -124,6 +129,7 @@ impl HislipClient {
             async_rd,
             async_wr,
             message_id: FIRST_MESSAGE_ID,
+            last_srq: None,
         })
     }
 
@@ -168,13 +174,32 @@ impl HislipClient {
     async fn async_request(&mut self, request: Message, expect: MessageType) -> Result<Message> {
         request.write_to(&mut self.async_wr).await?;
         flush(&mut self.async_wr).await?;
-        let resp = read_msg(&mut self.async_rd)
-            .await
-            .context("read async reply")?;
-        if resp.message_type != expect {
-            bail!("expected {expect:?}, got {:?}", resp.message_type);
+        loop {
+            let resp = read_msg(&mut self.async_rd)
+                .await
+                .context("read async reply")?;
+            // The server pushes service requests unsolicited, so one can arrive
+            // between our request and its reply. Keep the status byte and carry
+            // on waiting rather than treating it as a protocol error.
+            if resp.message_type == MessageType::AsyncServiceRequest {
+                self.last_srq = Some(resp.control_code);
+                continue;
+            }
+            if resp.message_type != expect {
+                bail!("expected {expect:?}, got {:?}", resp.message_type);
+            }
+            return Ok(resp);
         }
-        Ok(resp)
+    }
+
+    /// Take the status byte of the most recent service request pushed by the
+    /// server, clearing it. `None` if none has arrived since the last call.
+    ///
+    /// Service requests are only noticed while some other async round-trip is
+    /// in flight, since this client has no background reader — poll it after a
+    /// `status()` or similar call.
+    pub fn take_service_request(&mut self) -> Option<u8> {
+        self.last_srq.take()
     }
 
     /// Send a Selected Device Clear and wait for the acknowledge.
