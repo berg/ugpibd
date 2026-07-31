@@ -78,6 +78,12 @@ pub trait Device: Send + Sync + 'static {
 /// byte returned by a serial poll of whichever device pulled SRQ.
 const STB_RQS: u8 = 0x40;
 
+/// How long the SRQ forwarder waits for the async channel's write lock before
+/// saying so. Comfortably longer than any legitimate hold — the async loop only
+/// holds it to service one request — so this firing means something is wedged.
+/// It only logs; the forwarder keeps waiting.
+const WRITE_LOCK_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vendor_id: u16,
@@ -510,9 +516,14 @@ impl Drop for TaskGuard {
 /// across the whole bus, so without that check another instrument pulling the
 /// line would raise a spurious service request against this session's device.
 ///
-/// The writer lock is taken *before* the serial poll, matching the order the
-/// async loop uses. Polling first and locking after would invert the two locks
-/// against each other and can deadlock.
+/// The poll runs with no lock held. A serial poll is a bus transaction that can
+/// take up to the GPIB timeout, and holding the write lock across it would stall
+/// the async channel's replies for that whole time for no reason.
+///
+/// This is safe in either order, contrary to what an earlier revision of this
+/// comment claimed: `Device::get_status` takes the bus mutex and drops it before
+/// returning, so nothing is ever held across the two acquisitions and there is
+/// no hold-and-wait cycle to deadlock on.
 async fn srq_forwarder<W>(
     mut srq: tokio::sync::broadcast::Receiver<()>,
     writer: Arc<Mutex<W>>,
@@ -530,7 +541,6 @@ async fn srq_forwarder<W>(
             Err(RecvError::Closed) => return,
         }
 
-        let mut guard = writer.lock().await;
         let stb = match entry.device.get_status().await {
             Ok(stb) => stb,
             Err(e) => {
@@ -545,6 +555,23 @@ async fn srq_forwarder<W>(
             );
             continue;
         }
+
+        // Bound only the *acquisition*, and only to log: abandoning a wait for
+        // a lock costs nothing, so a slow acquisition is reported and then
+        // waited out rather than dropping the service request. The write below
+        // is deliberately not bounded — cancelling it part-way would leave a
+        // truncated HiSLIP message on the socket and desync the client for
+        // good, which is far worse than blocking.
+        let mut guard = loop {
+            match tokio::time::timeout(WRITE_LOCK_STUCK_AFTER, writer.lock()).await {
+                Ok(guard) => break guard,
+                Err(_) => warn!(
+                    "srq forwarder has waited {:?} for the write lock; \
+                     the async channel may be stuck",
+                    WRITE_LOCK_STUCK_AFTER
+                ),
+            }
+        };
 
         debug!(stb, "forwarding service request");
         let write = async {
