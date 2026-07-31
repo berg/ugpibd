@@ -2,6 +2,9 @@
 // Copyright (C) 2026 ugpibd contributors
 
 use anyhow::{bail, Context, Result};
+
+/// Cap on a single firmware-upload control transfer.
+const CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 use nusb::transfer::{ControlOut, ControlType, Recipient};
 
 #[derive(Debug, Clone)]
@@ -55,18 +58,19 @@ pub async fn upload_firmware(
 }
 
 async fn anchor_load(device: &nusb::Device, address: u16, data: &[u8]) -> Result<()> {
-    let completion = device
-        .control_out(ControlOut {
-            control_type: ControlType::Vendor,
-            recipient: Recipient::Device,
-            request: ANCHOR_LOAD_INTERNAL,
-            value: address,
-            index: 0,
-            data,
-        })
-        .await;
-    completion
-        .into_result()
+    device
+        .control_out(
+            ControlOut {
+                control_type: ControlType::Vendor,
+                recipient: Recipient::Device,
+                request: ANCHOR_LOAD_INTERNAL,
+                value: address,
+                index: 0,
+                data,
+            },
+            CONTROL_TIMEOUT,
+        )
+        .await
         .map_err(|e| anyhow::anyhow!("FX2 vendor control-out failed: {e}"))?;
     Ok(())
 }

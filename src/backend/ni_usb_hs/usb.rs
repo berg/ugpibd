@@ -10,9 +10,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nusb::transfer::{ControlIn, ControlType, Recipient, RequestBuffer};
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlType, In, Interrupt, Out, Recipient};
+use nusb::{Endpoint, MaybeFuture};
 use tracing::{debug, info, warn};
 
+use super::protocol::{IBSTA_DEFINED_BITS, IBSTA_SRQI, NIUSB_TERM_ID};
 use super::NiTransport;
 
 pub const USB_VENDOR_ID_NI: u16 = 0x3923;
@@ -20,6 +22,11 @@ pub const PID_NI_USB_HS: u16 = 0x709b;
 pub const PID_NI_USB_HS_PLUS: u16 = 0x7618;
 pub const PID_KUSB_488A: u16 = 0x725c;
 pub const PID_MC_USB_488: u16 = 0x725d;
+
+/// How many service-request notifications to buffer. SRQ is a level, not a
+/// count: a lagging subscriber only needs to learn that *someone* asked for
+/// service, so a small buffer is plenty and lagging is harmless.
+const SRQ_CHANNEL_CAPACITY: usize = 16;
 
 /// Cap on vendor control transfers. These are all short status/handshake
 /// exchanges, so anything approaching this means the adapter is not responding.
@@ -74,14 +81,34 @@ pub fn endpoints_for_test(pid: u16) -> (u8, u8, u8) {
     (e.bulk_out, e.bulk_in, e.interrupt_in)
 }
 
+/// The bulk endpoints plus a note of whether the last exchange finished.
+///
+/// Every adapter operation is a bulk-out and the bulk-in carrying its status,
+/// and the two are not separable: anything that slips between them leaves the
+/// reply to be read by the *next* request, and every reply from then on answers
+/// the one before. Holding both endpoints behind a single lock is what keeps
+/// the pair indivisible against the interrupt reader's re-arm, which is a
+/// control transfer on the same device.
+///
+/// `abandoned` covers the other way the pair can be broken: a HiSLIP client
+/// that gives up cancels the task mid-await, and a failed bulk-in returns
+/// early. Either way the adapter still sends the reply. The flag is set before
+/// the exchange and cleared only on success, so the next caller knows to drain.
+struct BulkIo {
+    out: Endpoint<Bulk, Out>,
+    r#in: Endpoint<Bulk, In>,
+    abandoned: bool,
+}
+
 pub struct NiUsbTransport {
     interface: nusb::Interface,
     device: nusb::Device,
-    bulk_out_ep: u8,
-    bulk_in_ep: u8,
-    interrupt_in_ep: u8,
+    io: tokio::sync::Mutex<BulkIo>,
     pid: u16,
     timeout_ms: u32,
+    srq: tokio::sync::broadcast::Sender<()>,
+    /// Aborted on drop, which is what stops the adapter reporting to nobody.
+    _reader_task: tokio::task::JoinHandle<()>,
 }
 
 impl NiUsbTransport {
@@ -89,8 +116,11 @@ impl NiUsbTransport {
     /// GPIB interface, and wire up the fixed endpoints.
     pub async fn open(timeout_ms: u32, port: Option<&str>) -> Result<Self> {
         let (dev_info, pid) = find_device(port)?;
-        let device = dev_info.open().context("failed to open NI USB device")?;
-        let interface = device.claim_interface(0).context(
+        let device = dev_info
+            .open()
+            .wait()
+            .context("failed to open NI USB device")?;
+        let interface = device.claim_interface(0).wait().context(
             "failed to claim NI GPIB interface 0 — is the kernel ni_usb driver loaded? \
              Blacklist it (see README) to use the userspace driver",
         )?;
@@ -99,15 +129,43 @@ impl NiUsbTransport {
             "NI adapter open (PID {pid:#06x}), bulk out {:#04x} in {:#04x}",
             eps.bulk_out, eps.bulk_in
         );
+
+        let io = tokio::sync::Mutex::new(BulkIo {
+            out: interface
+                .endpoint::<Bulk, Out>(eps.bulk_out)
+                .with_context(|| format!("open bulk-out endpoint {:#04x}", eps.bulk_out))?,
+            r#in: interface
+                .endpoint::<Bulk, In>(eps.bulk_in)
+                .with_context(|| format!("open bulk-in endpoint {:#04x}", eps.bulk_in))?,
+            abandoned: false,
+        });
+
+        // Read the interrupt endpoint from the moment the adapter is open, and
+        // before anything arms monitoring. A reported bit nobody reads backs up
+        // and stalls the adapter's bulk transfers on the *next* session,
+        // recoverable only by replugging, so the reader is not an optional
+        // companion to SRQ support — it is what makes arming safe at all.
+        let (srq, _) = tokio::sync::broadcast::channel(SRQ_CHANNEL_CAPACITY);
+        let irq_ep = interface
+            .endpoint::<Interrupt, In>(eps.interrupt_in)
+            .with_context(|| format!("open interrupt endpoint {:#04x}", eps.interrupt_in))?;
+        let reader_srq = srq.clone();
+        let reader_task = tokio::spawn(interrupt_reader(irq_ep, reader_srq));
+
         Ok(Self {
             interface,
             device,
-            bulk_out_ep: eps.bulk_out,
-            bulk_in_ep: eps.bulk_in,
-            interrupt_in_ep: eps.interrupt_in,
+            io,
             pid,
             timeout_ms,
+            srq,
+            _reader_task: reader_task,
         })
+    }
+
+    /// Receiver for service-request notifications from the interrupt endpoint.
+    pub fn subscribe_srq(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.srq.subscribe()
     }
 
     fn bulk_timeout(&self) -> Duration {
@@ -126,13 +184,12 @@ impl NiUsbTransport {
             Ok(reply) => debug!(?reply, "ni stop request"),
             Err(e) => debug!("ni stop request failed (adapter may be idle): {e}"),
         }
-        for ep in [self.bulk_out_ep, self.bulk_in_ep] {
-            if let Err(e) = self.interface.clear_halt(ep) {
-                debug!("ni clear_halt on endpoint {ep:#04x} failed: {e}");
-            }
+        {
+            let mut io = self.io.lock().await;
+            let _ = MaybeFuture::wait(io.out.clear_halt());
+            let _ = MaybeFuture::wait(io.r#in.clear_halt());
         }
         self.drain_bulk_in().await;
-        self.drain_interrupts().await;
     }
 
     /// Read and discard any bulk response left queued by a previous session.
@@ -144,40 +201,176 @@ impl NiUsbTransport {
     /// wrong-sized status blocks and operations that appear to hang because
     /// their response was already consumed by the one before.
     pub async fn drain_bulk_in(&self) {
-        for _ in 0..16 {
-            let mut queue = self.interface.bulk_in_queue(self.bulk_in_ep);
-            queue.submit(RequestBuffer::new(256));
-            match tokio::time::timeout(Duration::from_millis(100), queue.next_complete()).await {
-                Ok(completion) if completion.status.is_ok() && !completion.data.is_empty() => {
-                    debug!(packet = %hex(&completion.data), "ni drained stale bulk response");
-                }
-                // Timed out or errored: the endpoint is empty, which is normal.
-                _ => return,
-            }
+        let mut io = self.io.lock().await;
+        drain_bulk_in_locked(&mut io).await;
+    }
+}
+
+/// Submit an OUT transfer and wait for it. Caller holds the I/O lock.
+async fn bulk_out_locked(io: &mut BulkIo, data: &[u8], timeout: Duration) -> Result<()> {
+    debug!(len = data.len(), packet = %hex(data), "ni bulk-out");
+    io.out.submit(data.to_vec().into());
+    let completion = tokio::time::timeout(timeout, io.out.next_complete())
+        .await
+        .context("ni bulk-out timed out")?;
+    completion
+        .status
+        .map_err(|e| anyhow::anyhow!("ni bulk-out failed: {e}"))?;
+    Ok(())
+}
+
+/// Submit an IN transfer and wait for it. Caller holds the I/O lock.
+async fn bulk_in_locked(io: &mut BulkIo, max_len: usize, timeout: Duration) -> Result<Vec<u8>> {
+    /// Cap on a single IN request, a whole number of any plausible packet size.
+    const MAX_REQUEST: usize = 16 * 1024;
+    const TERMINATION: [u8; 4] = [NIUSB_TERM_ID, 0x00, 0x00, 0x00];
+
+    // An IN transfer must request a whole number of max-size packets.
+    let mps = io.r#in.max_packet_size().max(1);
+    let mut data: Vec<u8> = Vec::with_capacity(max_len.min(4096));
+
+    // A long reply arrives as several transfers, each ending at a packet
+    // boundary, so one completion yields only the first packet and the caller
+    // sees a truncated status block. Packet boundaries cannot say where the
+    // reply ends, but the framing can: every reply finishes with a termination
+    // block. Read until that arrives.
+    //
+    // `timeout` bounds each individual read and `max_len` the total, so a reply
+    // that never terminates cannot hang here.
+    while data.len() < max_len && !data.ends_with(&TERMINATION) {
+        let want = (max_len - data.len()).clamp(1, MAX_REQUEST).div_ceil(mps) * mps;
+        io.r#in.submit(Buffer::new(want));
+        let completion = tokio::time::timeout(timeout, io.r#in.next_complete())
+            .await
+            .context("ni bulk-in timed out")?;
+        completion
+            .status
+            .map_err(|e| anyhow::anyhow!("ni bulk-in failed: {e}"))?;
+        debug!(
+            got = completion.buffer.len(),
+            want,
+            have = data.len(),
+            "ni bulk-in chunk"
+        );
+        if completion.buffer.is_empty() {
+            // A zero-length packet ends the transfer; reading on would spin.
+            break;
         }
-        debug!("ni bulk drain hit its cap; leaving the rest");
+        data.extend_from_slice(&completion.buffer);
     }
 
-    /// Read and discard anything queued on the interrupt endpoint.
-    ///
-    /// The adapter reports ibsta changes there whenever interrupt monitoring is
-    /// enabled. Nothing in this daemon consumes those reports, so a backlog left
-    /// by an earlier session can stall the adapter's bulk transfers — the
-    /// symptom is the first IFC after a restart never completing.
-    pub async fn drain_interrupts(&self) {
-        for _ in 0..16 {
-            let mut queue = self.interface.interrupt_in_queue(self.interrupt_in_ep);
-            queue.submit(RequestBuffer::new(64));
-            match tokio::time::timeout(Duration::from_millis(50), queue.next_complete()).await {
-                Ok(completion) if completion.status.is_ok() && !completion.data.is_empty() => {
-                    debug!(packet = %hex(&completion.data), "ni drained stale interrupt");
+    debug!(len = data.len(), packet = %hex(&data), "ni bulk-in");
+    Ok(data)
+}
+
+/// Issue a vendor control-IN against the device. Caller holds the I/O lock.
+async fn vendor_control_in(
+    device: &nusb::Device,
+    request: u8,
+    value: u16,
+    index: u16,
+    max_len: usize,
+) -> Result<Vec<u8>> {
+    device
+        .control_in(
+            ControlIn {
+                control_type: ControlType::Vendor,
+                recipient: Recipient::Device,
+                request,
+                value,
+                index,
+                length: max_len as u16,
+            },
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("ni control-in failed: {e}"))
+}
+
+/// Read and discard any bulk response left queued by an earlier exchange.
+///
+/// Caller holds the I/O lock.
+async fn drain_bulk_in_locked(io: &mut BulkIo) {
+    let mps = io.r#in.max_packet_size().max(1);
+    for _ in 0..16 {
+        io.r#in.submit(Buffer::new(256usize.div_ceil(mps) * mps));
+        match tokio::time::timeout(Duration::from_millis(100), io.r#in.next_complete()).await {
+            Ok(c) if c.status.is_ok() && !c.buffer.is_empty() => {
+                debug!(packet = %hex(&c.buffer), "ni drained stale bulk response");
+            }
+            // Timed out or errored: the endpoint is empty, which is normal.
+            // next_complete is cancel-safe, so the timed-out transfer stays
+            // pending and is picked up by the next read rather than lost.
+            _ => return,
+        }
+    }
+    debug!("ni bulk drain hit its cap; leaving the rest");
+}
+
+/// Read the interrupt endpoint for as long as the adapter is open, publishing
+/// service requests.
+///
+/// The adapter only reports when monitoring is armed, and the monitor is
+/// one-shot *per bit*: the kernel driver clears each reported bit from the set
+/// it waits on (`monitored_ibsta_bits &= ~status.ibsta`), so a notification
+/// consumes the arming that produced it. Re-arming is the backend's job — it is
+/// a control transfer and has to be serialised against bulk traffic, which only
+/// the transport's I/O lock can do.
+///
+/// Errors are treated as "keep going": a transient failure must not quietly end
+/// the reader and leave the adapter reporting to nobody.
+async fn interrupt_reader(
+    mut endpoint: Endpoint<Interrupt, In>,
+    srq: tokio::sync::broadcast::Sender<()>,
+) {
+    let buf_len = {
+        let mps = endpoint.max_packet_size().max(1);
+        64usize.div_ceil(mps) * mps
+    };
+    loop {
+        endpoint.submit(Buffer::new(buf_len));
+        let completion = endpoint.next_complete().await;
+        match completion.status {
+            Ok(()) if completion.buffer.is_empty() => {}
+            Ok(()) => {
+                let ibsta = parse_interrupt_ibsta(&completion.buffer);
+                let asserted = ibsta.is_some_and(|v| v & IBSTA_SRQI != 0);
+                debug!(
+                    packet = %hex(&completion.buffer),
+                    ibsta = ?ibsta.map(|v| format!("{v:#06x}")),
+                    asserted,
+                    "ni interrupt report"
+                );
+                if asserted {
+                    // No subscribers is normal; a send error is not a problem.
+                    let _ = srq.send(());
                 }
-                // Timed out or errored: nothing more is queued.
-                _ => return,
+            }
+            Err(e) => {
+                debug!("ni interrupt read failed, continuing: {e}");
+                let _ = MaybeFuture::wait(endpoint.clear_halt());
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-        debug!("ni interrupt drain hit its cap; leaving the rest");
     }
+}
+
+/// Pull the ibsta word out of an interrupt report.
+///
+/// Same layout as any status block, per `ni_usb_parse_status_block`: an id byte
+/// then ibsta big-endian. Reports too short, or carrying bits that are not
+/// defined ibsta bits, are rejected rather than guessed at — arming is
+/// acknowledged on this endpoint with a block that parses as `0xff00`, which
+/// has SRQI set and would otherwise read as a request nobody made.
+fn parse_interrupt_ibsta(packet: &[u8]) -> Option<u16> {
+    if packet.len() < 3 {
+        return None;
+    }
+    let ibsta = (u16::from(packet[1]) << 8) | u16::from(packet[2]);
+    if ibsta & !IBSTA_DEFINED_BITS != 0 {
+        return None;
+    }
+    Some(ibsta)
 }
 
 /// Re-apply the device's current USB configuration, mirroring the kernel
@@ -191,13 +384,17 @@ impl NiUsbTransport {
 /// replugged, turning a recoverable wedge into a dead adapter.
 pub fn reset_configuration(port: Option<&str>) -> Result<()> {
     let (dev_info, _pid) = find_device(port)?;
-    let device = dev_info.open().context("failed to reopen NI USB device")?;
+    let device = dev_info
+        .open()
+        .wait()
+        .context("failed to reopen NI USB device")?;
     let config = device
         .active_configuration()
         .map(|c| c.configuration_value())
         .unwrap_or(1);
     device
         .set_configuration(config)
+        .wait()
         .with_context(|| format!("failed to re-apply USB configuration {config}"))?;
     debug!("re-applied USB configuration {config}");
     Ok(())
@@ -206,7 +403,10 @@ pub fn reset_configuration(port: Option<&str>) -> Result<()> {
 /// Locate an NI GPIB-USB-HS-compatible adapter, returning its info and PID,
 /// restricted to `port` (USB port id) when given.
 fn find_device(port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
-    for dev in nusb::list_devices().context("failed to list USB devices")? {
+    for dev in nusb::list_devices()
+        .wait()
+        .context("failed to list USB devices")?
+    {
         if dev.vendor_id() != USB_VENDOR_ID_NI {
             continue;
         }
@@ -232,34 +432,48 @@ fn find_device(port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
 
 #[async_trait::async_trait]
 impl NiTransport for NiUsbTransport {
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(NiUsbTransport::subscribe_srq(self))
+    }
+
     async fn bulk_out(&self, data: &[u8]) -> Result<()> {
-        debug!(len = data.len(), packet = %hex(data), "ni bulk-out");
-        let mut queue = self.interface.bulk_out_queue(self.bulk_out_ep);
-        queue.submit(data.to_vec());
-        let completion = tokio::time::timeout(self.bulk_timeout(), queue.next_complete())
-            .await
-            .context("ni bulk-out timed out")?;
-        completion
-            .status
-            .map_err(|e| anyhow::anyhow!("ni bulk-out failed: {e}"))?;
-        Ok(())
+        let mut io = self.io.lock().await;
+        bulk_out_locked(&mut io, data, self.bulk_timeout()).await
     }
 
     async fn bulk_in(&self, max_len: usize) -> Result<Vec<u8>> {
-        let mut queue = self.interface.bulk_in_queue(self.bulk_in_ep);
-        queue.submit(RequestBuffer::new(max_len));
-        let completion = tokio::time::timeout(self.bulk_timeout(), queue.next_complete())
-            .await
-            .context("ni bulk-in timed out")?;
-        completion
-            .status
-            .map_err(|e| anyhow::anyhow!("ni bulk-in failed: {e}"))?;
-        debug!(
-            len = completion.data.len(),
-            packet = %hex(&completion.data),
-            "ni bulk-in"
-        );
-        Ok(completion.data)
+        let mut io = self.io.lock().await;
+        bulk_in_locked(&mut io, max_len, self.bulk_timeout()).await
+    }
+
+    async fn transact(&self, req: &[u8], resp_len: usize) -> Result<Vec<u8>> {
+        let timeout = self.bulk_timeout();
+        let mut io = self.io.lock().await;
+
+        if io.abandoned {
+            debug!("ni: draining after an abandoned transaction");
+            drain_bulk_in_locked(&mut io).await;
+            io.abandoned = false;
+        }
+
+        // Assume the worst until the pair completes. If this future is dropped
+        // between the halves, or the bulk-in fails, the flag stays set and the
+        // next transaction clears the orphaned reply before using the endpoint.
+        io.abandoned = true;
+        bulk_out_locked(&mut io, req, timeout).await?;
+        let resp = bulk_in_locked(&mut io, resp_len, timeout).await?;
+        io.abandoned = false;
+        Ok(resp)
+    }
+
+    /// Re-arm the adapter's interrupt monitor.
+    ///
+    /// Takes the I/O lock: this is a control transfer, and one landing between
+    /// a bulk-out and its bulk-in desynchronises every reply that follows.
+    async fn rearm_srq(&self, mask: u16) -> Result<()> {
+        let _io = self.io.lock().await;
+        vendor_control_in(&self.device, NI_USB_WAIT_REQUEST, 0x300, mask, 8).await?;
+        Ok(())
     }
 
     async fn control_in(
@@ -271,22 +485,8 @@ impl NiTransport for NiUsbTransport {
     ) -> Result<Vec<u8>> {
         // Bound the wait: a wedged adapter accepts the request and never
         // completes it, which would otherwise hang the daemon forever.
-        let completion = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            self.device.control_in(ControlIn {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Device,
-                request,
-                value,
-                index,
-                length: max_len as u16,
-            }),
-        )
-        .await
-        .with_context(|| format!("ni control-in (request {request:#04x}) timed out"))?;
-        completion
-            .into_result()
-            .map_err(|e| anyhow::anyhow!("ni control-in failed: {e}"))
+        let _io = self.io.lock().await;
+        vendor_control_in(&self.device, request, value, index, max_len).await
     }
 
     async fn control_in_interface(
@@ -296,21 +496,20 @@ impl NiTransport for NiUsbTransport {
         index: u16,
         max_len: usize,
     ) -> Result<Vec<u8>> {
-        let completion = tokio::time::timeout(
-            CONTROL_TIMEOUT,
-            self.interface.control_in(ControlIn {
-                control_type: ControlType::Vendor,
-                recipient: Recipient::Interface,
-                request,
-                value,
-                index,
-                length: max_len as u16,
-            }),
-        )
-        .await
-        .with_context(|| format!("ni interface control-in (request {request:#04x}) timed out"))?;
-        completion
-            .into_result()
+        let _io = self.io.lock().await;
+        self.interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Interface,
+                    request,
+                    value,
+                    index,
+                    length: max_len as u16,
+                },
+                CONTROL_TIMEOUT,
+            )
+            .await
             .map_err(|e| anyhow::anyhow!("ni interface control-in failed: {e}"))
     }
 
