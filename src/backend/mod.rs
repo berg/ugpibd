@@ -144,6 +144,22 @@ impl BackendKind {
         }
     }
 
+    /// Whether `pid` is this adapter's *pre-firmware* product id — the id it
+    /// enumerates with before its firmware has been uploaded.
+    ///
+    /// An un-programmed 82357 has no string descriptors of its own, so whatever
+    /// product/serial the OS reports for it in that state belongs to some other
+    /// device (in practice the parent hub) and must not be shown as the
+    /// adapter's. Adapters with no firmware-upload step are never "pre-init".
+    pub fn is_preinit_pid(self, pid: u16) -> bool {
+        match self {
+            BackendKind::Agilent82357b | BackendKind::Agilent82357a => {
+                self.agilent_model().pid_preinit == pid
+            }
+            BackendKind::NiUsbHs => false,
+        }
+    }
+
     /// Resolve a `--backend` id string to a kind.
     pub fn from_id(id: &str) -> Option<BackendKind> {
         BackendKind::ALL.iter().copied().find(|k| k.id() == id)
@@ -190,4 +206,37 @@ pub async fn open_selected(
         chosen.port_id
     );
     chosen.kind.open(timeout_ms, Some(&chosen.port_id)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agilent_82357::protocol::{
+        USB_PID_82357A, USB_PID_82357A_PREINIT, USB_PID_82357B, USB_PID_82357B_PREINIT,
+    };
+
+    #[test]
+    fn preinit_pid_recognized_per_model() {
+        assert!(BackendKind::Agilent82357a.is_preinit_pid(USB_PID_82357A_PREINIT));
+        assert!(BackendKind::Agilent82357b.is_preinit_pid(USB_PID_82357B_PREINIT));
+    }
+
+    #[test]
+    fn firmware_loaded_pid_is_not_preinit() {
+        assert!(!BackendKind::Agilent82357a.is_preinit_pid(USB_PID_82357A));
+        assert!(!BackendKind::Agilent82357b.is_preinit_pid(USB_PID_82357B));
+    }
+
+    #[test]
+    fn models_do_not_claim_each_others_preinit_pid() {
+        assert!(!BackendKind::Agilent82357a.is_preinit_pid(USB_PID_82357B_PREINIT));
+        assert!(!BackendKind::Agilent82357b.is_preinit_pid(USB_PID_82357A_PREINIT));
+    }
+
+    #[test]
+    fn adapters_without_firmware_upload_are_never_preinit() {
+        for (_, pid) in BackendKind::NiUsbHs.usb_ids() {
+            assert!(!BackendKind::NiUsbHs.is_preinit_pid(*pid));
+        }
+    }
 }
