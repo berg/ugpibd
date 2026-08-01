@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use nusb::MaybeFuture;
+use tracing::debug;
 
 use super::BackendKind;
 
@@ -109,6 +110,38 @@ pub fn enumerate() -> Result<Vec<DiscoveredAdapter>> {
         }
     }
     Ok(out)
+}
+
+/// How often to check that the adapter we opened is still attached.
+///
+/// Only bounds how quickly removal is noticed while the daemon is otherwise
+/// idle, so a second is ample and costs one enumeration.
+const PRESENCE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Resolve when the adapter at `port_id` is no longer attached.
+///
+/// Watching the USB port rather than waiting for a transfer to fail is what
+/// catches removal while the daemon is idle, which is the case that otherwise
+/// leaves it running against hardware that is gone.
+///
+/// A failed enumeration is treated as "still there". Enumeration can fail for
+/// reasons that have nothing to do with our adapter, and quitting on one would
+/// turn a transient error into an exit.
+pub async fn wait_for_removal(port_id: &str) {
+    loop {
+        tokio::time::sleep(PRESENCE_POLL).await;
+        match enumerate() {
+            Ok(found) => {
+                if !found
+                    .iter()
+                    .any(|a| port_input_matches(&a.port_id, port_id))
+                {
+                    return;
+                }
+            }
+            Err(e) => debug!("presence check failed, assuming still attached: {e:#}"),
+        }
+    }
 }
 
 /// Resolve `found` to exactly one adapter given an optional backend-id filter
