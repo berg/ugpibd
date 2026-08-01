@@ -188,18 +188,6 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if self.transport.product_id() == usb::PID_NI_USB_HS_PLUS {
             usb::hs_plus_extra_init(&self.transport).await?;
         }
-        // Arm the interrupt monitor for service requests, and nothing else.
-        //
-        // Safe only because the transport reads the interrupt endpoint from the
-        // moment it opens: a reported bit nobody reads backs up and stalls the
-        // adapter's bulk transfers on the *next* session, recoverable only by
-        // replugging. `shutdown` disarms, keeping that promise on a clean exit.
-        //
-        // SRQ alone, never `IBSTA_MONITOR_MASK`. The adapter reports a monitored
-        // bit that is already set straight away, and most of that mask — CIC,
-        // TACS, ATN — is true nearly always, so arming with it yields a
-        // continuous stream of reports carrying no news.
-        usb::set_interrupt_monitor(&self.transport, IBSTA_SRQI).await?;
         let regs = setup_init(my_pad, self.eos_mode());
         self.register_write(&regs)
             .await
@@ -251,6 +239,25 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if let Err(e) = self.transact(&doomed, OP_RESP_LEN).await {
             debug!("ni init: priming data write did not complete: {e}");
         }
+
+        // Arm the interrupt monitor for service requests, and nothing else.
+        //
+        // Last, deliberately. Everything above disturbs it: the register
+        // sequence resets the chip, and IFC, REN and the priming transfers all
+        // move the bus. Arming before them left the monitor cleared, so the
+        // only report ever seen was the acknowledgement of the arming itself
+        // and no service request was ever delivered.
+        //
+        // Safe only because the transport reads the interrupt endpoint from the
+        // moment it opens: a reported bit nobody reads backs up and stalls the
+        // adapter's bulk transfers on the *next* session, recoverable only by
+        // replugging. `shutdown` disarms, keeping that promise on a clean exit.
+        //
+        // SRQ alone, never `IBSTA_MONITOR_MASK`. The adapter reports a monitored
+        // bit that is already set straight away, and most of that mask — CIC,
+        // TACS, ATN — is true nearly always, so arming with it yields a
+        // continuous stream of reports carrying no news.
+        usb::set_interrupt_monitor(&self.transport, IBSTA_SRQI).await?;
 
         info!("NI GPIB-USB-HS initialized at pad {my_pad}");
         Ok(())
@@ -760,8 +767,18 @@ mod tests {
         // so the full mask yields a continuous stream of reports about nothing.
         // And shutdown must disarm, or the next session inherits an adapter
         // reporting to nobody.
+        //
+        // Arming must also come *last*. Everything else in init disturbs it —
+        // the register sequence resets the chip, and IFC, REN and the priming
+        // transfers all move the bus — so arming earlier leaves the monitor
+        // cleared and the only report ever seen is the acknowledgement of the
+        // arming itself. That failed silently: every SRQ test still "passed"
+        // by delivering nothing, because the checks that catch a missing
+        // delivery are the ones that assert something *arrives*. So record the
+        // number of bulk exchanges completed at the moment each arming is
+        // issued, and require the first one to come after all of them.
         let monitor_masks = std::sync::Arc::new(Mutex::new(Vec::new()));
-        struct Recorder(std::sync::Arc<Mutex<Vec<u16>>>, MockTransport);
+        struct Recorder(std::sync::Arc<Mutex<Vec<(u16, usize)>>>, MockTransport);
         #[async_trait::async_trait]
         impl NiTransport for Recorder {
             async fn bulk_out(&self, d: &[u8]) -> Result<()> {
@@ -772,7 +789,8 @@ mod tests {
             }
             async fn control_in(&self, r: u8, _v: u16, i: u16, m: usize) -> Result<Vec<u8>> {
                 if r == 0x21 {
-                    self.0.lock().unwrap().push(i);
+                    let writes = self.1.written.lock().unwrap().len();
+                    self.0.lock().unwrap().push((i, writes));
                 }
                 self.1.control_in(r, _v, i, m).await
             }
@@ -795,15 +813,29 @@ mod tests {
         let mut be = NiUsbHsBackend::new(t, 3000);
 
         be.init(0).await.unwrap();
+        let armed = monitor_masks.lock().unwrap().clone();
+        let init_writes = be.transport.1.written.lock().unwrap().len();
+
         assert_eq!(
-            monitor_masks.lock().unwrap().clone(),
+            armed.iter().map(|&(mask, _)| mask).collect::<Vec<_>>(),
             vec![IBSTA_SRQI],
             "init must arm for SRQ alone, never the whole monitor mask"
+        );
+        assert_eq!(
+            armed[0].1, init_writes,
+            "init must arm last: it armed after {} of {init_writes} bulk exchanges, \
+             so the chip reset and bus activity that follow would clear it",
+            armed[0].1
         );
 
         be.shutdown().await.unwrap();
         assert_eq!(
-            monitor_masks.lock().unwrap().clone(),
+            monitor_masks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(mask, _)| mask)
+                .collect::<Vec<_>>(),
             vec![IBSTA_SRQI, 0],
             "shutdown must disarm the monitor"
         );
