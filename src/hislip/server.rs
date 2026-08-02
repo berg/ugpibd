@@ -1072,10 +1072,27 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncRemoteLocalControl => {
+                // Control codes per HiSLIP §6.3, in the spec's own names:
+                // 0 disableRemote, 1 enableRemote, 2 disableAndGTL,
+                // 3 enableAndGotoRemote, 4 enableAndLockoutLocal,
+                // 5 enableAndGTRLLO, 6 justGTL.
+                //
+                // Everything that enables remote drives REN, including 1. It
+                // used to be a no-op on the theory that "enable remote" says
+                // nothing about the line, which is wrong and expensive: it is
+                // what `viGpibControlREN(VI_GPIB_REN_ASSERT)` sends, so REN
+                // could be dropped and never put back. An instrument left in
+                // local is not just cosmetically wrong — an HP 34401A services
+                // the bus about twenty times slower while its front panel is
+                // live, which reads as the daemon being slow.
+                //
+                // The GTL and lockout parts are approximated by REN alone:
+                // ugpibd has no addressed GTL or LLO (see docs/ROADMAP.md), so
+                // 2 and 6 return the device to local by dropping REN, which is
+                // a bigger hammer than GTL on a multi-device bus.
                 let res = match msg.control_code {
                     0 | 2 | 6 => entry.device.set_remote(false).await,
-                    1 => Ok(()),
-                    3..=5 => entry.device.set_remote(true).await,
+                    1 | 3..=5 => entry.device.set_remote(true).await,
                     _ => {
                         send_nonfatal(
                             wr,
