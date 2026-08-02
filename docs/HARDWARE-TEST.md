@@ -199,17 +199,31 @@ is the measurement.
 Unlike REN, these are per-device (GTL) and bus-wide (LLO), so watch the panel
 rather than the daemon log.
 
+Two things about a 34401A to have straight first, or the results read as
+nonsense: in remote its front-panel keys are **already** dead, all except
+LOCAL — so "the keys do nothing" proves nothing on its own. LOCAL is the only
+interesting key, because without a lockout it returns the instrument to local
+and under LLO it stops working too.
+
+Send one thing at a time and look before sending the next. In particular do not
+query between steps: addressing the instrument is itself what returns it to
+remote, which undoes the state you are trying to observe.
+
 1. `++ren 1`, then any query, so the instrument is in remote: RMT lit.
-2. `++loc` — RMT should go dark while REN stays asserted. This is the part
-   dropping REN cannot do: other instruments on the bus stay in remote.
-3. Query it again. RMT should come back on by itself. That is correct, not a
-   bug: addressing a device to listen while REN is asserted returns it to
-   remote, so GTL only survives until the next write.
-4. `++ren 1`, then `++llo`. RMT stays lit. Now press the instrument's
-   LOCAL/SHIFT key: it should do nothing. This is what REN alone could never
-   do.
-5. `++ren 0`. The keys come back. Dropping REN is the only way to clear a
-   lockout — IEEE-488 defines no un-LLO command.
+2. `++loc` — RMT should go dark **while REN stays asserted**. That is the part
+   dropping REN cannot do: every other instrument on the bus stays in remote.
+3. Query it again. RMT comes back on by itself. Correct, not a bug: addressing
+   a device to listen while REN is asserted returns it to remote, so GTL lasts
+   only until the next write.
+4. Press LOCAL (Shift on a 34401A) with no lockout in force: RMT goes dark, so
+   the key is live to begin with.
+5. `++ren 1`, then `++llo`, then press LOCAL again: now it should do **nothing**
+   and RMT should stay lit. That is LLO, and it is the one thing driving REN
+   alone could never do.
+6. `++ren 0`. RMT goes dark and LOCAL works again — dropping REN is the only
+   way to clear a lockout, since IEEE-488 defines no un-LLO command.
+
+`hislip-stress/bench_gtl.py` walks this one prompt at a time over HiSLIP.
 
 Over HiSLIP the same paths are reached through `viGpibControlREN` with
 `VI_GPIB_REN_ADDRESS_GTL` (6) and `VI_GPIB_REN_ASSERT_LLO` (4).
