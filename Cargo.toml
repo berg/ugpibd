@@ -35,7 +35,9 @@ bitfield = "0.14"
 async-trait = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+# test-util for `#[tokio::test(start_paused = true)]`: the lock timeout tests
+# would otherwise spend their timeouts in real time.
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 
 # Debian packaging. Built with `cargo deb`; see scripts/build-blacklist-deb for
 # the companion ugpibd-blacklist-linux-gpib package.

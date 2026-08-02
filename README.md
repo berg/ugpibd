@@ -252,6 +252,43 @@ Why no comma in the sub-address: pyvisa-py parses
 TCP port 15 rather than passing 15 through to the server. Embedding the
 PAD in the sub-address itself (`hislip15`) avoids that.
 
+#### Locking
+
+`viLock` / `viUnlock` are enforced, not advisory. An exclusive lock (empty lock
+string) is granted only when nobody else holds anything; a shared lock is
+granted to everyone using the same lock string. While a lock is held, another
+client's reads, writes, triggers and device clears are refused rather than
+quietly interleaved, and a request that conflicts waits out the timeout the
+caller asked for before being refused. Locks nest, they are scoped to the
+instrument rather than the bus — locking `hislip23` leaves `hislip3` free — and
+they are released when the session closes, so a client that crashes holding one
+does not lock the instrument out.
+
+#### Service requests
+
+`viWaitOnEvent(VI_EVENT_SERVICE_REQ)` works, including for requests that depend
+on MAV. Those need help, because HiSLIP has no read request — the server pushes
+replies — so a GPIB bridge must drain the instrument's output queue on its own
+initiative, and that read is exactly what clears MAV. Nothing looking afterwards
+would ever see it.
+
+The daemon watches the SRQ line across its own read rather than trying to
+second-guess the instrument. Nothing parses `*SRE` out of the traffic: applying
+that mask is the instrument's job, and a sniffed copy would be a cache with no
+invalidation — blind to the front panel, to another controller on the bus, to
+`*PSC`, and to the several NRf spellings of the same number. So if the
+instrument pulled SRQ, there is a service request; if it did not, there is not.
+With `*SRE 16` set, the classic `write(query)` → wait for SRQ → `read()` idiom
+works here as it does against a native HiSLIP instrument.
+
+One consequence worth knowing: when the daemon serial-polls to fill in the
+status byte, that poll clears RQS at the instrument, so a client reading the
+status byte itself would find the bit already taken. The daemon hands over what
+it consumed on the next `AsyncStatusQuery`, once.
+
+This needs an adapter that can report SRQ. The NI GPIB-USB-HS can; the 82357B
+cannot yet (see `docs/ROADMAP.md`).
+
 ### Prologix (legacy)
 
 ```python

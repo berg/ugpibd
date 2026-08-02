@@ -10,6 +10,7 @@
 pub mod client;
 pub mod errors;
 pub mod instrument;
+pub mod lock;
 pub mod messages;
 pub mod protocol;
 pub mod server;

@@ -405,16 +405,6 @@ impl Display for FeatureBitmap {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum RequestLockControl {
-    Failure = 0,
-    Success = 1,
-    Error = 2,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ReleaseLockControl {
-    SuccessExclusive = 1,
-    SuccessShared = 2,
-    Error = 3,
-}
+// Lock request/release answers share one control-code space (0 failure,
+// 1 success exclusive, 2 success shared, 3 error) and live in
+// [`super::lock::LockResponse`], next to the state machine that produces them.

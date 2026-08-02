@@ -261,6 +261,14 @@ impl HislipClient {
                         return Ok(out);
                     }
                 }
+                MessageType::Interrupted => {
+                    // A device clear on another channel abandoned this
+                    // message. The reply is gone, not late.
+                    bail!(
+                        "query interrupted by a device clear (message id {})",
+                        msg.message_parameter
+                    );
+                }
                 MessageType::Error => {
                     bail!("device error: {}", String::from_utf8_lossy(&msg.payload));
                 }
