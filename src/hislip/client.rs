@@ -226,9 +226,15 @@ impl HislipClient {
     }
 
     /// Read the instrument's serial-poll status byte.
+    ///
+    /// The MessageID has to be the most recent one this client sent on the
+    /// sync channel, or the id before the first one when it has sent nothing:
+    /// §6.14.3 has the server report MAV false for a status query quoting
+    /// anything else, which would make MAV unreadable.
     pub async fn status(&mut self) -> Result<u8> {
+        let most_recent = self.message_id.wrapping_sub(2);
         let req = MessageType::AsyncStatusQuery
-            .message_params(0, 0)
+            .message_params(0, most_recent)
             .no_payload();
         let resp = self
             .async_request(req, MessageType::AsyncStatusResponse)

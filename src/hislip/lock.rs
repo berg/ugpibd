@@ -236,6 +236,25 @@ impl LockRegistry {
         }
     }
 
+    /// Park until this session may do I/O — it holds a lock itself, or nobody
+    /// else does.
+    ///
+    /// The spec's answer to locked-out traffic is to leave it unprocessed, not
+    /// to refuse it (§2.6.1): Data, DataEND and Trigger stay in the input
+    /// buffer, TCP applies the backpressure, and the client blocks until either
+    /// the lock frees or its own timeout fires. HiSLIP has no "resource locked"
+    /// reply and none is to be invented, so this waits rather than answering.
+    pub async fn wait_for_access(&self, resource: &str, id: u16) {
+        loop {
+            // Subscribe before testing, so a release in between is not missed.
+            let released = self.released.notified();
+            if self.has_access(resource, id) {
+                return;
+            }
+            released.await;
+        }
+    }
+
     /// May this session do I/O right now? True when it holds a lock itself, or
     /// when nobody else does.
     pub fn has_access(&self, resource: &str, id: u16) -> bool {

@@ -176,6 +176,35 @@ impl Session {
         id
     }
 
+    /// Send a command with the RMT-delivered flag set — the client's way of
+    /// saying it has consumed the previous response (§6.14.1).
+    async fn send_rmt(&mut self, cmd: &[u8]) -> u32 {
+        let id = self.message_id;
+        self.message_id = self.message_id.wrapping_add(2);
+        MessageType::DataEnd
+            .message_params(1, id)
+            .with_payload(cmd.to_vec())
+            .write_to(&mut self.sync)
+            .await
+            .unwrap();
+        self.sync.flush().await.unwrap();
+        id
+    }
+
+    /// `AsyncStatusQuery` quoting `message_id`, which §6.14.3 requires to be
+    /// the most recent Data/DataEND/Trigger id for MAV to be reported.
+    async fn status(&mut self, message_id: u32) -> u8 {
+        let resp = self
+            .async_transaction(
+                MessageType::AsyncStatusQuery
+                    .message_params(0, message_id)
+                    .no_payload(),
+            )
+            .await;
+        assert_eq!(resp.message_type, MessageType::AsyncStatusResponse);
+        resp.control_code
+    }
+
     async fn read_sync(&mut self) -> Message {
         read_msg(&mut self.sync).await
     }
@@ -327,7 +356,7 @@ async fn an_exclusive_lock_shuts_out_a_second_client() {
 }
 
 #[tokio::test]
-async fn a_lock_is_enforced_against_other_clients_io() {
+async fn locked_out_traffic_waits_rather_than_being_refused() {
     let addr = start_server().await;
     let mut a = Session::open(addr, "hislip0").await;
     let mut b = Session::open(addr, "hislip0").await;
@@ -338,29 +367,43 @@ async fn a_lock_is_enforced_against_other_clients_io() {
 
     assert_eq!(a.lock(1000, "").await, 1);
 
+    // §2.6.1: B's synchronous traffic is left unprocessed while A holds the
+    // lock. No reply, and in particular no synthesised "resource locked"
+    // Error — HiSLIP has no such message, and answering one would show the
+    // client a hard failure where the spec calls for a wait.
     b.send(b"*IDN?").await;
-    let refused = b.read_sync().await;
-    assert_eq!(refused.message_type, MessageType::Error);
-    assert_eq!(refused.control_code, 128, "device-defined 'locked' code");
+    assert!(
+        read_msg_within(&mut b.sync, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "locked-out traffic was answered instead of left unprocessed"
+    );
 
-    MessageType::Trigger
-        .message_params(0, 1)
-        .no_payload()
-        .write_to(&mut b.sync)
-        .await
-        .unwrap();
-    b.sync.flush().await.unwrap();
-    assert_eq!(b.read_sync().await.message_type, MessageType::Error);
-
-    let clear = b.device_clear().await;
-    assert_eq!(clear.message_type, MessageType::Error);
-
-    // The holder is unaffected, and so is everyone once it lets go.
+    // The holder is unaffected meanwhile.
     a.send(b"*IDN?").await;
     assert_eq!(a.read_sync().await.message_type, MessageType::DataEnd);
+
+    // Releasing the lock lets the waiting message through, rather than having
+    // discarded it.
     assert_eq!(a.unlock().await, 1);
-    b.send(b"*IDN?").await;
-    assert_eq!(b.read_sync().await.message_type, MessageType::DataEnd);
+    let resp = read_msg_within(&mut b.sync, Duration::from_secs(2))
+        .await
+        .expect("waiting message was never serviced after the lock freed");
+    assert_eq!(resp.message_type, MessageType::DataEnd);
+}
+
+#[tokio::test]
+async fn a_lock_holder_does_not_block_the_async_channel_of_others() {
+    let addr = start_server().await;
+    let mut a = Session::open(addr, "hislip0").await;
+    let mut b = Session::open(addr, "hislip0").await;
+
+    assert_eq!(a.lock(1000, "").await, 1);
+
+    // §2.6.1 and §6.6: these have to complete for a client holding no lock.
+    let _ = b.status(0xffff_fefe).await;
+    b.declare_max_message_size(1 << 20).await;
+    assert_eq!(b.lock_info().await, (1, 1));
 }
 
 #[tokio::test]
@@ -427,7 +470,7 @@ async fn a_disconnect_releases_the_lock() {
 // -------------------------------------------------------------- device clear
 
 #[tokio::test]
-async fn device_clear_abandons_an_in_flight_reply() {
+async fn device_clear_does_not_send_interrupted() {
     let clears = Arc::new(AtomicU32::new(0));
     let seen = clears.clone();
     let addr = start_server_with(move |_| {
@@ -440,21 +483,25 @@ async fn device_clear_abandons_an_in_flight_reply() {
     let mut session = Session::open(addr, "hislip0").await;
 
     let id = session.send(b"*IDN?").await;
-    // Let the server get as far as the bus before clearing.
+    // Let the server get as far as the bus before clearing, so the reply is
+    // genuinely in flight.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let ack = session.device_clear().await;
     assert_eq!(ack.message_type, MessageType::AsyncDeviceClearAcknowledge);
     assert_eq!(seen.load(Ordering::SeqCst), 1, "clear reached the device");
 
+    // Interrupted belongs to the interrupted protocol error (§6.11, §3.1.1),
+    // not to device clear (§6.12), whose step 4 puts the discarding on the
+    // client. Sending one alone is actively harmful: §3.1.2 rule 4 stops a
+    // conformant client from sending anything further until it also sees
+    // AsyncInterrupted, which this transaction never produces.
     let resp = session.read_sync().await;
     assert_eq!(
         resp.message_type,
-        MessageType::Interrupted,
-        "the abandoned reply is announced, not delivered"
+        MessageType::DataEnd,
+        "device clear must not answer with Interrupted"
     );
-    assert_eq!(resp.message_parameter, id, "which message was abandoned");
-    assert_eq!(resp.control_code, 0);
-    assert!(resp.payload.is_empty());
+    assert_eq!(resp.message_parameter, id);
 
     // Finish the handshake and check the session still works.
     MessageType::DeviceClearComplete
@@ -685,39 +732,124 @@ async fn no_service_request_when_the_instrument_did_not_raise_one() {
 }
 
 #[tokio::test]
+async fn mav_follows_message_flow_with_no_service_request_mask_in_sight() {
+    // No *SRE anywhere in this test, and the device raises no service request:
+    // MAV is defined by message flow alone (§6.14.1), so a client that polls
+    // the status byte without enabling service requests must still see that a
+    // reply is waiting.
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // Before anything is sent, §6.14 says a status query quotes the first id
+    // minus two, and there is nothing available.
+    assert_eq!(
+        session.status(0xffff_fefe).await & 0x10,
+        0,
+        "MAV before any I/O"
+    );
+
+    let id = session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_type, MessageType::DataEnd);
+    assert_eq!(
+        session.status(id).await & 0x10,
+        0x10,
+        "MAV must be set once a reply has been sent and not consumed"
+    );
+
+    // §6.14.3: a query quoting anything but the most recent id reports MAV
+    // false, whatever the true state is.
+    assert_eq!(
+        session.status(0x1234).await & 0x10,
+        0,
+        "MAV reported for a stale message id"
+    );
+
+    // The client says it consumed the response.
+    let next = session.send_rmt(b"*CLS").await;
+    assert_eq!(
+        session.status(next).await & 0x10,
+        0,
+        "MAV must clear when the client indicates RMT-delivered"
+    );
+}
+
+#[tokio::test]
+async fn a_write_only_command_leaves_mav_clear() {
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // No response was sent, so nothing is available to read.
+    let id = session.send(b"*CLS").await;
+    assert_eq!(session.status(id).await & 0x10, 0);
+}
+
+#[tokio::test]
 async fn the_status_byte_the_daemon_consumed_is_handed_over_once() {
     let addr = start_server_raising(0x50).await;
     let mut session = Session::open(addr, "hislip0").await;
 
-    session.send(b"*IDN?").await;
+    let id = session.send(b"*IDN?").await;
     assert_eq!(session.read_sync().await.message_type, MessageType::DataEnd);
     let srq = read_msg_within(&mut session.async_ch, Duration::from_secs(2))
         .await
         .expect("no AsyncServiceRequest");
     assert_eq!(srq.control_code, 0x50);
 
-    // The daemon's poll cleared RQS at the instrument, so a client reading the
-    // status byte itself would see nothing. Hand over what we took.
-    let status = session
-        .async_transaction(
-            MessageType::AsyncStatusQuery
-                .message_params(0, 0)
-                .no_payload(),
-        )
-        .await;
-    assert_eq!(status.message_type, MessageType::AsyncStatusResponse);
-    assert_eq!(status.control_code, 0x50, "consumed status byte");
+    // The daemon's poll cleared RQS at the instrument, so hand over what it
+    // took. MAV rides along from the server's own tracking.
+    assert_eq!(session.status(id).await, 0x50, "consumed status byte");
 
-    // Once only: it is a bit that was taken, not a state to be reported for
-    // ever. TestDevice polls as 0.
-    let status = session
-        .async_transaction(
-            MessageType::AsyncStatusQuery
-                .message_params(0, 0)
-                .no_payload(),
-        )
-        .await;
-    assert_eq!(status.control_code, 0x00, "not reported twice");
+    // Once only for RQS; MAV persists because the reply is still unconsumed.
+    assert_eq!(session.status(id).await, 0x10, "RQS must not be replayed");
+}
+
+#[tokio::test]
+async fn a_later_command_invalidates_the_consumed_status_byte() {
+    let addr = start_server_raising(0x50).await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_type, MessageType::DataEnd);
+    let _ = read_msg_within(&mut session.async_ch, Duration::from_secs(2))
+        .await
+        .expect("no AsyncServiceRequest");
+
+    // `*CLS` clears the instrument's status registers, so a byte held from
+    // before it must not be replayed afterwards. Any command invalidates it,
+    // which avoids having to parse the payload to find out which ones matter.
+    let id = session.send_rmt(b"*CLS").await;
+    assert_eq!(
+        session.status(id).await,
+        0x00,
+        "stale status byte outlived *CLS"
+    );
+}
+
+#[tokio::test]
+async fn a_fatal_error_is_reported_on_both_channels() {
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // A bad prologue is a framing failure: §6.2 says the server "shall send the
+    // FatalError message on the synchronous channel and the asynchronous
+    // channel", then close. A client parked on the async channel would
+    // otherwise learn nothing.
+    session
+        .sync
+        .write_all(b"XXnot-a-hislip-header-at-all")
+        .await
+        .unwrap();
+    session.sync.flush().await.unwrap();
+
+    let on_sync = read_msg_within(&mut session.sync, Duration::from_secs(2))
+        .await
+        .expect("no FatalError on the synchronous channel");
+    assert_eq!(on_sync.message_type, MessageType::FatalError);
+
+    let on_async = read_msg_within(&mut session.async_ch, Duration::from_secs(2))
+        .await
+        .expect("no FatalError on the asynchronous channel");
+    assert_eq!(on_async.message_type, MessageType::FatalError);
 }
 
 // Suppress unused-warning for the re-exported InitializeParameter (kept for
