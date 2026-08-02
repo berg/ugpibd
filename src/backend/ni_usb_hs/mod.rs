@@ -7,12 +7,15 @@
 // handshake instead.
 //
 // Brought up and verified on a physical GPIB-USB-HS (PID 0x709b) against an
-// SR620: identify, query, serial poll, device clear, and daemon restart.
+// SR620, and on a GPIB-USB-HS+ (0x7618) against an HP 34401A and 53132A.
 //
-// The HS+ (0x7618), KUSB-488A and MC-USB-488 share this code path but have not
-// been tested; the HS+ in particular uses different endpoints and needs an
-// extra init step the kernel driver calls `ni_usb_hs_plus_extra_init`, which is
-// not implemented here.
+// The HS+ differs in three ways, all handled here: different endpoints (bulk
+// 0x01/0x82, interrupt 0x83), a second "analyzer" USB interface we do not
+// claim, and the extra bring-up the kernel driver calls
+// `ni_usb_hs_plus_extra_init`. It needed no other special casing.
+//
+// The KUSB-488A and MC-USB-488 share this code path and remain untested, but
+// the kernel driver treats them as byte-identical to the plain HS.
 
 pub mod protocol;
 pub mod usb;
@@ -27,7 +30,7 @@ use protocol::*;
 pub const ID: &str = "ni-usb-hs";
 
 /// Human-readable description shown by `--backend list`.
-pub const DESCRIPTION: &str = "NI GPIB-USB-HS (HS+ / KUSB-488A / MC-USB-488 untested)";
+pub const DESCRIPTION: &str = "NI GPIB-USB-HS and HS+ (KUSB-488A / MC-USB-488 untested)";
 
 /// (VID, PID) pairs handled as GPIB-USB-HS-compatible. The HS+ exposes a second
 /// analyzer interface we ignore; KUSB-488A and MC-USB-488 are HS clones.

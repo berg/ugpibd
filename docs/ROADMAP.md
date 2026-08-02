@@ -32,21 +32,13 @@ nothing at that point warns that it is unauthenticated. The cheap mitigation is
 to say so where the flag is documented; the real fix is HiSLIP 2.0 TLS plus
 SASL, which is a substantial piece of work and needs a certificate story.
 
-## 2. Untested adapter: NI GPIB-USB-HS+
+## 2. Untested adapters: KUSB-488A and MC-USB-488
 
-**Implemented, never run.** `3923:7618` has different endpoints (bulk
-`0x01`/`0x82`, interrupt `0x83`), a second "analyzer" USB interface we ignore,
-and a three-request extra init (`0x48`, `0x4b` LED, `0xf8` — the last with
-*interface* recipient).
-
-Unit tests pin both differences (`endpoints_differ_only_for_hs_plus`, and the
-init-request comparison against the plain HS), so the shape is right; nothing
-has confirmed the hardware agrees.
-
-The KUSB-488A (`3923:725c`) and MC-USB-488 (`3923:725d`) are also untested, but
-the kernel driver treats them as byte-identical to the GPIB-USB-HS — same
-endpoints, readiness handshake, init and teardown — and a unit test asserts
-their init requests match the HS exactly. Buying one adds ~no coverage.
+`3923:725c` and `3923:725d` have never been run. The kernel driver treats them
+as byte-identical to the GPIB-USB-HS — same endpoints, readiness handshake, init
+and teardown — and unit tests assert their init requests match it exactly, so
+buying one adds close to no coverage. Left here so that "nobody has tried"
+stays distinguishable from "tried and working".
 
 ## 3. Remaining Prologix stubs
 

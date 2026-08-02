@@ -22,7 +22,7 @@ the ids.
 | `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | Supported — firmware is bundled and uploaded automatically |
 | `ni-usb-hs` | NI GPIB-USB-HS (USB `3923:709b`) | Supported |
 | `ni-usb-hs` | KUSB-488A (`3923:725c`), MC-USB-488 (`3923:725d`) | Untested, but byte-for-byte the same code path as the GPIB-USB-HS |
-| `ni-usb-hs` | NI GPIB-USB-HS+ (`3923:7618`) | **Experimental** — different endpoints and an extra vendor-request init, both implemented but never run on hardware |
+| `ni-usb-hs` | NI GPIB-USB-HS+ (`3923:7618`) | Supported — different endpoints and an extra vendor-request init, both verified on hardware |
 
 ### Multiple adapters
 
