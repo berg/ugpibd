@@ -844,6 +844,33 @@ async fn a_later_command_invalidates_the_consumed_status_byte() {
 }
 
 #[tokio::test]
+async fn a_fatal_error_detected_on_the_async_channel_reaches_both() {
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // §6.2 does not care which channel noticed: both get told, then the
+    // connection closes. The async channel is the harder direction, because
+    // the sync loop is parked in a read that will never return once the
+    // client has given up.
+    session
+        .async_ch
+        .write_all(b"XXnot-a-hislip-header-at-all")
+        .await
+        .unwrap();
+    session.async_ch.flush().await.unwrap();
+
+    let on_async = read_msg_within(&mut session.async_ch, Duration::from_secs(2))
+        .await
+        .expect("no FatalError on the asynchronous channel");
+    assert_eq!(on_async.message_type, MessageType::FatalError);
+
+    let on_sync = read_msg_within(&mut session.sync, Duration::from_secs(2))
+        .await
+        .expect("no FatalError on the synchronous channel");
+    assert_eq!(on_sync.message_type, MessageType::FatalError);
+}
+
+#[tokio::test]
 async fn a_fatal_error_is_reported_on_both_channels() {
     let addr = start_server().await;
     let mut session = Session::open(addr, "hislip0").await;

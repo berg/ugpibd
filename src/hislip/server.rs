@@ -257,6 +257,10 @@ struct SessionEntry {
     /// whichever task owns the async channel's writer.
     async_tx: mpsc::Sender<AsyncPush>,
     async_rx: Mutex<Option<mpsc::Receiver<AsyncPush>>>,
+    /// The other direction of §6.2: a fatal the async channel detected, to be
+    /// written on the synchronous one.
+    sync_tx: mpsc::Sender<(FatalErrorCode, String)>,
+    sync_rx: Mutex<Option<mpsc::Receiver<(FatalErrorCode, String)>>>,
 }
 
 /// Something the session needs written on the async channel, from a task that
@@ -284,6 +288,8 @@ impl SessionEntry {
         max_message_size: u64,
     ) -> Self {
         let (async_tx, async_rx) = mpsc::channel(SRQ_QUEUE_DEPTH);
+        // One fatal ends the session, so there is never a second to queue.
+        let (sync_tx, sync_rx) = mpsc::channel(1);
         Self {
             id,
             protocol,
@@ -299,6 +305,8 @@ impl SessionEntry {
             last_message_id: AtomicU32::new(FIRST_MESSAGE_ID.wrapping_sub(2)),
             async_tx,
             async_rx: Mutex::new(Some(async_rx)),
+            sync_tx,
+            sync_rx: Mutex::new(Some(sync_rx)),
         }
     }
 
@@ -379,6 +387,14 @@ impl SessionEntry {
         }
     }
 
+    /// The same, in the other direction: a fatal the async channel detected,
+    /// written on the synchronous one.
+    fn mirror_fatal_to_sync(&self, code: FatalErrorCode, message: &str) {
+        if self.sync_tx.try_send((code, message.to_string())).is_err() {
+            debug!("could not mirror the fatal error onto the sync channel");
+        }
+    }
+
     /// Take the status byte the daemon consumed, if it has not been handed
     /// over yet.
     fn take_consumed_stb(&self) -> Option<u8> {
@@ -439,7 +455,9 @@ async fn init_sync<R, W, F>(
 ) -> io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    // Send + 'static so the writer can be shared with the task that mirrors a
+    // fatal error here from the async channel, as init_async already requires.
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(&str) -> Option<Arc<dyn Device>> + Send + Sync + 'static,
 {
     let params = InitializeParameter(init.message_parameter);
@@ -535,9 +553,42 @@ where
         registry: registry.clone(),
         locks,
     };
-    let result = sync_loop(&mut rd, &mut wr, entry, config).await;
+    // Shared so the async channel can have a fatal error written here too
+    // (§6.2). The task owning the receiving end dies with this function.
+    let writer = Arc::new(Mutex::new(wr));
+    let _fatal_task = entry
+        .sync_rx
+        .lock()
+        .await
+        .take()
+        .map(|rx| TaskGuard(tokio::spawn(sync_fatal_pusher(rx, writer.clone()))));
+    let result = sync_loop(&mut rd, &writer, entry.clone(), config).await;
     drop(guard);
     result
+}
+
+/// Write a fatal error the *async* channel detected onto the synchronous one.
+///
+/// §6.2 wants a desync reported on both channels and the connection closed, so
+/// this shuts the writer down afterwards: the sync loop is parked in a read
+/// that will not return until the client says something, and after a fatal it
+/// never will.
+async fn sync_fatal_pusher<W>(
+    mut rx: mpsc::Receiver<(FatalErrorCode, String)>,
+    writer: Arc<Mutex<W>>,
+) where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let Some((code, message)) = rx.recv().await else {
+        return;
+    };
+    let mut wr = writer.lock().await;
+    debug!("mirroring a fatal error onto the synchronous channel");
+    if let Err(e) = send_fatal(&mut *wr, code, message).await {
+        debug!("could not mirror the fatal error: {e}");
+        return;
+    }
+    let _ = wr.shutdown().await;
 }
 
 async fn init_async<R, W>(
@@ -622,9 +673,16 @@ impl Drop for RegistrationGuard {
     }
 }
 
+/// Drive the synchronous channel.
+///
+/// The writer is shared rather than owned because §6.2 has a desync reported on
+/// *both* channels, and the async channel is the one that may detect it. The
+/// lock is taken per write and never held across a wait for the bus or for a
+/// lock, so a fatal arriving from the other side is never stuck behind a long
+/// GPIB transaction or, worse, behind a client waiting out someone else's lock.
 async fn sync_loop<R, W>(
     rd: &mut R,
-    wr: &mut W,
+    writer: &Arc<Mutex<W>>,
     entry: Arc<SessionEntry>,
     config: Config,
 ) -> io::Result<()>
@@ -647,8 +705,11 @@ where
                 if let super::errors::Error::Fatal(code, ref message) = e {
                     entry.mirror_fatal(code, message);
                 }
-                Message::from(e).write_to(wr).await?;
-                wr.flush().await?;
+                {
+                    let mut wr = writer.lock().await;
+                    Message::from(e).write_to(&mut *wr).await?;
+                    wr.flush().await?;
+                }
                 if fatal {
                     // Give the mirrored copy a moment to reach the wire before
                     // this task returns and tears the session down.
@@ -722,7 +783,7 @@ where
                             escape_bytes_truncated(&cmd, 120),
                         );
                         send_nonfatal(
-                            wr,
+                            &mut *writer.lock().await,
                             NonFatalErrorCode::UnidentifiedError,
                             format!("device error: {e}"),
                         )
@@ -736,7 +797,13 @@ where
                     // response is sent, and stays true until the client says it
                     // has consumed it. Nothing to do with `*SRE`.
                     entry.mav.store(true, Ordering::Release);
-                    write_response(wr, &entry, msg.message_parameter, &data).await?;
+                    write_response(
+                        &mut *writer.lock().await,
+                        &entry,
+                        msg.message_parameter,
+                        &data,
+                    )
+                    .await?;
                 }
                 // Raised after the reply is on the wire: a client woken by the
                 // service request finds the data already waiting for it.
@@ -757,12 +824,15 @@ where
                 // mode this server does not implement.
                 let _ = features.overlapped();
                 let agreed = FeatureBitmap::new(false, false, false);
-                MessageType::DeviceClearAcknowledge
-                    .message_params(agreed.0, 0)
-                    .no_payload()
-                    .write_to(wr)
-                    .await?;
-                wr.flush().await?;
+                {
+                    let mut wr = writer.lock().await;
+                    MessageType::DeviceClearAcknowledge
+                        .message_params(agreed.0, 0)
+                        .no_payload()
+                        .write_to(&mut *wr)
+                        .await?;
+                    wr.flush().await?;
+                }
             }
             MessageType::FatalError => {
                 warn!(
@@ -789,7 +859,7 @@ where
                     "TLS/SASL not supported",
                 );
                 send_fatal(
-                    wr,
+                    &mut *writer.lock().await,
                     FatalErrorCode::SecureConnectionFailed,
                     "TLS/SASL not supported",
                 )
@@ -799,7 +869,7 @@ where
             }
             other => {
                 send_nonfatal(
-                    wr,
+                    &mut *writer.lock().await,
                     NonFatalErrorCode::UnrecognizedMessageType,
                     format!("unexpected sync message: {other:?}"),
                 )
@@ -1107,9 +1177,14 @@ where
             Ok(m) => m,
             Err(e) => {
                 let fatal = e.is_fatal();
+                // §6.2, the other direction: report it on the sync channel too.
+                if let super::errors::Error::Fatal(code, ref message) = e {
+                    entry.mirror_fatal_to_sync(code, message);
+                }
                 Message::from(e).write_to(wr).await?;
                 wr.flush().await?;
                 if fatal {
+                    tokio::time::sleep(FATAL_MIRROR_GRACE).await;
                     return Ok(());
                 }
                 continue;
