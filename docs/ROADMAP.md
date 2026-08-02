@@ -66,23 +66,7 @@ supports enabling it. Nothing in the daemon's addressing path (`listen_address`
 / `talk_address`) emits secondary address bytes, and no front-end can request
 one. Only matters for instruments that use subaddresses.
 
-## 5. A fatal error on the async channel is not mirrored onto the sync one
-
-§6.2 requires a desync to be reported on **both** channels before the connection
-closes. The sync loop does this: it hands its fatal to the task that owns the
-async writer, which sends a copy. The other direction does not — a framing
-failure detected on the *async* channel is reported there and nowhere else.
-
-The asymmetry is structural rather than an oversight. The async channel's writer
-is already shared behind a mutex so the service-request forwarder can push to
-it; the sync writer is owned outright by its loop, which spends its life parked
-in a read that is not cancel-safe, so there is nothing to hand a message to.
-Closing it means sharing that writer the same way.
-
-Low priority: a desync on the async channel is rare, and the client is told
-about it on the channel it was talking on.
-
-## 6. HiSLIP `GetDescriptors` is refused with the wrong error code
+## 5. HiSLIP `GetDescriptors` is refused with the wrong error code
 
 Message type 26 is not implemented. It falls through to the catch-all arm and is
 answered with a non-fatal Error, control code 1, **"unrecognized message
