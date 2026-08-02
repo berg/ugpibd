@@ -256,13 +256,19 @@ PAD in the sub-address itself (`hislip15`) avoids that.
 
 `viLock` / `viUnlock` are enforced, not advisory. An exclusive lock (empty lock
 string) is granted only when nobody else holds anything; a shared lock is
-granted to everyone using the same lock string. While a lock is held, another
-client's reads, writes, triggers and device clears are refused rather than
-quietly interleaved, and a request that conflicts waits out the timeout the
-caller asked for before being refused. Locks nest, they are scoped to the
-instrument rather than the bus — locking `hislip23` leaves `hislip3` free — and
-they are released when the session closes, so a client that crashes holding one
-does not lock the instrument out.
+granted to everyone using the same lock string. A request that conflicts waits
+out the timeout the caller asked for before being refused.
+
+While a lock is held, another client's reads, writes, triggers and device
+clears are **left unprocessed until the lock frees**, rather than interleaved
+or refused. That is what the spec calls for — HiSLIP has no "resource locked"
+message and none is to be invented — so a locked-out client blocks and, if it
+runs out of patience, times out. Its status queries, lock info and maximum
+message size still work, which is how it can find out what is going on.
+
+Locks nest, they are scoped to the instrument rather than the bus — locking
+`hislip23` leaves `hislip3` free — and they are released when the session
+closes, so a client that crashes holding one does not lock the instrument out.
 
 #### Service requests
 

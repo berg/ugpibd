@@ -301,14 +301,18 @@ async fn service_request_without_rqs_is_not_forwarded() {
     let dev = Arc::new(ProbeDevice::with_srq());
     // Another instrument pulled the wired-OR SRQ line: our device's poll comes
     // back with RQS clear, so nothing should be pushed for this session.
-    dev.status.store(0x10, Ordering::SeqCst);
+    //
+    // Deliberately not MAV (0x10) here: bit 4 of the status byte belongs to the
+    // server, which reports it from message flow per §6.14.1 rather than
+    // passing through whatever the instrument's own poll said.
+    dev.status.store(0x20, Ordering::SeqCst);
     let addr = start_server(dev.clone()).await.unwrap();
     let mut client = connect(addr).await.unwrap();
 
     dev.raise_srq();
 
     for _ in 0..10 {
-        assert_eq!(client.status().await.unwrap(), 0x10);
+        assert_eq!(client.status().await.unwrap(), 0x20);
         assert_eq!(
             client.take_service_request(),
             None,

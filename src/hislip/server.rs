@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::str::from_utf8;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ use super::lock::LockRegistry;
 use super::messages::{
     send_fatal, send_nonfatal, AsyncInitializeResponseControl, AsyncInitializeResponseParameter,
     FeatureBitmap, InitializeParameter, InitializeResponseControl, InitializeResponseParameter,
-    Message, MessageType,
+    Message, MessageType, RmtDeliveredControl,
 };
 use super::protocol::{Protocol, SUPPORTED_PROTOCOL};
 use super::DEFAULT_SUBADDRESS;
@@ -118,6 +118,17 @@ pub trait Device: Send + Sync + 'static {
     }
 }
 
+/// How long the sync loop waits, after handing a fatal error to the async
+/// channel, before tearing the session down. Long enough for a loopback or LAN
+/// write, short enough not to delay a close anyone is waiting on — and the
+/// session is already over either way, so the cost of it being too short is a
+/// missed copy rather than a stuck client.
+const FATAL_MIRROR_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// First MessageID a client uses, per §6.14. A status query arriving before the
+/// client has sent anything quotes this minus two.
+const FIRST_MESSAGE_ID: u32 = 0xffff_ff00;
+
 /// IEEE-488 status byte bit 6: the device is requesting service. Set in the
 /// byte returned by a serial poll of whichever device pulled SRQ.
 pub const STB_RQS: u8 = 0x40;
@@ -125,11 +136,6 @@ pub const STB_RQS: u8 = 0x40;
 /// IEEE-488 status byte bit 4: message available — the device has output
 /// queued that nobody has read yet.
 pub const STB_MAV: u8 = 0x10;
-
-/// Non-fatal error code for "somebody else holds the lock". The defined codes
-/// stop at 5 and 6..=127 are reserved by the spec, so this lands in the
-/// device-defined range where a server is allowed to invent one.
-const ERROR_LOCKED: u8 = 128;
 
 /// How long the SRQ forwarder waits for the async channel's write lock before
 /// saying so. Comfortably longer than any legitimate hold — the async loop only
@@ -218,13 +224,35 @@ struct SessionEntry {
     /// image of this in VXI-11, where polling inside the SRQ handler broke
     /// because the bit was not cached.
     consumed_stb: std::sync::Mutex<Option<u8>>,
-    /// Bumped by every device clear. The sync loop compares it across an
-    /// operation to notice that its in-flight message was abandoned.
+    /// Bumped by every device clear, so the sync loop drops a half-assembled
+    /// message rather than finishing it with bytes from before the clear.
     clear_epoch: AtomicU64,
+    /// MAV, per §6.14.1: this client has a response it has not consumed.
+    ///
+    /// Set when the first Data/DataEND of a reply goes out, cleared when the
+    /// client indicates RMT-delivered. Deliberately independent of `*SRE`: the
+    /// service request mask gates RQS, not MAV, so a client that polls the
+    /// status byte without enabling service requests must still see that a
+    /// reply is waiting.
+    mav: AtomicBool,
+    /// MessageID of the most recent Data/DataEND/Trigger from this client.
+    /// §6.14.3 reports MAV false to a status query quoting any other id.
+    last_message_id: AtomicU32,
     /// Service requests the server raises itself, from the sync loop to
     /// whichever task owns the async channel's writer.
-    srq_tx: mpsc::Sender<u8>,
-    srq_rx: Mutex<Option<mpsc::Receiver<u8>>>,
+    async_tx: mpsc::Sender<AsyncPush>,
+    async_rx: Mutex<Option<mpsc::Receiver<AsyncPush>>>,
+}
+
+/// Something the session needs written on the async channel, from a task that
+/// does not own that channel's writer.
+#[derive(Debug)]
+enum AsyncPush {
+    /// A service request the daemon observed on this session's behalf.
+    ServiceRequest(u8),
+    /// §6.2: a desync is reported on *both* channels before closing, so the
+    /// sync loop hands its fatal to whoever owns the async writer.
+    Fatal(FatalErrorCode, String),
 }
 
 /// Depth of the self-raised service request queue. A service request is a
@@ -240,7 +268,7 @@ impl SessionEntry {
         locks: Arc<LockRegistry>,
         max_message_size: u64,
     ) -> Self {
-        let (srq_tx, srq_rx) = mpsc::channel(SRQ_QUEUE_DEPTH);
+        let (async_tx, async_rx) = mpsc::channel(SRQ_QUEUE_DEPTH);
         Self {
             id,
             protocol,
@@ -251,8 +279,11 @@ impl SessionEntry {
             locks,
             consumed_stb: std::sync::Mutex::new(None),
             clear_epoch: AtomicU64::new(0),
-            srq_tx,
-            srq_rx: Mutex::new(Some(srq_rx)),
+            mav: AtomicBool::new(false),
+            // The id a client quotes before it has sent anything, per §6.14.
+            last_message_id: AtomicU32::new(FIRST_MESSAGE_ID.wrapping_sub(2)),
+            async_tx,
+            async_rx: Mutex::new(Some(async_rx)),
         }
     }
 
@@ -261,14 +292,75 @@ impl SessionEntry {
         self.locks.has_access(&self.resource, self.id)
     }
 
+    /// Park until this session may touch the bus. See
+    /// [`LockRegistry::wait_for_access`] for why this waits instead of
+    /// refusing.
+    async fn wait_for_access(&self) {
+        if !self.has_access() {
+            debug!(
+                session = self.id,
+                resource = %self.resource,
+                "another client holds the lock; leaving this message unprocessed"
+            );
+            self.locks.wait_for_access(&self.resource, self.id).await;
+        }
+    }
+
+    /// Note a Data/DataEND/Trigger arriving from the client.
+    ///
+    /// Two pieces of §6.14 bookkeeping: the id a later status query has to
+    /// quote, and the RMT-delivered flag, which is how the client says it has
+    /// consumed the previous response.
+    fn note_client_message(&self, msg: &Message) {
+        self.last_message_id
+            .store(msg.message_parameter, Ordering::Release);
+        if RmtDeliveredControl(msg.control_code).rmt_delivered() {
+            self.mav.store(false, Ordering::Release);
+        }
+        // A fresh command makes any status byte we are holding stale — `*CLS`
+        // most obviously, but any command that changes the status registers.
+        // Cheaper and more honest than parsing the payload to find out which.
+        self.take_consumed_stb();
+    }
+
+    /// MAV as a status-byte bit, for a status query quoting `message_id`.
+    fn mav_bit(&self, message_id: u32) -> u8 {
+        if !self.mav.load(Ordering::Acquire) {
+            return 0;
+        }
+        let expected = self.last_message_id.load(Ordering::Acquire);
+        if message_id != expected {
+            // §6.14.3: a status query that does not quote the most recent
+            // Data/DataEND/Trigger is answered with MAV false.
+            debug!(
+                message_id,
+                expected, "status query quotes a stale message id; reporting MAV false"
+            );
+            return 0;
+        }
+        STB_MAV
+    }
+
     /// Push a service request the daemon observed on this session's behalf,
     /// remembering the status byte for the client's next `AsyncStatusQuery`.
     /// Dropped if no async channel is bound or the client is not keeping up —
     /// see [`SRQ_QUEUE_DEPTH`].
     fn raise_service_request(&self, stb: u8) {
         *self.consumed_stb.lock().unwrap() = Some(stb);
-        if self.srq_tx.try_send(stb).is_err() {
+        if self
+            .async_tx
+            .try_send(AsyncPush::ServiceRequest(stb))
+            .is_err()
+        {
             debug!(stb, "no async channel to raise a service request on");
+        }
+    }
+
+    /// Mirror a fatal error onto the async channel, per §6.2.
+    fn mirror_fatal(&self, code: FatalErrorCode, message: &str) {
+        let push = AsyncPush::Fatal(code, message.to_string());
+        if self.async_tx.try_send(push).is_err() {
+            debug!("no async channel to mirror the fatal error onto");
         }
     }
 
@@ -411,7 +503,11 @@ where
     debug!(session_id, %subaddr, %protocol, "hislip sync initialized");
 
     let resp_param = InitializeResponseParameter::new(protocol, session_id);
-    let resp_ctrl = InitializeResponseControl::new(true, false, false);
+    // Synchronized, not overlapped: commands are executed one at a time on a
+    // single bus. Advertising a preference for overlap would also change which
+    // MAV rules apply — §6.14.2 compares MessageIDs where §6.14.1, which this
+    // server implements, uses message flow.
+    let resp_ctrl = InitializeResponseControl::new(false, false, false);
     MessageType::InitializeResponse
         .message_params(resp_ctrl.0, resp_param.0)
         .no_payload()
@@ -530,9 +626,18 @@ where
             Ok(m) => m,
             Err(e) => {
                 let fatal = e.is_fatal();
+                // §6.2: a desync is reported on both channels, then the
+                // connection closes. The async channel has its own writer, so
+                // hand it over rather than reaching across.
+                if let super::errors::Error::Fatal(code, ref message) = e {
+                    entry.mirror_fatal(code, message);
+                }
                 Message::from(e).write_to(wr).await?;
                 wr.flush().await?;
                 if fatal {
+                    // Give the mirrored copy a moment to reach the wire before
+                    // this task returns and tears the session down.
+                    tokio::time::sleep(FATAL_MIRROR_GRACE).await;
                     return Ok(());
                 }
                 continue;
@@ -547,6 +652,15 @@ where
             buffer.clear();
         }
 
+        // Data, DataEND and Trigger all carry the RMT-delivered flag and a
+        // MessageID, which §6.14 needs regardless of what the message does.
+        if matches!(
+            msg.message_type,
+            MessageType::Data | MessageType::DataEnd | MessageType::Trigger
+        ) {
+            entry.note_client_message(&msg);
+        }
+
         match msg.message_type {
             MessageType::Data | MessageType::DataEnd => {
                 let is_end = msg.message_type == MessageType::DataEnd;
@@ -555,10 +669,19 @@ where
                     continue;
                 }
                 let cmd = std::mem::take(&mut buffer);
-                if !entry.has_access() {
-                    refuse_locked(wr, "data").await?;
-                    continue;
-                }
+                // Locked out? Wait, do not refuse. §2.6.1 leaves synchronous
+                // traffic unprocessed until the lock frees; there is no
+                // "resource locked" reply in HiSLIP and inventing one shows the
+                // client a hard failure where the spec calls for a wait.
+                //
+                // The message has already been read off the socket, which the
+                // spec would leave buffered. That is deliberate and not
+                // observable: the sync channel is strictly ordered, so nothing
+                // else could be serviced meanwhile either way — and having read
+                // it, a client that gives up and disconnects is noticed at once
+                // instead of leaving this task parked on a lock it no longer
+                // wants.
+                entry.wait_for_access().await;
                 let expect_response = cmd.contains(&b'?');
                 debug!(
                     "exec ({} bytes, expect_response={}): {}",
@@ -593,29 +716,11 @@ where
                     }
                 };
 
-                // A device clear that landed while the bus transaction was in
-                // flight abandons it: the reply is discarded and the client is
-                // told which message it belonged to. We cannot abort the GPIB
-                // read itself — it is one transaction, and half of one is
-                // worse than all of it — so the abandonment is of the reply,
-                // not of the bus traffic.
-                let current = entry.clear_epoch.load(Ordering::Acquire);
-                if current != epoch {
-                    epoch = current;
-                    debug!(
-                        message_id = msg.message_parameter,
-                        "device clear abandoned an in-flight message"
-                    );
-                    MessageType::Interrupted
-                        .message_params(0, msg.message_parameter)
-                        .no_payload()
-                        .write_to(wr)
-                        .await?;
-                    wr.flush().await?;
-                    continue;
-                }
-
                 if let Some(data) = executed.data {
+                    // §6.14.1: MAV goes true as the first Data/DataEND of the
+                    // response is sent, and stays true until the client says it
+                    // has consumed it. Nothing to do with `*SRE`.
+                    entry.mav.store(true, Ordering::Release);
                     write_response(wr, &entry, msg.message_parameter, &data).await?;
                 }
                 // Raised after the reply is on the wire: a client woken by the
@@ -625,10 +730,7 @@ where
                 }
             }
             MessageType::Trigger => {
-                if !entry.has_access() {
-                    refuse_locked(wr, "trigger").await?;
-                    continue;
-                }
+                entry.wait_for_access().await;
                 if let Err(e) = entry.device.trigger().await {
                     warn!("trigger failed: {e:#}");
                 }
@@ -636,7 +738,10 @@ where
             MessageType::DeviceClearComplete => {
                 // Client ack of clear — finish the handshake.
                 let features = FeatureBitmap(msg.control_code);
-                let agreed = FeatureBitmap::new(features.overlapped(), false, false);
+                // Echoing the client's preference would claim an overlapped
+                // mode this server does not implement.
+                let _ = features.overlapped();
+                let agreed = FeatureBitmap::new(false, false, false);
                 MessageType::DeviceClearAcknowledge
                     .message_params(agreed.0, 0)
                     .no_payload()
@@ -664,12 +769,17 @@ where
             | MessageType::AuthenticationExchange
                 if entry.protocol >= super::protocol::PROTOCOL_2_0 =>
             {
+                entry.mirror_fatal(
+                    FatalErrorCode::SecureConnectionFailed,
+                    "TLS/SASL not supported",
+                );
                 send_fatal(
                     wr,
                     FatalErrorCode::SecureConnectionFailed,
                     "TLS/SASL not supported",
                 )
                 .await?;
+                tokio::time::sleep(FATAL_MIRROR_GRACE).await;
                 return Ok(());
             }
             other => {
@@ -732,21 +842,6 @@ where
             .await?;
     }
     wr.flush().await
-}
-
-/// Refuse an operation because another client holds the lock. HiSLIP has no
-/// dedicated "locked" reply, so this is a non-fatal Error in the
-/// device-defined code range: the session survives, the operation does not.
-async fn refuse_locked<W>(wr: &mut W, what: &str) -> io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    send_nonfatal(
-        wr,
-        NonFatalErrorCode::DeviceDefined(ERROR_LOCKED),
-        format!("{what} refused: another client holds the lock"),
-    )
-    .await
 }
 
 /// Aborts a per-session forwarder task when the async channel goes away.
@@ -894,23 +989,32 @@ async fn srq_forwarder<W>(
 /// that is the sync loop announcing MAV for a reply it has just delivered,
 /// which the instrument cannot announce itself because the read that produced
 /// the reply is what cleared its MAV bit.
-async fn self_raised_srq_forwarder<W>(mut rx: mpsc::Receiver<u8>, writer: Arc<Mutex<W>>)
+async fn async_pusher<W>(mut rx: mpsc::Receiver<AsyncPush>, writer: Arc<Mutex<W>>)
 where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    while let Some(stb) = rx.recv().await {
+    while let Some(push) = rx.recv().await {
         let mut guard = writer.lock().await;
-        debug!(stb, "raising service request on the server's own behalf");
-        let write = async {
-            MessageType::AsyncServiceRequest
-                .message_params(stb, 0)
-                .no_payload()
-                .write_to(&mut *guard)
-                .await?;
-            (*guard).flush().await
+        let result = match push {
+            AsyncPush::ServiceRequest(stb) => {
+                debug!(stb, "raising service request on the server's own behalf");
+                let write = async {
+                    MessageType::AsyncServiceRequest
+                        .message_params(stb, 0)
+                        .no_payload()
+                        .write_to(&mut *guard)
+                        .await?;
+                    (*guard).flush().await
+                };
+                write.await
+            }
+            AsyncPush::Fatal(code, message) => {
+                debug!("mirroring a fatal error onto the async channel");
+                send_fatal(&mut *guard, code, message).await
+            }
         };
-        if let Err(e) = write.await {
-            debug!("service request push failed, client likely gone: {e}");
+        if let Err(e) = result {
+            debug!("async push failed, client likely gone: {e}");
             return;
         }
     }
@@ -946,12 +1050,12 @@ where
     // The other source: service requests the server raises itself. Separate
     // task for the same reason — the loop below is parked in a read almost all
     // of the time.
-    let _self_srq_task = entry
-        .srq_rx
+    let _push_task = entry
+        .async_rx
         .lock()
         .await
         .take()
-        .map(|rx| TaskGuard(tokio::spawn(self_raised_srq_forwarder(rx, writer.clone()))));
+        .map(|rx| TaskGuard(tokio::spawn(async_pusher(rx, writer.clone()))));
 
     loop {
         // Read with the writer unlocked, so the forwarder can push meanwhile.
@@ -1048,10 +1152,12 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncDeviceClear => {
-                if !entry.has_access() {
-                    refuse_locked(wr, "device clear").await?;
-                    continue;
-                }
+                // Same rule as the sync channel: wait for the lock rather
+                // than synthesising a refusal. The three async messages §2.6.1
+                // and §6.6 require to work without a lock — status query,
+                // maximum message size, lock info — are handled above and are
+                // deliberately not gated.
+                entry.wait_for_access().await;
                 // Bump before touching the bus. The sync loop compares this
                 // across its operation, so it has to change while that
                 // operation is still running for the reply to be abandoned.
@@ -1063,7 +1169,7 @@ where
                 if let Err(e) = entry.device.clear().await {
                     warn!("device clear failed: {e:#}");
                 }
-                let features = FeatureBitmap::new(true, false, false);
+                let features = FeatureBitmap::new(false, false, false);
                 MessageType::AsyncDeviceClearAcknowledge
                     .message_params(features.0, 0)
                     .no_payload()
@@ -1139,6 +1245,12 @@ where
                 } else {
                     entry.take_consumed_stb();
                 }
+                // MAV is the server's to report, not the instrument's: the read
+                // that fetched the reply cleared the instrument's own bit, and
+                // §6.14.1 defines MAV by message flow anyway. Overwrite bit 4
+                // in whatever came back rather than OR-ing, so a stale set bit
+                // cannot outlive the response it belonged to.
+                stb = (stb & !STB_MAV) | entry.mav_bit(msg.message_parameter);
                 MessageType::AsyncStatusResponse
                     .message_params(stb, 0)
                     .no_payload()
