@@ -183,18 +183,17 @@ removed is only noise.
 
 ## Test 10: Go To Local and Local Lockout
 
-**The front-panel half of this is the only part still owed.** The command bytes
-are pinned by unit tests on both backends and have been read off the wire on an
-NI GPIB-USB-HS *and* an 82357B — `UNL LAD<pad> GTL` addressed, a bare
-unaddressed `LLO` — so the encoding and addressing are confirmed on both. What
-nobody has watched is the instrument obeying.
+**Confirmed on an 82357B with an HP 34401A**, every step below behaving as
+described. The command bytes are pinned by unit tests on both backends and were
+read off the wire on that adapter and on an NI GPIB-USB-HS — `UNL LAD<pad> GTL`
+addressed, a bare unaddressed `LLO`.
 
 Do not try to substitute a host-side measurement for the panel; it was tried and
 does not work. A 34401A in local services *queries* about twelve times slower,
 but serial polls are answered below the SCPI layer and run at ~500/s either way,
 and any query re-addresses the instrument as a listener, which returns it to
 remote and erases the evidence before it can be timed. Watching the annunciator
-is the measurement.
+is the measurement, which is why this stays a manual test.
 
 Unlike REN, these are per-device (GTL) and bus-wide (LLO), so watch the panel
 rather than the daemon log.
@@ -249,7 +248,10 @@ exercises both front-ends and reports any mismatch between them.
   macOS: firmware uploaded from cold, including the documented double-upload
   retry. HiSLIP conformance 25/25 and all 9 `hislip-stress` scripts pass,
   covering locking, MAV-driven service requests and the remote/local codes.
-  GTL and LLO reach the bus with the same command bytes as the NI adapter.
+  GTL and LLO reach the bus with the same command bytes as the NI adapter, and
+  Test 10 was walked on the front panel: addressed GTL takes the instrument
+  local while REN stays asserted, re-addressing returns it to remote, and LOCAL
+  works until LLO is sent and not after.
 - **NI GPIB-USB-HS** + SR620 at PAD 16, and + HP 34401A at PAD 23 on macOS:
   HiSLIP conformance and the `hislip-stress` suite pass, including SRQ push and
   MAV-driven service requests.
