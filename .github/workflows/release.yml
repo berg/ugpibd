@@ -87,12 +87,34 @@ jobs:
           merge-multiple: true
           path: artifacts/
 
+      # The release notes are the CHANGELOG entry for this tag, not a list of
+      # merged pull requests: a reader deciding whether to upgrade wants to know
+      # what changed for them, which no amount of commit titles adds up to.
+      # scripts/release refuses to tag a version with no entry, so this cannot
+      # silently fall back to an empty body.
+      - name: Extract the release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="## v${version} " '
+            index($0, v) == 1 { inside = 1; next }
+            inside && /^## v/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no entry for ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          cat release-notes.md
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*.tar.gz
             artifacts/*.deb
+          body_path: release-notes.md
+          # Appended below the notes above, so the pull request list is still
+          # there for anyone who wants it.
           generate_release_notes: true
 
   # The apt repository is published by apt.yml, which triggers on this workflow

@@ -28,6 +28,15 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     exit 1
 fi
 
+# Release notes come from CHANGELOG.md. Check before anything is bumped or
+# pushed: the tag is what publishes, and a tag pushed without notes cannot be
+# fixed by editing a file afterwards.
+if ! grep -q "^## v${VERSION} " CHANGELOG.md; then
+    echo "Error: CHANGELOG.md has no '## v${VERSION} <date>' entry"
+    echo "  the release workflow publishes that section as the release notes"
+    exit 1
+fi
+
 echo "Releasing v${VERSION}..."
 
 # Bump version in Cargo.toml
