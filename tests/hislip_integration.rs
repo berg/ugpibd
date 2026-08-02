@@ -4,7 +4,7 @@
 // same as the server's, so we can drive real TCP sockets without a separate
 // client library.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +27,8 @@ struct TestDevice {
     resource: String,
     service_request: Option<u8>,
     clears: Arc<AtomicU32>,
+    /// Last state `set_remote` was asked for: 1 remote, 0 local, -1 never.
+    remote: Arc<AtomicI32>,
 }
 
 impl TestDevice {
@@ -37,6 +39,7 @@ impl TestDevice {
             resource: "gpib0".to_string(),
             service_request: None,
             clears: Arc::new(AtomicU32::new(0)),
+            remote: Arc::new(AtomicI32::new(-1)),
         }
     }
 
@@ -81,7 +84,8 @@ impl Device for TestDevice {
         self.clears.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    async fn set_remote(&self, _remote: bool) -> Result<()> {
+    async fn set_remote(&self, remote: bool) -> Result<()> {
+        self.remote.store(i32::from(remote), Ordering::SeqCst);
         Ok(())
     }
     async fn get_status(&self) -> Result<u8> {
@@ -575,6 +579,61 @@ async fn a_request_split_across_messages_is_reassembled() {
     let resp = session.read_sync().await;
     assert_eq!(resp.message_type, MessageType::DataEnd);
     assert_eq!(resp.payload, b"ECHO,TEST,SN,1.0\n");
+}
+
+// -------------------------------------------------------------- remote/local
+
+#[tokio::test]
+async fn every_control_code_that_enables_remote_drives_ren() {
+    let remote = Arc::new(AtomicI32::new(-1));
+    let seen = remote.clone();
+    let addr = start_server_with(move |_| {
+        let mut dev = TestDevice::new();
+        dev.remote = remote.clone();
+        let dev: Arc<dyn Device> = Arc::new(dev);
+        Some(dev)
+    })
+    .await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // Code 1 is `enableRemote` — what viGpibControlREN(VI_GPIB_REN_ASSERT)
+    // sends. It was a no-op once, so REN could be dropped with no way to put
+    // it back, leaving the instrument in local: correctness aside, an HP
+    // 34401A services the bus ~20x slower that way.
+    for (code, expected, name) in [
+        (0u8, 0, "disableRemote"),
+        (1, 1, "enableRemote"),
+        (2, 0, "disableAndGTL"),
+        (3, 1, "enableAndGotoRemote"),
+        (4, 1, "enableAndLockoutLocal"),
+        (5, 1, "enableAndGTRLLO"),
+        (6, 0, "justGTL"),
+    ] {
+        seen.store(-1, Ordering::SeqCst);
+        let resp = session
+            .async_transaction(
+                MessageType::AsyncRemoteLocalControl
+                    .message_params(code, 0)
+                    .no_payload(),
+            )
+            .await;
+        assert_eq!(resp.message_type, MessageType::AsyncRemoteLocalResponse);
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            expected,
+            "control code {code} ({name}) did not drive REN"
+        );
+    }
+
+    // An unknown code is refused rather than silently treated as one of these.
+    let resp = session
+        .async_transaction(
+            MessageType::AsyncRemoteLocalControl
+                .message_params(9, 0)
+                .no_payload(),
+        )
+        .await;
+    assert_eq!(resp.message_type, MessageType::Error);
 }
 
 // ---------------------------------------------------------- service requests

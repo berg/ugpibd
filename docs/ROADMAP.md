@@ -75,6 +75,20 @@ firmware, so silence is not misleading here — but `++llo` / `++loc` (local
 lockout / return to local) are real bus operations that we simply do not
 perform. `GpibBackend` has no local/remote transition beyond `ren()`.
 
+The same gap shows up in HiSLIP `AsyncRemoteLocalControl`, where the GTL and
+lockout codes are approximated by driving REN alone: `disableAndGTL` (2) and
+`justGTL` (6) return the device to local by dropping REN, which on a
+multi-device bus is a bigger hammer than an addressed GTL, and
+`enableAndLockoutLocal` (4) does not actually lock out the front panel.
+Finishing it means an addressed `GTL` (`0x01`) and a universal `LLO` (`0x11`) on
+`GpibBackend`, which is a handful of lines per backend.
+
+Getting `enableRemote` (1) wrong was expensive, so it is worth saying why: an
+instrument left in local is not merely cosmetic. An HP 34401A services the bus
+about twenty times slower while its front panel is live — 300 queries took
+107 s instead of 5 s — and that presents as the daemon being slow, not as a REN
+bug.
+
 `++status` also returns `Ok`; in Prologix device mode it reports the status byte
 the *controller* would present, which is meaningless for a controller-only
 implementation. `++mode 0` (device mode) is correctly rejected as unsupported.
