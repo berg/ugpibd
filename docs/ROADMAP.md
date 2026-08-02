@@ -16,38 +16,29 @@ prefer `bail!("... not supported")` over inventing a value.
 
 ---
 
-## 1. Asynchronous SRQ notification
+## 1. Asynchronous SRQ notification — done, except on the 82357B
 
-**Now:** not forwarded. Clients can *poll* — `++srq` reads the live SRQ line and
-`++spoll` / HiSLIP `AsyncStatusQuery` serial-poll for a status byte — but
-nothing is pushed. HiSLIP `AsyncServiceRequest` (message type 20) is defined in
-`hislip/messages.rs` and never sent, so pyvisa's
-`viWaitOnEvent(VI_EVENT_SERVICE_REQ)` will wait forever.
+**Now:** forwarded. A bus SRQ wakes a per-session task that serial-polls and
+pushes `AsyncServiceRequest` (type 20) with the status byte — see
+`hislip/server.rs`. `viWaitOnEvent(VI_EVENT_SERVICE_REQ)` works.
 
-**Why:** documented scope in `hislip/server.rs` — single-bus / single-instrument
-deployments skip the spec's locking and multi-device machinery. It also keeps
-every server reply solicited, which is why `hislip/client.rs` needs no
-background reader.
+MAV-driven requests are the awkward case and are handled in
+`hislip/instrument.rs`: the daemon's own read is what clears MAV, so `execute`
+polls before draining and, failing that, notices an SRQ that fired during the
+read and did not survive it. Measured on an HP 34401A: SRQ comes up 5-13 ms
+after the write and the poll returns `0x50`, while the daemon's read takes
+~350 ms, so the request is always raised inside the window the daemon holds the
+bus. The status byte in that second case is reconstructed rather than read —
+the only inference left, and a narrow one, since the instrument applied its own
+`*SRE` mask when it pulled the line. Deliberately **not** done: parsing `*SRE`
+out of the traffic, which would be a cache with no invalidation.
 
-**To finish:**
-
-- An SRQ event stream on `GpibBackend` (e.g. a `tokio::sync::broadcast` sender).
-- **82357B:** the hard part already exists. `agilent_82357/usb.rs` runs a
-  permanent interrupt poller with stall recovery and backoff; it reads the flags
-  byte and acts only on `AIF_WRITE_COMPLETE_BN`. `AIF_SRQ_BN` is defined
-  (`protocol.rs`) and never tested — the bit is already arriving and is dropped.
-- **NI:** interrupt monitoring is deliberately **off**. Re-enabling it means
-  writing `IBSTA_MONITOR_MASK` *and* adding a task that continuously drains the
-  interrupt endpoint. Do not do one without the other: enabling monitoring with
-  no reader lets reports pile up and stalls the adapter's bulk transfers on the
-  *next* session, which presents as the first IFC after a restart hanging
-  forever, recoverable only by physically replugging. See `ni_usb_hs/mod.rs`.
-- HiSLIP: send `AsyncServiceRequest` on the async channel (it carries a status
-  byte, so serial-poll on notification).
-
-**Worth it when:** long unattended measurements (an SR620 averaging over
-minutes), instruments that raise SRQ on error, or pyvisa code using
-`wait_on_event`. Not needed for request/response SCPI.
+**What is left:** the **82357B** cannot report SRQ, so sessions on it never get
+a push (`subscribe_srq` returns `None` and the session says so at debug level).
+The hard part already exists: `agilent_82357/usb.rs` runs a permanent interrupt
+poller with stall recovery and backoff, and acts only on `AIF_WRITE_COMPLETE_BN`.
+`AIF_SRQ_BN` is defined in `protocol.rs` and never tested — the bit is already
+arriving and is dropped. The NI path is live and is the model to follow.
 
 ## 2. `srq_asserted()` only implemented for the NI backend
 
@@ -92,12 +83,28 @@ implementation. `++mode 0` (device mode) is correctly rejected as unsupported.
 
 Per the module comment in `hislip/server.rs`:
 
-- **Locking** — `AsyncLock` / `AsyncLockInfo` always report success. Correct for
-  one client on one bus; wrong the moment two clients contend.
 - **TLS / SASL** — `StartTLS`, `AsyncStartTLS`, `EndTLS` are rejected. Fine for
   `127.0.0.1`; a blocker for exposing the daemon on a network.
 - **Multi-device** — one bus, addressed per session by the `hislip<N>`
   sub-address.
+- **`GetDescriptors`** (type 26) — answered with the generic "unrecognized
+  message type" Error rather than a descriptor document. Nothing is known to
+  ask for it.
+
+Locking is no longer a simplification: `hislip/lock.rs` implements exclusive and
+shared locks with timeouts, nesting and release-on-disconnect, enforced against
+the traffic of sessions that do not hold them. Two things about it are worth
+knowing:
+
+- **Refusal, not delay.** A locked-out Data/Trigger/device-clear message is
+  answered with a non-fatal Error in the device-defined code range (128), which
+  is the VISA model — `VI_ERROR_RSRC_LOCKED` is immediate, and you are expected
+  to take the lock before doing I/O rather than queue behind someone else's.
+  HiSLIP defines no "locked" reply of its own, so the code is ours.
+- **Clients may not surface it.** pyvisa-py discards unexpected message types
+  while waiting for `Data`, so a refused read presents as a timeout rather than
+  as `VI_ERROR_RSRC_LOCKED`. The server's half is done; making it legible is a
+  client-side change.
 
 ## 6. Secondary addressing
 

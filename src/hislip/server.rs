@@ -7,36 +7,63 @@
 // are paired by the 16-bit session id the server hands out on the sync
 // Initialize, which the client echoes on AsyncInitialize.
 //
-// For single-bus / single-instrument deployments we skip the full locking
-// and multi-device machinery of the spec. Lock requests always succeed
-// (there is only ever one client competing for one bus) and TLS/SASL
-// handshakes are rejected.
+// Locks are real: AsyncLock/AsyncLockInfo are backed by lock.rs and enforced
+// against Data/Trigger/device-clear traffic from sessions that do not hold
+// them. TLS/SASL handshakes are rejected. Multi-device is out of scope: one
+// bus, addressed per session by the hislip<N> sub-address.
 //
-// Service requests are forwarded: when the adapter reports SRQ, a per-session
-// task serial-polls the device and pushes an AsyncServiceRequest carrying the
-// status byte. That is the only message the server sends unsolicited, so it is
-// also the only one a client must be prepared to see mid-round-trip.
+// Service requests reach the client from two places. When the adapter reports
+// SRQ while the bus is idle, a per-session task serial-polls the device and
+// pushes an AsyncServiceRequest carrying the status byte. When one is raised by
+// a command this session is running, `Device::execute` reports it — see
+// hislip/instrument.rs for why it has to be noticed there. Those are the only
+// messages the server sends unsolicited, so they are also the only ones a
+// client must be prepared to see mid-round-trip.
 
 use std::collections::HashMap;
 use std::io;
 use std::str::from_utf8;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use byteorder::{ByteOrder, NetworkEndian};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::errors::{FatalErrorCode, NonFatalErrorCode};
+use super::lock::LockRegistry;
 use super::messages::{
     send_fatal, send_nonfatal, AsyncInitializeResponseControl, AsyncInitializeResponseParameter,
     FeatureBitmap, InitializeParameter, InitializeResponseControl, InitializeResponseParameter,
-    Message, MessageType, ReleaseLockControl, RequestLockControl,
+    Message, MessageType,
 };
 use super::protocol::{Protocol, SUPPORTED_PROTOCOL};
 use super::DEFAULT_SUBADDRESS;
+
+/// What running one command produced.
+#[derive(Debug, Default)]
+pub struct Execution {
+    /// The instrument's reply, or `None` for a command we did not read back.
+    pub data: Option<Vec<u8>>,
+    /// Status byte of a service request the instrument raised while this
+    /// command was running, if the device noticed one. Carried out here
+    /// because the window it lives in is inside `execute` — see
+    /// [`crate::hislip::instrument::GpibInstrument`].
+    pub service_request: Option<u8>,
+}
+
+impl From<Option<Vec<u8>>> for Execution {
+    fn from(data: Option<Vec<u8>>) -> Self {
+        Self {
+            data,
+            service_request: None,
+        }
+    }
+}
 
 /// A HiSLIP device endpoint. The server resolves a subaddress to one of
 /// these on Initialize and then drives all per-session I/O through it.
@@ -47,7 +74,7 @@ use super::DEFAULT_SUBADDRESS;
 pub trait Device: Send + Sync + 'static {
     /// Execute a full query: write `cmd` to the instrument with EOI on the
     /// last byte, then (if `expect_response`) read a response.
-    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Option<Vec<u8>>>;
+    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Execution>;
 
     /// Send a GPIB trigger (GET) to the instrument.
     async fn trigger(&self) -> Result<()>;
@@ -81,11 +108,28 @@ pub trait Device: Send + Sync + 'static {
     async fn srq_asserted(&self) -> Result<bool> {
         anyhow::bail!("this device cannot read the SRQ line")
     }
+
+    /// Key identifying the physical resource behind this device, used to scope
+    /// locks. Two sessions that reach the same instrument must return the same
+    /// key, and two that reach different instruments must not: locking the DMM
+    /// has no business locking out the counter on the same bus.
+    fn resource_key(&self) -> String {
+        "default".to_string()
+    }
 }
 
 /// IEEE-488 status byte bit 6: the device is requesting service. Set in the
 /// byte returned by a serial poll of whichever device pulled SRQ.
-const STB_RQS: u8 = 0x40;
+pub const STB_RQS: u8 = 0x40;
+
+/// IEEE-488 status byte bit 4: message available — the device has output
+/// queued that nobody has read yet.
+pub const STB_MAV: u8 = 0x10;
+
+/// Non-fatal error code for "somebody else holds the lock". The defined codes
+/// stop at 5 and 6..=127 are reserved by the spec, so this lands in the
+/// device-defined range where a server is allowed to invent one.
+const ERROR_LOCKED: u8 = 128;
 
 /// How long the SRQ forwarder waits for the async channel's write lock before
 /// saying so. Comfortably longer than any legitimate hold — the async loop only
@@ -129,17 +173,19 @@ where
 {
     info!("HiSLIP listening on {}", listener.local_addr()?);
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+    let locks = Arc::new(LockRegistry::new());
     let device_for = Arc::new(device_for);
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
         let registry = registry.clone();
+        let locks = locks.clone();
         let config = config.clone();
         let device_for = device_for.clone();
         tokio::spawn(async move {
             info!(%addr, "hislip client connected");
-            if let Err(e) = handle_connection(stream, config, registry, device_for).await {
+            if let Err(e) = handle_connection(stream, config, registry, locks, device_for).await {
                 warn!(%addr, "hislip client error: {e:#}");
             } else {
                 info!(%addr, "hislip client disconnected");
@@ -151,6 +197,8 @@ where
 type Registry = Arc<Mutex<HashMap<u16, Arc<SessionEntry>>>>;
 
 struct SessionEntry {
+    /// This session's id — also how the lock registry identifies it.
+    id: u16,
     protocol: Protocol,
     /// `max_message_size` the client says it can receive; chunked response
     /// writes on the sync channel respect this.
@@ -158,12 +206,84 @@ struct SessionEntry {
     device: Arc<dyn Device>,
     /// Tracks whether an async channel has already bound to this session.
     async_bound: Mutex<bool>,
+    /// Server-wide lock state, and the resource key this session locks under.
+    locks: Arc<LockRegistry>,
+    resource: String,
+    /// The last status byte the daemon consumed on this client's behalf.
+    ///
+    /// A serial poll clears RQS at the instrument, so once the daemon has
+    /// polled — which it must, to put a status byte in `AsyncServiceRequest` —
+    /// the client's own `AsyncStatusQuery` would read a bit that has already
+    /// been taken. Hold it and hand it over once. pyvisa-py hit the mirror
+    /// image of this in VXI-11, where polling inside the SRQ handler broke
+    /// because the bit was not cached.
+    consumed_stb: std::sync::Mutex<Option<u8>>,
+    /// Bumped by every device clear. The sync loop compares it across an
+    /// operation to notice that its in-flight message was abandoned.
+    clear_epoch: AtomicU64,
+    /// Service requests the server raises itself, from the sync loop to
+    /// whichever task owns the async channel's writer.
+    srq_tx: mpsc::Sender<u8>,
+    srq_rx: Mutex<Option<mpsc::Receiver<u8>>>,
+}
+
+/// Depth of the self-raised service request queue. A service request is a
+/// level, not a count — a client that has not drained one does not need the
+/// next four — so a small queue that drops on overflow loses nothing.
+const SRQ_QUEUE_DEPTH: usize = 4;
+
+impl SessionEntry {
+    fn new(
+        id: u16,
+        protocol: Protocol,
+        device: Arc<dyn Device>,
+        locks: Arc<LockRegistry>,
+        max_message_size: u64,
+    ) -> Self {
+        let (srq_tx, srq_rx) = mpsc::channel(SRQ_QUEUE_DEPTH);
+        Self {
+            id,
+            protocol,
+            client_max_message_size: Mutex::new(max_message_size),
+            resource: device.resource_key(),
+            device,
+            async_bound: Mutex::new(false),
+            locks,
+            consumed_stb: std::sync::Mutex::new(None),
+            clear_epoch: AtomicU64::new(0),
+            srq_tx,
+            srq_rx: Mutex::new(Some(srq_rx)),
+        }
+    }
+
+    /// May this session do I/O right now, or is somebody else holding a lock?
+    fn has_access(&self) -> bool {
+        self.locks.has_access(&self.resource, self.id)
+    }
+
+    /// Push a service request the daemon observed on this session's behalf,
+    /// remembering the status byte for the client's next `AsyncStatusQuery`.
+    /// Dropped if no async channel is bound or the client is not keeping up —
+    /// see [`SRQ_QUEUE_DEPTH`].
+    fn raise_service_request(&self, stb: u8) {
+        *self.consumed_stb.lock().unwrap() = Some(stb);
+        if self.srq_tx.try_send(stb).is_err() {
+            debug!(stb, "no async channel to raise a service request on");
+        }
+    }
+
+    /// Take the status byte the daemon consumed, if it has not been handed
+    /// over yet.
+    fn take_consumed_stb(&self) -> Option<u8> {
+        self.consumed_stb.lock().unwrap().take()
+    }
 }
 
 async fn handle_connection<F>(
     stream: TcpStream,
     config: Config,
     registry: Registry,
+    locks: Arc<LockRegistry>,
     device_for: Arc<F>,
 ) -> io::Result<()>
 where
@@ -185,7 +305,9 @@ where
     };
 
     match first.message_type {
-        MessageType::Initialize => init_sync(first, rd, wr, config, registry, device_for).await,
+        MessageType::Initialize => {
+            init_sync(first, rd, wr, config, registry, locks, device_for).await
+        }
         MessageType::AsyncInitialize => init_async(first, rd, wr, config, registry).await,
         other => {
             send_fatal(
@@ -205,6 +327,7 @@ async fn init_sync<R, W, F>(
     mut wr: W,
     config: Config,
     registry: Registry,
+    locks: Arc<LockRegistry>,
     device_for: Arc<F>,
 ) -> io::Result<()>
 where
@@ -246,13 +369,7 @@ where
     // Allocate a session id and register. Session ids are 16-bit, we use
     // even numbers and wrap; collisions would only happen with > 32k
     // concurrent clients.
-    let entry = Arc::new(SessionEntry {
-        protocol,
-        client_max_message_size: Mutex::new(config.max_message_size),
-        device: device.clone(),
-        async_bound: Mutex::new(false),
-    });
-    let session_id = {
+    let (session_id, entry) = {
         let mut reg = registry.lock().await;
         if reg.len() >= config.max_sessions {
             drop(reg);
@@ -278,8 +395,17 @@ where
                 return Ok(());
             }
         }
+        // Built under the registry lock, so the id it carries cannot be handed
+        // to a second session in between.
+        let entry = Arc::new(SessionEntry::new(
+            id,
+            protocol,
+            device.clone(),
+            locks.clone(),
+            config.max_message_size,
+        ));
         reg.insert(id, entry.clone());
-        id
+        (id, entry)
     };
 
     debug!(session_id, %subaddr, %protocol, "hislip sync initialized");
@@ -296,6 +422,7 @@ where
     let guard = RegistrationGuard {
         id: session_id,
         registry: registry.clone(),
+        locks,
     };
     let result = sync_loop(&mut rd, &mut wr, entry, config).await;
     drop(guard);
@@ -363,10 +490,16 @@ where
 struct RegistrationGuard {
     id: u16,
     registry: Registry,
+    locks: Arc<LockRegistry>,
 }
 
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
+        // Locks go first, and synchronously: a client that crashes holding one
+        // would otherwise lock the instrument out until the daemon restarts.
+        // The lock registry uses a std mutex precisely so this works from Drop.
+        self.locks.release_all(self.id);
+
         let id = self.id;
         let registry = self.registry.clone();
         // Remove the entry in a detached task; Drop is sync but the mutex
@@ -389,6 +522,9 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buffer: Vec<u8> = Vec::new();
+    // Snapshot of the device-clear counter, so an interrupted message can be
+    // told apart from a completed one.
+    let mut epoch = entry.clear_epoch.load(Ordering::Acquire);
     loop {
         let msg = match Message::read_from(rd, config.max_message_size).await? {
             Ok(m) => m,
@@ -403,6 +539,14 @@ where
             }
         };
 
+        // A device clear since the last message means any half-assembled one
+        // is void; the client will start again after the handshake.
+        let current = entry.clear_epoch.load(Ordering::Acquire);
+        if current != epoch {
+            epoch = current;
+            buffer.clear();
+        }
+
         match msg.message_type {
             MessageType::Data | MessageType::DataEnd => {
                 let is_end = msg.message_type == MessageType::DataEnd;
@@ -411,6 +555,10 @@ where
                     continue;
                 }
                 let cmd = std::mem::take(&mut buffer);
+                if !entry.has_access() {
+                    refuse_locked(wr, "data").await?;
+                    continue;
+                }
                 let expect_response = cmd.contains(&b'?');
                 debug!(
                     "exec ({} bytes, expect_response={}): {}",
@@ -418,9 +566,9 @@ where
                     expect_response,
                     escape_bytes(&cmd)
                 );
-                let resp = match entry.device.execute(&cmd, expect_response).await {
+                let executed = match entry.device.execute(&cmd, expect_response).await {
                     Ok(r) => {
-                        match &r {
+                        match &r.data {
                             Some(data) => {
                                 debug!("resp ({} bytes): {}", data.len(), escape_bytes(data))
                             }
@@ -444,25 +592,43 @@ where
                         continue;
                     }
                 };
-                if let Some(data) = resp {
-                    let client_max = *entry.client_max_message_size.lock().await;
-                    let max = std::cmp::max(256, client_max as usize);
-                    let mut chunks = data.chunks(max).peekable();
-                    while let Some(chunk) = chunks.next() {
-                        let ty = if chunks.peek().is_none() {
-                            MessageType::DataEnd
-                        } else {
-                            MessageType::Data
-                        };
-                        ty.message_params(0, msg.message_parameter)
-                            .with_payload(chunk.to_vec())
-                            .write_to(wr)
-                            .await?;
-                    }
+
+                // A device clear that landed while the bus transaction was in
+                // flight abandons it: the reply is discarded and the client is
+                // told which message it belonged to. We cannot abort the GPIB
+                // read itself — it is one transaction, and half of one is
+                // worse than all of it — so the abandonment is of the reply,
+                // not of the bus traffic.
+                let current = entry.clear_epoch.load(Ordering::Acquire);
+                if current != epoch {
+                    epoch = current;
+                    debug!(
+                        message_id = msg.message_parameter,
+                        "device clear abandoned an in-flight message"
+                    );
+                    MessageType::Interrupted
+                        .message_params(0, msg.message_parameter)
+                        .no_payload()
+                        .write_to(wr)
+                        .await?;
                     wr.flush().await?;
+                    continue;
+                }
+
+                if let Some(data) = executed.data {
+                    write_response(wr, &entry, msg.message_parameter, &data).await?;
+                }
+                // Raised after the reply is on the wire: a client woken by the
+                // service request finds the data already waiting for it.
+                if let Some(stb) = executed.service_request {
+                    entry.raise_service_request(stb);
                 }
             }
             MessageType::Trigger => {
+                if !entry.has_access() {
+                    refuse_locked(wr, "trigger").await?;
+                    continue;
+                }
                 if let Err(e) = entry.device.trigger().await {
                     warn!("trigger failed: {e:#}");
                 }
@@ -518,7 +684,72 @@ where
     }
 }
 
-/// Aborts the SRQ forwarder when the async channel goes away.
+/// Smallest response chunk we will send, whatever the client declared. A
+/// client whose maximum leaves no useful room after the 16-byte header is
+/// misconfigured rather than genuinely constrained, and honouring it literally
+/// would mean either an infinite stream of one-byte messages or a panic on a
+/// zero-length chunk.
+const MIN_CHUNK: u64 = 256;
+
+/// Push a reply on the sync channel, split so that no message — header
+/// included — exceeds the maximum the client declared with AsyncMaxMsgSize.
+/// The client states its own limit in that request; the response states ours.
+async fn write_response<W>(
+    wr: &mut W,
+    entry: &SessionEntry,
+    message_id: u32,
+    data: &[u8],
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let client_max = *entry.client_max_message_size.lock().await;
+    let max = client_max
+        .saturating_sub(Message::MESSAGE_HEADER_SIZE as u64)
+        .max(MIN_CHUNK) as usize;
+
+    // An empty reply is still a reply: the client is waiting for a DataEND and
+    // gets one, rather than blocking until its timeout.
+    if data.is_empty() {
+        MessageType::DataEnd
+            .message_params(0, message_id)
+            .no_payload()
+            .write_to(wr)
+            .await?;
+        return wr.flush().await;
+    }
+
+    let mut chunks = data.chunks(max).peekable();
+    while let Some(chunk) = chunks.next() {
+        let ty = if chunks.peek().is_none() {
+            MessageType::DataEnd
+        } else {
+            MessageType::Data
+        };
+        ty.message_params(0, message_id)
+            .with_payload(chunk.to_vec())
+            .write_to(wr)
+            .await?;
+    }
+    wr.flush().await
+}
+
+/// Refuse an operation because another client holds the lock. HiSLIP has no
+/// dedicated "locked" reply, so this is a non-fatal Error in the
+/// device-defined code range: the session survives, the operation does not.
+async fn refuse_locked<W>(wr: &mut W, what: &str) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    send_nonfatal(
+        wr,
+        NonFatalErrorCode::DeviceDefined(ERROR_LOCKED),
+        format!("{what} refused: another client holds the lock"),
+    )
+    .await
+}
+
+/// Aborts a per-session forwarder task when the async channel goes away.
 struct TaskGuard(tokio::task::JoinHandle<()>);
 
 impl Drop for TaskGuard {
@@ -619,6 +850,9 @@ async fn srq_forwarder<W>(
         let Some(stb) = poll_for_service_request(&entry).await else {
             continue;
         };
+        // That poll took RQS from the instrument, so remember it for the
+        // client's next status query.
+        *entry.consumed_stb.lock().unwrap() = Some(stb);
 
         // Bound only the *acquisition*, and only to log: abandoning a wait for
         // a lock costs nothing, so a slow acquisition is reported and then
@@ -653,6 +887,35 @@ async fn srq_forwarder<W>(
     }
 }
 
+/// Push the service requests the server raises on its own behalf.
+///
+/// These have no SRQ line behind them, so there is nothing to serial-poll and
+/// nothing to clear: the status byte is decided by whoever queued it. Today
+/// that is the sync loop announcing MAV for a reply it has just delivered,
+/// which the instrument cannot announce itself because the read that produced
+/// the reply is what cleared its MAV bit.
+async fn self_raised_srq_forwarder<W>(mut rx: mpsc::Receiver<u8>, writer: Arc<Mutex<W>>)
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(stb) = rx.recv().await {
+        let mut guard = writer.lock().await;
+        debug!(stb, "raising service request on the server's own behalf");
+        let write = async {
+            MessageType::AsyncServiceRequest
+                .message_params(stb, 0)
+                .no_payload()
+                .write_to(&mut *guard)
+                .await?;
+            (*guard).flush().await
+        };
+        if let Err(e) = write.await {
+            debug!("service request push failed, client likely gone: {e}");
+            return;
+        }
+    }
+}
+
 async fn async_loop<R, W>(
     rd: &mut R,
     wr: W,
@@ -675,14 +938,48 @@ where
             entry.clone(),
         )))),
         None => {
-            debug!("adapter cannot report SRQ; service requests will not be pushed");
+            debug!("adapter cannot report SRQ; bus service requests will not be pushed");
             None
         }
     };
 
+    // The other source: service requests the server raises itself. Separate
+    // task for the same reason — the loop below is parked in a read almost all
+    // of the time.
+    let _self_srq_task = entry
+        .srq_rx
+        .lock()
+        .await
+        .take()
+        .map(|rx| TaskGuard(tokio::spawn(self_raised_srq_forwarder(rx, writer.clone()))));
+
     loop {
         // Read with the writer unlocked, so the forwarder can push meanwhile.
         let incoming = Message::read_from(rd, config.max_message_size).await?;
+
+        // A contended lock request waits for the holder to let go, which can be
+        // the client's whole timeout. Do that before taking the write lock:
+        // parking this client is what it asked for, parking the service-request
+        // forwarders behind it is not.
+        let mut lock_answer = None;
+        if let Ok(msg) = &incoming {
+            if msg.message_type == MessageType::AsyncLock && msg.control_code != 0 {
+                let lock_string = String::from_utf8_lossy(&msg.payload).into_owned();
+                let timeout = Duration::from_millis(msg.message_parameter as u64);
+                let answer = entry
+                    .locks
+                    .request(&entry.resource, entry.id, &lock_string, timeout)
+                    .await;
+                debug!(
+                    session = entry.id,
+                    %lock_string,
+                    ?timeout,
+                    ?answer,
+                    "lock request"
+                );
+                lock_answer = Some(answer);
+            }
+        }
 
         let mut guard = writer.lock().await;
         let wr = &mut *guard;
@@ -702,23 +999,28 @@ where
 
         match msg.message_type {
             MessageType::AsyncLock => {
-                // Single-bus: locking is a no-op. Acknowledge as success.
-                let control = if msg.control_code == 0 {
-                    ReleaseLockControl::SuccessExclusive as u8
-                } else {
-                    RequestLockControl::Success as u8
+                // Control code 0 releases, 1 requests. A request was answered
+                // above, before the write lock; a release never waits, so it
+                // can happen here.
+                let answer = match lock_answer {
+                    Some(answer) => answer,
+                    None => {
+                        let answer = entry.locks.release(&entry.resource, entry.id);
+                        debug!(session = entry.id, ?answer, "lock release");
+                        answer
+                    }
                 };
                 MessageType::AsyncLockResponse
-                    .message_params(control, 0)
+                    .message_params(answer.control_code(), 0)
                     .no_payload()
                     .write_to(wr)
                     .await?;
                 wr.flush().await?;
             }
             MessageType::AsyncLockInfo => {
-                // exclusive=0, shared_count=0
+                let (exclusive, holders) = entry.locks.info(&entry.resource);
                 MessageType::AsyncLockInfoResponse
-                    .message_params(0, 0)
+                    .message_params(u8::from(exclusive), holders)
                     .no_payload()
                     .write_to(wr)
                     .await?;
@@ -746,6 +1048,14 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncDeviceClear => {
+                if !entry.has_access() {
+                    refuse_locked(wr, "device clear").await?;
+                    continue;
+                }
+                // Bump before touching the bus. The sync loop compares this
+                // across its operation, so it has to change while that
+                // operation is still running for the reply to be abandoned.
+                entry.clear_epoch.fetch_add(1, Ordering::Release);
                 // The GpibController serializes ops across the shared
                 // Arc<Mutex<_>>, so this clear is naturally ordered after
                 // whatever the sync side is mid-doing — no explicit
@@ -791,13 +1101,27 @@ where
                 // carries a status byte and nothing else — so a failed poll can
                 // only be reported as 0. Log it, so it is at least visible as a
                 // failure rather than passing for a genuine "nothing to report".
-                let stb = match entry.device.get_status().await {
+                let mut stb = match entry.device.get_status().await {
                     Ok(stb) => stb,
                     Err(e) => {
                         warn!("hislip status query failed, reporting 0: {e:#}");
                         0
                     }
                 };
+                // If the instrument has nothing to report, it may be because
+                // the daemon already took it: a serial poll clears RQS, and
+                // the daemon has to poll to fill in an AsyncServiceRequest.
+                // Hand that byte over rather than let the client read a bit
+                // that was consumed on its behalf. Only when the live poll is
+                // silent, so a real reading is never overwritten.
+                if stb == 0 {
+                    if let Some(consumed) = entry.take_consumed_stb() {
+                        debug!(consumed, "reporting the status byte we polled earlier");
+                        stb = consumed;
+                    }
+                } else {
+                    entry.take_consumed_stb();
+                }
                 MessageType::AsyncStatusResponse
                     .message_params(stb, 0)
                     .no_payload()

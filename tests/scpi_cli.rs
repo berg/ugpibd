@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::net::TcpListener;
-use ugpibd::hislip::server::{run, Config, Device};
+use ugpibd::hislip::server::{run, Config, Device, Execution};
 
 #[derive(Default)]
 struct EchoDevice {
@@ -20,11 +20,11 @@ struct EchoDevice {
 
 #[async_trait::async_trait]
 impl Device for EchoDevice {
-    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Option<Vec<u8>>> {
+    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Execution> {
         if expect_response {
-            Ok(Some(cmd.to_vec()))
+            Ok(Some(cmd.to_vec()).into())
         } else {
-            Ok(None)
+            Ok(None.into())
         }
     }
     async fn trigger(&self) -> Result<()> {

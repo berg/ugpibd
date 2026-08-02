@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::net::TcpListener;
 use ugpibd::hislip::client::HislipClient;
-use ugpibd::hislip::server::{run, Config, Device};
+use ugpibd::hislip::server::{run, Config, Device, Execution};
 
 /// A device that records control operations and echoes data so the client's
 /// round-trips can be asserted.
@@ -64,14 +64,14 @@ impl ProbeDevice {
 
 #[async_trait::async_trait]
 impl Device for ProbeDevice {
-    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Option<Vec<u8>>> {
+    async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Execution> {
         if !expect_response {
-            return Ok(None);
+            return Ok(None.into());
         }
         if cmd.eq_ignore_ascii_case(b"*idn?") {
-            Ok(Some(b"ECHO,TEST,SN,1.0\n".to_vec()))
+            Ok(Some(b"ECHO,TEST,SN,1.0\n".to_vec()).into())
         } else {
-            Ok(Some(cmd.to_vec()))
+            Ok(Some(cmd.to_vec()).into())
         }
     }
     async fn trigger(&self) -> Result<()> {
