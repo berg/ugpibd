@@ -86,6 +86,13 @@ impl Device for ProbeDevice {
         self.remote.store(remote, Ordering::SeqCst);
         Ok(())
     }
+    /// The client's `remote(true)` sends `enableAndGotoRemote`, which asserts
+    /// REN *and* addresses the instrument. As far as this probe is concerned
+    /// that is REN on.
+    async fn go_to_remote(&self) -> Result<()> {
+        self.remote.store(true, Ordering::SeqCst);
+        Ok(())
+    }
     async fn get_status(&self) -> Result<u8> {
         self.polls.fetch_add(1, Ordering::SeqCst);
         Ok(self.status.load(Ordering::SeqCst))

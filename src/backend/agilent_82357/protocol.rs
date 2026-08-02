@@ -132,6 +132,8 @@ pub const ADDRESS_MASK: u8 = 0x1f;
 // IEEE-488 bus command bytes, sent with ATN asserted.
 pub const GPIB_UNL: u8 = 0x3f;
 pub const GPIB_UNT: u8 = 0x5f;
+pub const GPIB_GTL: u8 = 0x01;
+pub const GPIB_LLO: u8 = 0x11;
 pub const GPIB_SDC: u8 = 0x04;
 pub const GPIB_GET: u8 = 0x08;
 pub const GPIB_SPE: u8 = 0x18;

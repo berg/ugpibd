@@ -4,7 +4,7 @@
 // same as the server's, so we can drive real TCP sockets without a separate
 // client library.
 
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +27,8 @@ struct TestDevice {
     resource: String,
     service_request: Option<u8>,
     clears: Arc<AtomicU32>,
-    /// Last state `set_remote` was asked for: 1 remote, 0 local, -1 never.
-    remote: Arc<AtomicI32>,
+    /// Remote/local operations the server asked for, in order.
+    ren_ops: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 
 impl TestDevice {
@@ -39,7 +39,7 @@ impl TestDevice {
             resource: "gpib0".to_string(),
             service_request: None,
             clears: Arc::new(AtomicU32::new(0)),
-            remote: Arc::new(AtomicI32::new(-1)),
+            ren_ops: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -85,7 +85,22 @@ impl Device for TestDevice {
         Ok(())
     }
     async fn set_remote(&self, remote: bool) -> Result<()> {
-        self.remote.store(i32::from(remote), Ordering::SeqCst);
+        self.ren_ops
+            .lock()
+            .unwrap()
+            .push(if remote { "ren(true)" } else { "ren(false)" });
+        Ok(())
+    }
+    async fn go_to_remote(&self) -> Result<()> {
+        self.ren_ops.lock().unwrap().push("goto_remote");
+        Ok(())
+    }
+    async fn go_to_local(&self) -> Result<()> {
+        self.ren_ops.lock().unwrap().push("gtl");
+        Ok(())
+    }
+    async fn local_lockout(&self) -> Result<()> {
+        self.ren_ops.lock().unwrap().push("llo");
         Ok(())
     }
     async fn get_status(&self) -> Result<u8> {
@@ -631,32 +646,32 @@ async fn a_request_split_across_messages_is_reassembled() {
 // -------------------------------------------------------------- remote/local
 
 #[tokio::test]
-async fn every_control_code_that_enables_remote_drives_ren() {
-    let remote = Arc::new(AtomicI32::new(-1));
-    let seen = remote.clone();
+async fn remote_local_control_codes_map_to_the_right_bus_operations() {
+    let ops: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = ops.clone();
     let addr = start_server_with(move |_| {
         let mut dev = TestDevice::new();
-        dev.remote = remote.clone();
+        dev.ren_ops = ops.clone();
         let dev: Arc<dyn Device> = Arc::new(dev);
         Some(dev)
     })
     .await;
     let mut session = Session::open(addr, "hislip0").await;
 
-    // Code 1 is `enableRemote` — what viGpibControlREN(VI_GPIB_REN_ASSERT)
-    // sends. It was a no-op once, so REN could be dropped with no way to put
-    // it back, leaving the instrument in local: correctness aside, an HP
-    // 34401A services the bus ~20x slower that way.
+    // Asserting REN only permits remote; a device enters it on being addressed,
+    // which is why 3 and 5 do more than 1. GTL is addressed, so 2 and 6 touch
+    // this instrument alone. LLO is universal — the standard has no per-device
+    // form.
     for (code, expected, name) in [
-        (0u8, 0, "disableRemote"),
-        (1, 1, "enableRemote"),
-        (2, 0, "disableAndGTL"),
-        (3, 1, "enableAndGotoRemote"),
-        (4, 1, "enableAndLockoutLocal"),
-        (5, 1, "enableAndGTRLLO"),
-        (6, 0, "justGTL"),
+        (0u8, vec!["ren(false)"], "disableRemote"),
+        (1, vec!["ren(true)"], "enableRemote"),
+        (2, vec!["gtl", "ren(false)"], "disableAndGTL"),
+        (3, vec!["goto_remote"], "enableAndGotoRemote"),
+        (4, vec!["ren(true)", "llo"], "enableAndLockoutLocal"),
+        (5, vec!["goto_remote", "llo"], "enableAndGTRLLO"),
+        (6, vec!["gtl"], "justGTL"),
     ] {
-        seen.store(-1, Ordering::SeqCst);
+        recorded.lock().unwrap().clear();
         let resp = session
             .async_transaction(
                 MessageType::AsyncRemoteLocalControl
@@ -666,13 +681,15 @@ async fn every_control_code_that_enables_remote_drives_ren() {
             .await;
         assert_eq!(resp.message_type, MessageType::AsyncRemoteLocalResponse);
         assert_eq!(
-            seen.load(Ordering::SeqCst),
+            *recorded.lock().unwrap(),
             expected,
-            "control code {code} ({name}) did not drive REN"
+            "control code {code} ({name})"
         );
     }
 
-    // An unknown code is refused rather than silently treated as one of these.
+    // An unknown code is refused rather than silently treated as one of these,
+    // and touches the bus not at all.
+    recorded.lock().unwrap().clear();
     let resp = session
         .async_transaction(
             MessageType::AsyncRemoteLocalControl
@@ -681,6 +698,7 @@ async fn every_control_code_that_enables_remote_drives_ren() {
         )
         .await;
     assert_eq!(resp.message_type, MessageType::Error);
+    assert!(recorded.lock().unwrap().is_empty());
 }
 
 // ---------------------------------------------------------- service requests

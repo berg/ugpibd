@@ -139,6 +139,21 @@ impl Device for GpibInstrument {
         ctrl.ren(remote).await
     }
 
+    async fn go_to_remote(&self) -> Result<()> {
+        let mut ctrl = self.ctrl.lock().await;
+        ctrl.go_to_remote(self.pad).await
+    }
+
+    async fn go_to_local(&self) -> Result<()> {
+        let mut ctrl = self.ctrl.lock().await;
+        ctrl.go_to_local(self.pad).await
+    }
+
+    async fn local_lockout(&self) -> Result<()> {
+        let mut ctrl = self.ctrl.lock().await;
+        ctrl.local_lockout().await
+    }
+
     async fn get_status(&self) -> Result<u8> {
         let mut ctrl = self.ctrl.lock().await;
         ctrl.serial_poll(self.pad).await

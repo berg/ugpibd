@@ -318,6 +318,23 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         self.send_command(&cmd, false).await
     }
 
+    async fn go_to_remote(&mut self, pad: u8) -> Result<()> {
+        self.ren(true).await?;
+        // Addressing as listener is the transition; REN only permits it.
+        let cmd = [GPIB_UNL, listen_address(pad)];
+        self.send_command(&cmd, false).await
+    }
+
+    async fn go_to_local(&mut self, pad: u8) -> Result<()> {
+        let cmd = [GPIB_UNL, listen_address(pad), GPIB_GTL];
+        self.send_command(&cmd, false).await
+    }
+
+    async fn local_lockout(&mut self) -> Result<()> {
+        // Universal command: no addressing, every device obeys it.
+        self.send_command(&[GPIB_LLO], false).await
+    }
+
     async fn trigger(&mut self, pad: u8) -> Result<()> {
         let cmd = [GPIB_UNL, listen_address(pad), GPIB_GET];
         self.send_command(&cmd, false).await
@@ -650,6 +667,42 @@ mod tests {
         let writes = be.transport.written.lock().unwrap().clone();
         let cmd = &writes[1];
         assert_eq!(&cmd[4..7], &[GPIB_UNL, listen_address(0), talk_address(23)]);
+    }
+
+    #[tokio::test]
+    async fn go_to_local_is_addressed_to_the_listener() {
+        // take control, command bytes.
+        let t = MockTransport::new(vec![op_ok(), op_ok()]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.go_to_local(23).await.unwrap();
+        let writes = be.transport.written.lock().unwrap().clone();
+        // GTL is addressed, so it returns this one instrument to its front
+        // panel; dropping REN would return the whole bus.
+        assert_eq!(&writes[1][4..7], &[GPIB_UNL, listen_address(23), GPIB_GTL]);
+    }
+
+    #[tokio::test]
+    async fn local_lockout_is_universal_and_unaddressed() {
+        let t = MockTransport::new(vec![op_ok(), op_ok()]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.local_lockout().await.unwrap();
+        let writes = be.transport.written.lock().unwrap().clone();
+        // No address: IEEE-488 defines no per-device lockout, and inventing
+        // one by addressing first would be a different command.
+        assert_eq!(&writes[1][4..5], &[GPIB_LLO]);
+    }
+
+    #[tokio::test]
+    async fn go_to_remote_asserts_ren_then_addresses() {
+        // ren(true) register write, then take control + command.
+        let t = MockTransport::new(vec![reg_write_ok(1), op_ok(), op_ok()]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.go_to_remote(23).await.unwrap();
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert_eq!(writes[0][0], NIUSB_REG_WRITE_ID, "REN first");
+        // REN only permits remote; being addressed to listen is the actual
+        // transition, which is what separates this from a plain assert.
+        assert_eq!(&writes[2][4..6], &[GPIB_UNL, listen_address(23)]);
     }
 
     /// Records every vendor control request, reporting whichever PID it is told.

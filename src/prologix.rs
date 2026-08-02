@@ -32,6 +32,12 @@ pub enum LineResult {
     DeviceClear {
         pad: u8,
     },
+    /// Send an addressed Go To Local to `pad` (`++loc`).
+    GoToLocal {
+        pad: u8,
+    },
+    /// Send Local Lockout to the whole bus (`++llo`).
+    LocalLockout,
     /// Pulse IFC.
     Ifc,
     /// Reset daemon GPIB state (not the instrument).
@@ -224,10 +230,21 @@ impl PrologixState {
                 Ok(pad) => LineResult::Trigger { pad },
                 Err(e) => LineResult::Error(e),
             },
-            // Accepted and ignored. None of these have a reply in the real
-            // Prologix firmware, so silence is not misleading — but ++llo/++loc
-            // are real bus operations we do not perform. See docs/ROADMAP.md.
-            "llo" | "loc" | "status" | "savecfg" => LineResult::Ok,
+            // ++llo — local lockout. Universal: the standard has no
+            // per-device form, so this disables the local key on every
+            // instrument on the bus, and dropping REN is what clears it.
+            "llo" => LineResult::LocalLockout,
+            // ++loc [pad] — return one instrument to front-panel control.
+            // Addressed, so unlike dropping REN it leaves the rest of the bus
+            // in remote. The next write to the instrument puts it back into
+            // remote, which is what the standard says happens.
+            "loc" => match parse_optional_pad(args, self.addr) {
+                Ok(pad) => LineResult::GoToLocal { pad },
+                Err(e) => LineResult::Error(e),
+            },
+            // Accepted and ignored: neither has a reply in the real Prologix
+            // firmware, so silence is not misleading. See docs/ROADMAP.md.
+            "status" | "savecfg" => LineResult::Ok,
             _ => LineResult::Error(format!("unknown command: {name}")),
         }
     }

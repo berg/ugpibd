@@ -115,6 +115,16 @@ async fn handle_connection(
                     warn!("gpib device_clear failed: {e:#}");
                 }
             }
+            LineResult::GoToLocal { pad } => {
+                if let Err(e) = ctrl.lock().await.go_to_local(pad).await {
+                    warn!("gpib go_to_local failed: {e:#}");
+                }
+            }
+            LineResult::LocalLockout => {
+                if let Err(e) = ctrl.lock().await.local_lockout().await {
+                    warn!("gpib local_lockout failed: {e:#}");
+                }
+            }
             LineResult::Ifc => {
                 if let Err(e) = ctrl.lock().await.ifc().await {
                     warn!("gpib ifc failed: {e:#}");

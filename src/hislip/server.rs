@@ -85,6 +85,21 @@ pub trait Device: Send + Sync + 'static {
     /// Drive REN on/off.
     async fn set_remote(&self, remote: bool) -> Result<()>;
 
+    /// Assert REN and address this instrument, putting it into remote state.
+    async fn go_to_remote(&self) -> Result<()> {
+        anyhow::bail!("this device cannot be addressed into remote state")
+    }
+
+    /// Send an addressed Go To Local to this instrument.
+    async fn go_to_local(&self) -> Result<()> {
+        anyhow::bail!("this device cannot be sent Go To Local")
+    }
+
+    /// Send Local Lockout, which the standard defines only bus-wide.
+    async fn local_lockout(&self) -> Result<()> {
+        anyhow::bail!("this device cannot be sent Local Lockout")
+    }
+
     /// Read the instrument's serial-poll status byte.
     ///
     /// No default: 0 is a meaningful status ("nothing to report"), so an
@@ -1178,27 +1193,39 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncRemoteLocalControl => {
-                // Control codes per HiSLIP §6.3, in the spec's own names:
-                // 0 disableRemote, 1 enableRemote, 2 disableAndGTL,
-                // 3 enableAndGotoRemote, 4 enableAndLockoutLocal,
-                // 5 enableAndGTRLLO, 6 justGTL.
+                // Control codes per HiSLIP §6.3, in the spec's own names,
+                // which line up one-to-one with VISA's RENLineOperation:
                 //
-                // Everything that enables remote drives REN, including 1. It
-                // used to be a no-op on the theory that "enable remote" says
-                // nothing about the line, which is wrong and expensive: it is
-                // what `viGpibControlREN(VI_GPIB_REN_ASSERT)` sends, so REN
-                // could be dropped and never put back. An instrument left in
-                // local is not just cosmetically wrong — an HP 34401A services
-                // the bus about twenty times slower while its front panel is
-                // live, which reads as the daemon being slow.
+                //   0 disableRemote          drop REN; every device goes local
+                //   1 enableRemote           assert REN, address nobody
+                //   2 disableAndGTL          GTL to this device, then drop REN
+                //   3 enableAndGotoRemote    assert REN and address this device
+                //   4 enableAndLockoutLocal  assert REN, then LLO
+                //   5 enableAndGTRLLO        assert REN, address, then LLO
+                //   6 justGTL                GTL to this device, REN untouched
                 //
-                // The GTL and lockout parts are approximated by REN alone:
-                // ugpibd has no addressed GTL or LLO (see docs/ROADMAP.md), so
-                // 2 and 6 return the device to local by dropping REN, which is
-                // a bigger hammer than GTL on a multi-device bus.
+                // Asserting REN only *permits* remote; a device enters it when
+                // addressed to listen, which is why 3 and 5 do more than 1.
+                // GTL is addressed, so 2 and 6 return this one instrument to
+                // its front panel rather than the whole bus. LLO is universal
+                // and has no per-device form — the standard offers none.
                 let res = match msg.control_code {
-                    0 | 2 | 6 => entry.device.set_remote(false).await,
-                    1 | 3..=5 => entry.device.set_remote(true).await,
+                    0 => entry.device.set_remote(false).await,
+                    1 => entry.device.set_remote(true).await,
+                    2 => match entry.device.go_to_local().await {
+                        Ok(()) => entry.device.set_remote(false).await,
+                        Err(e) => Err(e),
+                    },
+                    3 => entry.device.go_to_remote().await,
+                    4 => match entry.device.set_remote(true).await {
+                        Ok(()) => entry.device.local_lockout().await,
+                        Err(e) => Err(e),
+                    },
+                    5 => match entry.device.go_to_remote().await {
+                        Ok(()) => entry.device.local_lockout().await,
+                        Err(e) => Err(e),
+                    },
+                    6 => entry.device.go_to_local().await,
                     _ => {
                         send_nonfatal(
                             wr,

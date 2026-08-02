@@ -13,6 +13,16 @@ use super::gpib::Transport;
 use super::protocol::*;
 use super::Model;
 
+/// Render a packet as hex for the trace. The command bytes of a GPIB command
+/// live past the 8-byte framing header, so truncating the dump hides exactly
+/// the part worth reading — which of GTL, SDC or GET actually went out.
+fn hex(data: &[u8]) -> String {
+    data.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// How many service-request notifications to buffer. SRQ is a level, not a
 /// count: a subscriber that lags only needs to learn that *some* device
 /// requested service, so a small buffer is plenty and lagging is harmless.
@@ -216,7 +226,7 @@ impl Transport for UsbTransport {
     }
 
     async fn write_bulk(&self, data: &[u8]) -> Result<()> {
-        debug!(len = data.len(), first = ?&data[..data.len().min(8)], "bulk-out");
+        debug!(len = data.len(), packet = %hex(data), "bulk-out");
         let mut io = self.io.lock().await;
         io.out.submit(data.to_vec().into());
         let completion = io.out.next_complete().await;
@@ -250,11 +260,7 @@ impl Transport for UsbTransport {
             }
         }
 
-        debug!(
-            len = data.len(),
-            first = ?&data[..data.len().min(8)],
-            "bulk-in"
-        );
+        debug!(len = data.len(), packet = %hex(&data), "bulk-in");
         Ok(data)
     }
 
