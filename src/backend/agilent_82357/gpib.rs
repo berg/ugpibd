@@ -246,6 +246,28 @@ impl<T: Transport> GpibController<T> {
         self.send_command_bytes(&cmd).await
     }
 
+    /// Address `pad` as listener, which is the transition into remote state
+    /// while REN is asserted.
+    pub async fn go_to_remote(&mut self, pad: u8) -> Result<()> {
+        self.ren(true).await?;
+        let cmd = [GPIB_UNL, listen_address(pad)];
+        self.send_command_bytes(&cmd).await
+    }
+
+    /// Send Go To Local to `pad` (GTL, addressed as listener), returning that
+    /// one device to front-panel control without disturbing the rest of the
+    /// bus the way dropping REN would.
+    pub async fn go_to_local(&mut self, pad: u8) -> Result<()> {
+        let cmd = [GPIB_UNL, listen_address(pad), GPIB_GTL];
+        self.send_command_bytes(&cmd).await
+    }
+
+    /// Send Local Lockout (LLO). Universal, so it takes no address and applies
+    /// to every device on the bus.
+    pub async fn local_lockout(&mut self) -> Result<()> {
+        self.send_command_bytes(&[GPIB_LLO]).await
+    }
+
     /// Send Group Execute Trigger to `pad` (GET, addressed as listener).
     pub async fn trigger(&mut self, pad: u8) -> Result<()> {
         let cmd = [GPIB_UNL, listen_address(pad), GPIB_GET];
@@ -496,6 +518,15 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     }
     async fn trigger(&mut self, pad: u8) -> Result<()> {
         self.trigger(pad).await
+    }
+    async fn go_to_remote(&mut self, pad: u8) -> Result<()> {
+        self.go_to_remote(pad).await
+    }
+    async fn go_to_local(&mut self, pad: u8) -> Result<()> {
+        self.go_to_local(pad).await
+    }
+    async fn local_lockout(&mut self) -> Result<()> {
+        self.local_lockout().await
     }
     async fn ifc(&mut self) -> Result<()> {
         self.ifc().await
@@ -810,5 +841,47 @@ mod tests {
             cmd_payload(&writes[0]),
             [GPIB_UNL, listen_address(7), GPIB_SDC]
         );
+    }
+
+    #[tokio::test]
+    async fn go_to_local_is_addressed_to_the_listener() {
+        let t = MockTransport::new();
+        t.push_control(xfer_status(3));
+        let mut ctrl = GpibController::new(t, 3000);
+        ctrl.go_to_local(7).await.unwrap();
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        // GTL is an addressed command, so it acts only on this instrument —
+        // that is the whole point of it over dropping REN, which returns every
+        // device on the bus to local.
+        assert_eq!(
+            cmd_payload(&writes[0]),
+            [GPIB_UNL, listen_address(7), GPIB_GTL]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_lockout_is_universal_and_unaddressed() {
+        let t = MockTransport::new();
+        t.push_control(xfer_status(1));
+        let mut ctrl = GpibController::new(t, 3000);
+        ctrl.local_lockout().await.unwrap();
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        // LLO takes no address: IEEE-488 defines no per-device lockout, and
+        // addressing it would be inventing one.
+        assert_eq!(cmd_payload(&writes[0]), [GPIB_LLO]);
+    }
+
+    #[tokio::test]
+    async fn go_to_remote_asserts_ren_then_addresses() {
+        let t = MockTransport::new();
+        t.push_response(wr_regs_ok()); // ren(true)
+        t.push_control(xfer_status(2));
+        let mut ctrl = GpibController::new(t, 3000);
+        ctrl.go_to_remote(7).await.unwrap();
+        let writes = ctrl.transport.written.lock().unwrap().clone();
+        // REN only permits remote; the listen address is what performs the
+        // transition, so both are needed and in this order.
+        assert_eq!(writes[0][0], BulkCmd::WrRegs as u8);
+        assert_eq!(cmd_payload(&writes[1]), [GPIB_UNL, listen_address(7)]);
     }
 }

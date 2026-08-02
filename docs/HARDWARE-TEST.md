@@ -150,8 +150,8 @@ released `pyvisa-py` cannot, so use a build whose HiSLIP backend implements it.
 If the log instead says `srq raised by another device on the bus`, the poll
 came back without RQS: the SRQ was someone else's, which is exactly the case
 the forwarder is meant to filter out. `adapter cannot report SRQ` means the
-backend has no notification path — currently true of the NI adapter, which can
-read the SRQ line for `++srq` but has no asynchronous path.
+backend has no notification path at all — no supported adapter is in that state
+now that both the NI GPIB-USB-HS and the 82357B report SRQ asynchronously.
 
 ## Test 8: Timeout and bus recovery
 
@@ -181,6 +181,31 @@ The daemon deliberately does not try to tidy up the adapter on this path — eve
 transfer would fail, and warning about failing to reset hardware that has been
 removed is only noise.
 
+## Test 10: Go To Local and Local Lockout
+
+**Not yet run on 82357A/82357B.** The command bytes are pinned by unit tests on
+both backends and were read off the wire on an NI GPIB-USB-HS, but the
+front-panel effect — the only part that proves the instrument obeyed — has not
+been watched on the Agilent hardware. Do this one when an 82357 is attached.
+
+Unlike REN, these are per-device (GTL) and bus-wide (LLO), so watch the panel
+rather than the daemon log.
+
+1. `++ren 1`, then any query, so the instrument is in remote: RMT lit.
+2. `++loc` — RMT should go dark while REN stays asserted. This is the part
+   dropping REN cannot do: other instruments on the bus stay in remote.
+3. Query it again. RMT should come back on by itself. That is correct, not a
+   bug: addressing a device to listen while REN is asserted returns it to
+   remote, so GTL only survives until the next write.
+4. `++ren 1`, then `++llo`. RMT stays lit. Now press the instrument's
+   LOCAL/SHIFT key: it should do nothing. This is what REN alone could never
+   do.
+5. `++ren 0`. The keys come back. Dropping REN is the only way to clear a
+   lockout — IEEE-488 defines no un-LLO command.
+
+Over HiSLIP the same paths are reached through `viGpibControlREN` with
+`VI_GPIB_REN_ADDRESS_GTL` (6) and `VI_GPIB_REN_ASSERT_LLO` (4).
+
 ## Optional: Prologix front-end
 
 The Prologix-compatible port is disabled unless `--enable-prologix` is passed.
@@ -198,14 +223,16 @@ exercises both front-ends and reports any mismatch between them.
   twice, including once after an unplug/replug mid-session. A soak of 300 short
   queries, 20 long reads, and 30 session open/closes completed with no
   failures.
-- **NI GPIB-USB-HS** + SR620 at PAD 16. Note this adapter has no asynchronous
-  SRQ path, so Test 7 does not apply to it.
+- **NI GPIB-USB-HS** + SR620 at PAD 16, and + HP 34401A at PAD 23 on macOS:
+  HiSLIP conformance and the `hislip-stress` suite pass, including SRQ push and
+  MAV-driven service requests.
 
-Known gap: when two instruments assert SRQ at almost the same moment, the
-second one's request can be missed. SRQ is a wired-OR line and the adapter
-notifies on a transition, so a device that asserts while the line is already
-low produces no new edge. Handling this needs a level read of the SRQ line
-(`srq_asserted`), which the 82357 backend does not yet implement.
+Two instruments asserting SRQ at almost the same moment used to lose the
+second request: SRQ is a wired-OR line and the adapter notifies on a
+transition, so a device asserting while the line is already low produces no new
+edge. The forwarder now re-polls while the line stays asserted, using the level
+read `srq_asserted`, which both backends implement. Worth re-checking on a
+two-instrument bus after any change to the SRQ path.
 
 ## A note on VISA clients
 

@@ -106,10 +106,12 @@ pub const ADMR_DISABLE_SAD: u8 = 0x31; // HR_TRM0 | HR_TRM1 | HR_ADM0
 
 // ---- GPIB command bytes (ATN true) -----------------------------------------
 
+pub const GPIB_GTL: u8 = 0x01; // go to local (addressed)
 pub const GPIB_SDC: u8 = 0x04; // selected device clear
 pub const GPIB_GET: u8 = 0x08; // group execute trigger
 pub const GPIB_SPE: u8 = 0x18; // serial poll enable
 pub const GPIB_SPD: u8 = 0x19; // serial poll disable
+pub const GPIB_LLO: u8 = 0x11; // local lockout (universal)
 pub const GPIB_UNL: u8 = 0x3f; // unlisten
 pub const GPIB_UNT: u8 = 0x5f; // untalk
 

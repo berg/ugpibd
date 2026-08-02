@@ -55,6 +55,31 @@ pub trait GpibBackend: Send + Sync {
     /// Assert or deassert Remote Enable.
     async fn ren(&mut self, enable: bool) -> Result<()>;
 
+    /// Address the instrument at `pad` as listener, which is what puts it into
+    /// remote state while REN is asserted.
+    ///
+    /// Addressing alone does it — REN gates the transition, the listen address
+    /// triggers it — so this is `ren(true)` plus an addressing sequence, and is
+    /// how `viGpibControlREN(VI_GPIB_REN_ASSERT_ADDRESS)` differs from a plain
+    /// assert.
+    async fn go_to_remote(&mut self, pad: u8) -> Result<()>;
+
+    /// Send Go To Local (GTL) to the instrument at `pad`, returning that one
+    /// device to front-panel control.
+    ///
+    /// Addressed, unlike dropping REN, which returns *every* device on the bus
+    /// to local. Note the effect is undone by the next write to the device:
+    /// addressing it as a listener with REN still asserted puts it straight
+    /// back into remote, which is the standard's behaviour and not a bug here.
+    async fn go_to_local(&mut self, pad: u8) -> Result<()>;
+
+    /// Send Local Lockout (LLO), disabling the front-panel local key on every
+    /// device on the bus.
+    ///
+    /// Universal, so it takes no address: the standard offers no per-device
+    /// lockout. Cleared by dropping REN.
+    async fn local_lockout(&mut self) -> Result<()>;
+
     /// Serial-poll the instrument at `pad` and return its status byte. This
     /// backs both the Prologix `++spoll` and the HiSLIP `get_status` operation.
     ///

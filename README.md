@@ -292,8 +292,8 @@ status byte, that poll clears RQS at the instrument, so a client reading the
 status byte itself would find the bit already taken. The daemon hands over what
 it consumed on the next `AsyncStatusQuery`, once.
 
-This needs an adapter that can report SRQ. The NI GPIB-USB-HS can; the 82357B
-cannot yet (see `docs/ROADMAP.md`).
+This needs an adapter that can report SRQ asynchronously, which both the NI
+GPIB-USB-HS and the 82357B do.
 
 ### Prologix (legacy)
 
@@ -353,16 +353,22 @@ The following applies to the **Prologix** server (port 1234), not the
 
 Implemented: `++addr`, `++auto`, `++read`, `++eoi`, `++eos`, `++eot_enable`,
 `++eot_char`, `++read_tmo_ms`, `++clr`, `++ifc`, `++rst`, `++ver`, `++mode`,
-`++spoll [pad]`, `++trg [pad]`, `++srq`.
+`++spoll [pad]`, `++trg [pad]`, `++srq`, `++loc [pad]`, `++llo`.
 
 `++srq` reads the live SRQ line, so it needs a backend that can report bus
 state; on adapters that cannot (currently everything except `ni-usb-hs`) it
 logs a warning and returns nothing rather than inventing a "0".
 
-Accepted and ignored: `++llo`, `++loc`, `++savecfg`, `++status`.
+`++loc` sends an addressed Go To Local, so it returns one instrument to its
+front panel and leaves the rest of the bus in remote — but the next write to
+that instrument addresses it again and puts it straight back into remote, which
+is what IEEE-488 says happens. `++llo` sends Local Lockout, which is universal:
+it disables the local key on every device on the bus, and dropping REN is the
+only way to clear it.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining gaps, including
-asynchronous SRQ notification.
+Accepted and ignored: `++savecfg`, `++status`.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining gaps.
 
 ## Hardware limitations (firmware)
 
