@@ -183,10 +183,18 @@ removed is only noise.
 
 ## Test 10: Go To Local and Local Lockout
 
-**Not yet run on 82357A/82357B.** The command bytes are pinned by unit tests on
-both backends and were read off the wire on an NI GPIB-USB-HS, but the
-front-panel effect — the only part that proves the instrument obeyed — has not
-been watched on the Agilent hardware. Do this one when an 82357 is attached.
+**The front-panel half of this is the only part still owed.** The command bytes
+are pinned by unit tests on both backends and have been read off the wire on an
+NI GPIB-USB-HS *and* an 82357B — `UNL LAD<pad> GTL` addressed, a bare
+unaddressed `LLO` — so the encoding and addressing are confirmed on both. What
+nobody has watched is the instrument obeying.
+
+Do not try to substitute a host-side measurement for the panel; it was tried and
+does not work. A 34401A in local services *queries* about twelve times slower,
+but serial polls are answered below the SCPI layer and run at ~500/s either way,
+and any query re-addresses the instrument as a listener, which returns it to
+remote and erases the evidence before it can be timed. Watching the annunciator
+is the measurement.
 
 Unlike REN, these are per-device (GTL) and bus-wide (LLO), so watch the panel
 rather than the daemon log.
@@ -223,6 +231,11 @@ exercises both front-ends and reports any mismatch between them.
   twice, including once after an unplug/replug mid-session. A soak of 300 short
   queries, 20 long reads, and 30 session open/closes completed with no
   failures.
+- **82357B** (`0957:0518` cold) + HP 34401A at PAD 23 and HP 53132A at PAD 3, on
+  macOS: firmware uploaded from cold, including the documented double-upload
+  retry. HiSLIP conformance 25/25 and all 9 `hislip-stress` scripts pass,
+  covering locking, MAV-driven service requests and the remote/local codes.
+  GTL and LLO reach the bus with the same command bytes as the NI adapter.
 - **NI GPIB-USB-HS** + SR620 at PAD 16, and + HP 34401A at PAD 23 on macOS:
   HiSLIP conformance and the `hislip-stress` suite pass, including SRQ push and
   MAV-driven service requests.
