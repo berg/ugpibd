@@ -69,6 +69,20 @@ of the bus is slow and tells you nothing the front panel doesn't.
 
 2. Confirm every reading arrives and parses — 200 comma-separated values,
    roughly 3.2 KB.
+3. For anything that compares two reads of the same query — HiSLIP chunking,
+   the partial-read state machine, the stress suite's `--big-query` — use
+   `INIT` once and then `FETC?` rather than `READ?`. `READ?` takes a fresh
+   measurement each time, so the reply is a different 3.2 KB on every call and
+   a comparison against a reference fails for reasons that have nothing to do
+   with the transport. `FETC?` returns the stored readings and repeats exactly.
+
+   ```bash
+   # once, to fill the instrument's reading memory
+   printf '*RST\nCONF:VOLT:DC 10\nVOLT:DC:NPLC 0.02\nSAMP:COUN 200\nINIT\n' \
+     | ugpibd-scpi --addr <PAD>
+   # then, repeatably
+   ./run_all.sh --big-query 'FETC?' -t 30000 -r <resource>
+   ```
 
 ## Test 5: Trigger, device clear, and REN
 
@@ -244,6 +258,14 @@ exercises both front-ends and reports any mismatch between them.
   twice, including once after an unplug/replug mid-session. A soak of 300 short
   queries, 20 long reads, and 30 session open/closes completed with no
   failures.
+- **NI GPIB-USB-HS+** (`3923:7618`, serial `01A87F99`) + HP 34401A at PAD 23 and
+  HP 53132A at PAD 3, on macOS: first bring-up of this adapter, and it needed no
+  code changes. HiSLIP conformance 28/28 and all 9 `hislip-stress` scripts pass,
+  five daemon start/stop cycles each re-initialising on the first attempt, and
+  3.2 KB transfers including the partial-read state machine at 1, 7, 64 and 997
+  bytes at a time. This is also the first adapter on which HiSLIP chunking was
+  checked against a real instrument rather than a unit test — see Test 4 for the
+  `FETC?` recipe that makes that possible.
 - **82357B** (`0957:0518` cold) + HP 34401A at PAD 23 and HP 53132A at PAD 3, on
   macOS: firmware uploaded from cold, including the documented double-upload
   retry. HiSLIP conformance 25/25 and all 9 `hislip-stress` scripts pass,

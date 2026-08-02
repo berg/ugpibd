@@ -522,7 +522,11 @@ impl NiTransport for NiUsbTransport {
 /// `ni_usb_hs_plus_extra_init`. Three vendor reads whose replies the kernel only
 /// sanity-checks, so we log mismatches rather than failing.
 ///
-/// UNTESTED: no HS+ hardware was available: this is a direct translation.
+/// Verified on a GPIB-USB-HS+ (serial 01A87F99). The LED and interface-recipient
+/// replies come back exactly as the kernel driver expects; the first request
+/// answers `48 cd 75 00 ...` where the driver's example shows `48 f3 30 00 ...`,
+/// so only byte 0 — the echoed request id — is worth checking, which is all
+/// either driver does.
 pub async fn hs_plus_extra_init<T: NiTransport>(transport: &T) -> Result<()> {
     // Expected: 48 f3 30 00 00 ...
     let reply = transport.control_in(0x48, 0x0, 0x0, 16).await?;
