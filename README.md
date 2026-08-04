@@ -1,88 +1,42 @@
 # ugpibd
 
 Userspace Rust daemon for USB-to-GPIB adapters that otherwise need an
-out-of-tree kernel driver. Exposes two TCP front-ends against the same bus:
-
-- **Prologix-compatible** ASCII protocol on port 1234 (opt-in via `--enable-prologix`)
-- **HiSLIP** (IVI-6.1) on port 4880 (the IANA-assigned HiSLIP port)
-
-Use HiSLIP with pyvisa/NI-VISA for proper `TCPIP::...::INSTR` resource
-strings with locking, clear, trigger, and REN. Use the Prologix port for
-existing scripts written against `prologix-gpib-async` or raw sockets.
+out-of-tree kernel driver. It exposes the bus over **HiSLIP** (IVI-6.1) on port
+4880, so pyvisa and NI-VISA reach it with an ordinary `TCPIP::...::INSTR`
+resource string — with locking, clear, trigger, REN, and SRQ. A
+Prologix-compatible port is available for older scripts.
 
 ## Supported adapters
 
-The adapter is selected with `--backend` (default `auto`, which detects a
-single connected adapter by USB VID/PID). Run `ugpibd --backend list` to see
-the ids.
-
-| Backend id | Adapter | Status |
+| Backend id | Adapter | USB id |
 |------------|---------|--------|
-| `agilent-82357b` | Agilent/Keysight 82357B (USB `0957:0518` → `0957:0718` after firmware) | Supported |
-| `agilent-82357a` | Agilent 82357A (USB `0957:0007` → `0957:0107` after firmware) | Supported — firmware is bundled and uploaded automatically |
-| `ni-usb-hs` | NI GPIB-USB-HS (USB `3923:709b`) | Supported |
-| `ni-usb-hs` | KUSB-488A (`3923:725c`), MC-USB-488 (`3923:725d`) | Untested, but byte-for-byte the same code path as the GPIB-USB-HS |
-| `ni-usb-hs` | NI GPIB-USB-HS+ (`3923:7618`) | Supported — different endpoints and an extra vendor-request init, both verified on hardware |
+| `agilent-82357b` | Agilent/Keysight 82357B | `0957:0518` → `0957:0718` |
+| `agilent-82357a` | Agilent 82357A | `0957:0007` → `0957:0107` |
+| `ni-usb-hs` | NI GPIB-USB-HS | `3923:709b` |
+| `ni-usb-hs` | NI GPIB-USB-HS+ | `3923:7618` |
+| `ni-usb-hs` | KUSB-488A | `3923:725c` |
+| `ni-usb-hs` | MC-USB-488 | `3923:725d` |
 
-### Multiple adapters
+The second USB id is what the adapter enumerates as once ugpibd has uploaded
+its firmware, which it does automatically. KUSB-488A and MC-USB-488 are
+untested, but take the same code path as the GPIB-USB-HS.
 
-With one adapter attached, `auto` just works. When several are present, list
-them and pick one by its physical USB port:
-
-```bash
-$ ugpibd --list
-#   backend          vid:pid    port           serial             product
-0   agilent-82357b   0957:0718  1-1.1          (none)             82357B
-1   agilent-82357b   0957:0718  1-1.2          (none)             82357B
-
-$ ugpibd --usb-port 1-1.2
-```
-
-The **port id** identifies the physical socket, not the unit: on Linux it is the
-sysfs name (`1-1.2`), on macOS the IOKit location id (`0x03440000`). It is stable
-across replug into the same port and across firmware reload. Serial numbers are
-shown for reference only — this hardware's serials are not reliably unique, so
-they are never used to select an adapter.
-
-## Requirements
-
-- Linux (Ubuntu 22.04+, Debian 12+, or 64-bit Raspberry Pi OS) or macOS 12+
-- A supported USB-GPIB adapter (see above)
-- Rust 1.75+ to build from source
+The adapter is picked with `--backend`; the default, `auto`, detects a single
+connected adapter by USB id.
 
 ## Install
 
-Installing gets you two binaries — the `ugpibd` daemon and the `ugpibd-scpi`
-client. The Linux packages additionally set up udev rules for adapter access,
-systemd units, and `/etc/default/ugpibd`.
+You get two binaries: the `ugpibd` daemon and the `ugpibd-scpi` client. The apt
+package also installs udev rules for adapter access, a systemd unit, and
+`/etc/default/ugpibd`.
 
-### Homebrew (macOS and Linux)
+**macOS 12+ and Linux — Homebrew:**
 
 ```bash
 brew install berg/ugpibd/ugpibd
 ```
 
-One command is enough: the fully qualified name taps
-[berg/homebrew-ugpibd](https://github.com/berg/homebrew-ugpibd) automatically,
-and trusts this formula alone rather than the whole tap. The formula installs
-prebuilt binaries straight from the release tarballs, so there is nothing to
-compile.
-
-Later releases arrive with `brew upgrade`. Note that the *short* name is not
-trusted, so `brew install ugpibd` and `brew upgrade ugpibd` will not resolve —
-use the qualified name, or opt in once:
-
-```bash
-brew trust --formula berg/ugpibd/ugpibd
-```
-
-Homebrew installs the binaries only — no udev rules, no systemd unit. On Linux
-that means you either run the daemon as a user with access to the adapter, or use
-the apt packages below, which wire all of that up.
-
-### Debian / Ubuntu / Raspberry Pi OS (apt)
-
-Add the repository and install, in one command:
+**Debian 12+ / Ubuntu 22.04+ / 64-bit Raspberry Pi OS — apt:**
 
 ```bash
 sudo install -d /etc/apt/keyrings \
@@ -94,83 +48,66 @@ sudo install -d /etc/apt/keyrings \
   && sudo apt install -y ugpibd
 ```
 
-That fetches the signing key into `/etc/apt/keyrings/`, registers the repository
-with `signed-by=` so the key is trusted for this repository only — never
-system-wide, which is what the deprecated `apt-key add` used to do — and
-installs the daemon. Upgrades then arrive through `apt upgrade` as normal.
-
-Afterwards:
-
-```bash
-ugpibd --list          # is the adapter visible?
-sudo systemctl start ugpibd
-```
-
-Packages depend only on glibc 2.34+, so they install on Ubuntu 22.04+ and
-Debian 12+. Every published release stays in the pool, so you can pin or roll
-back:
-
-```bash
-apt list -a ugpibd                 # versions available
-sudo apt install ugpibd=<version>  # pin one
-```
-
-Package list and the deb822 (`.sources`) form of the setup:
-<https://berg.github.io/ugpibd/>
-
-**Raspberry Pi:** use 64-bit Raspberry Pi OS, Bookworm or later — check with
-`dpkg --print-architecture`, which should report `arm64`. The only
-shared-library dependency is glibc, since the USB layer is pure Rust with no
-libusb. There is no `armhf` package, so 32-bit Pi OS needs a build from source.
-
-The daemon package is all you need. If a kernel GPIB driver turns out to be
-claiming your adapter, there is a separate opt-in package for that — see [If the
-kernel driver interferes](#if-the-kernel-driver-interferes-linux).
-
-**The service does not start on its own** — see [Running as a
-service](#running-as-a-service) below.
-
-### Single .deb
-
-If you would rather not add a repository, the `.deb` files are attached to every
-[release](https://github.com/berg/ugpibd/releases/latest):
-
-```bash
-sudo apt install ./ugpibd_*_amd64.deb
-```
-
-Use `apt install ./…` rather than `dpkg -i`, so dependencies are resolved. The
-optional `ugpibd-blacklist-linux-gpib_*_all.deb` is attached to the same release.
-
-### From source
+**From source** (Rust 1.75+):
 
 ```bash
 cargo build --release
 sudo cp contrib/60-ugpibd.rules /usr/lib/udev/rules.d/
 sudo groupadd -f ugpibd && sudo usermod -aG ugpibd "$USER"
 sudo udevadm control --reload-rules && sudo udevadm trigger
-./target/release/ugpibd
 ```
 
-The rules file sets `GROUP="ugpibd"` and tags the device `uaccess`, so the user
-at the local console gets access without being in that group. Log out and back
-in after `usermod` for remote or non-console sessions.
-
-## Quick Start
+Then check the adapter is visible and start the daemon:
 
 ```bash
+ugpibd --list
 ugpibd
 ```
 
-By default the daemon binds to `127.0.0.1` and runs only the HiSLIP
-front-end. Pass `--bind 0.0.0.0` (or a specific interface address) for
-remote access, and `--enable-prologix` to also expose the Prologix port.
+It binds `127.0.0.1` and serves HiSLIP only. Use `--bind 0.0.0.0` for remote
+access, `--enable-prologix` for the Prologix port, and `RUST_LOG=ugpibd=debug`
+for protocol tracing.
 
-For protocol-level tracing:
+## PyVISA
+
+```python
+import pyvisa
+rm = pyvisa.ResourceManager("@py")
+inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")  # 15 = GPIB primary address
+print(inst.query("*IDN?"))
+```
+
+The sub-address carries the GPIB primary address and may be written
+`hislip<N>`, `gpib<N>`, or bare `<N>`; `hislip0` means the daemon's
+`--default-address`. Locking, service requests, and the rest of the HiSLIP
+semantics are in [docs/HISLIP.md](docs/HISLIP.md).
+
+## `ugpibd-scpi`
+
+A REPL bundled with the daemon, speaking the same HiSLIP transport pyvisa uses.
 
 ```bash
-RUST_LOG=ugpibd=debug ugpibd
+ugpibd-scpi --addr 15                      # instrument at GPIB address 15
+ugpibd-scpi --host bench-pi --port 4880    # no --addr: daemon's default PAD
+printf '++ren 1\n*RST\n*IDN?\n' | ugpibd-scpi --addr 15
 ```
+
+A line containing `?` is sent as a query and its reply printed; any other line
+is written without reading. The address is fixed for the session.
+
+| Command | Action |
+|---------|--------|
+| `++clr` | Selected Device Clear |
+| `++trg` | GPIB trigger (GET) |
+| `++ren <0\|1>` | REN off / on |
+| `++status` | print the serial-poll status byte |
+| `++help` | list meta-commands |
+
+## Prologix
+
+`--enable-prologix` adds a Prologix GPIB-USB-compatible ASCII server on port
+1234 for scripts written against `prologix-gpib-async` or raw sockets. Supported
+`++` commands and their quirks: [docs/PROLOGIX.md](docs/PROLOGIX.md).
 
 ## Running as a service
 
@@ -200,9 +137,24 @@ not set, that unit exits cleanly rather than failing, so nothing accumulates in
 `systemctl --failed`. Startup on plug also covers adapters already attached at
 boot, since udev re-emits their `add` events during early boot.
 
-With more than one adapter attached, `auto` detection is ambiguous — pin one
-with `--usb-port` (from `ugpibd --list`) in `UGPIBD_OPTS`. One service instance
-drives one adapter.
+## Multiple adapters
+
+With one adapter attached, `auto` just works. When several are present, list
+them and pick one by its physical USB port:
+
+```bash
+$ ugpibd --list
+#   backend          vid:pid    port           serial             product
+0   agilent-82357b   0957:0718  1-1.1          (none)             82357B
+1   agilent-82357b   0957:0718  1-1.2          (none)             82357B
+
+$ ugpibd --usb-port 1-1.2
+```
+
+The port id identifies the physical socket, not the unit: on Linux the sysfs
+name (`1-1.2`), on macOS the IOKit location id (`0x03440000`). It is stable
+across replug into the same port and across firmware reload. One service
+instance drives one adapter, so put `--usb-port` in `UGPIBD_OPTS`.
 
 ## If the kernel driver interferes (Linux)
 
@@ -230,151 +182,6 @@ lock you out of linux-gpib. Note that blacklisting `ni_usb_gpib` also disables
 the kernel driver for the NI GPIB-USB-B, which ugpibd does **not** support —
 module granularity is coarser than device granularity, so it cannot be
 exempted.
-
-## PyVISA usage
-
-### HiSLIP (recommended)
-
-```python
-import pyvisa
-rm = pyvisa.ResourceManager("@py")
-# Sub-address encodes the GPIB primary address: "hislip<PAD>".
-inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")
-print(inst.query("*IDN?"))
-```
-
-The HiSLIP server accepts sub-addresses of the form `hislip<N>`,
-`gpib<N>`, or a bare `<N>`. A bare `hislip0` / `gpib0` means "use the
-daemon's configured default PAD" (`--default-address`, default 0).
-
-Why no comma in the sub-address: pyvisa-py parses
-`hislip0,15` as `sub_address=hislip0, port=15` — it would try to open
-TCP port 15 rather than passing 15 through to the server. Embedding the
-PAD in the sub-address itself (`hislip15`) avoids that.
-
-#### Locking
-
-`viLock` / `viUnlock` are enforced, not advisory. An exclusive lock (empty lock
-string) is granted only when nobody else holds anything; a shared lock is
-granted to everyone using the same lock string. A request that conflicts waits
-out the timeout the caller asked for before being refused.
-
-While a lock is held, another client's reads, writes, triggers and device
-clears are **left unprocessed until the lock frees**, rather than interleaved
-or refused. That is what the spec calls for — HiSLIP has no "resource locked"
-message and none is to be invented — so a locked-out client blocks and, if it
-runs out of patience, times out. Its status queries, lock info and maximum
-message size still work, which is how it can find out what is going on.
-
-Locks nest, they are scoped to the instrument rather than the bus — locking
-`hislip23` leaves `hislip3` free — and they are released when the session
-closes, so a client that crashes holding one does not lock the instrument out.
-
-#### Service requests
-
-`viWaitOnEvent(VI_EVENT_SERVICE_REQ)` works, including for requests that depend
-on MAV. Those need help, because HiSLIP has no read request — the server pushes
-replies — so a GPIB bridge must drain the instrument's output queue on its own
-initiative, and that read is exactly what clears MAV. Nothing looking afterwards
-would ever see it.
-
-The daemon watches the SRQ line across its own read rather than trying to
-second-guess the instrument. Nothing parses `*SRE` out of the traffic: applying
-that mask is the instrument's job, and a sniffed copy would be a cache with no
-invalidation — blind to the front panel, to another controller on the bus, to
-`*PSC`, and to the several NRf spellings of the same number. So if the
-instrument pulled SRQ, there is a service request; if it did not, there is not.
-With `*SRE 16` set, the classic `write(query)` → wait for SRQ → `read()` idiom
-works here as it does against a native HiSLIP instrument.
-
-One consequence worth knowing: when the daemon serial-polls to fill in the
-status byte, that poll clears RQS at the instrument, so a client reading the
-status byte itself would find the bit already taken. The daemon hands over what
-it consumed on the next `AsyncStatusQuery`, once.
-
-This needs an adapter that can report SRQ asynchronously, which both the NI
-GPIB-USB-HS and the 82357B do.
-
-### Prologix (legacy)
-
-```python
-import pyvisa
-rm = pyvisa.ResourceManager("@py")
-inst = rm.open_resource(
-    "TCPIP::localhost::1234::SOCKET",
-    read_termination="\n",
-    write_termination="\n",
-)
-inst.write("++mode 1")
-inst.write("++addr 15")
-inst.write("++auto 1")
-print(inst.query("*IDN?"))
-```
-
-## Interactive `ugpibd-scpi` client
-
-`ugpibd-scpi` is a small REPL bundled with the daemon. It speaks **HiSLIP** to
-`ugpibd` (the same transport pyvisa uses), so it does not need the Prologix
-port.
-
-```bash
-# Talk to the instrument at GPIB primary address 15:
-ugpibd-scpi --addr 15
-# Or omit --addr to use the daemon's default PAD (sub-address hislip0):
-ugpibd-scpi --host bench-pi --port 4880
-```
-
-Each line is a request/response round-trip: a line containing `?` is sent as
-a query and its reply is printed; any other line is written without reading.
-`--addr N` is encoded as the HiSLIP sub-address `hislip<N>` at connect time;
-the address is fixed for the session.
-
-Meta-commands map to HiSLIP control operations:
-
-| Command | Action |
-|---------|--------|
-| `++clr` | Selected Device Clear |
-| `++trg` | GPIB trigger (GET) |
-| `++ren <0\|1>` | REN off / on |
-| `++status` | print the serial-poll status byte |
-| `++help` | list meta-commands |
-
-Non-TTY stdin is supported for scripting:
-
-```bash
-printf '++ren 1\n*RST\n*IDN?\n' | ugpibd-scpi --addr 15
-```
-
-## Supported `++` commands
-
-The following applies to the **Prologix** server (port 1234), not the
-`ugpibd-scpi` client above.
-
-
-Implemented: `++addr`, `++auto`, `++read`, `++eoi`, `++eos`, `++eot_enable`,
-`++eot_char`, `++read_tmo_ms`, `++clr`, `++ifc`, `++rst`, `++ver`, `++mode`,
-`++spoll [pad]`, `++trg [pad]`, `++srq`, `++loc [pad]`, `++llo`.
-
-`++srq` reads the live SRQ line, so it needs a backend that can report bus
-state; on adapters that cannot (currently everything except `ni-usb-hs`) it
-logs a warning and returns nothing rather than inventing a "0".
-
-`++loc` sends an addressed Go To Local, so it returns one instrument to its
-front panel and leaves the rest of the bus in remote — but the next write to
-that instrument addresses it again and puts it straight back into remote, which
-is what IEEE-488 says happens. `++llo` sends Local Lockout, which is universal:
-it disables the local key on every device on the bus, and dropping REN is the
-only way to clear it.
-
-Accepted and ignored: `++savecfg`, `++status`.
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining gaps.
-
-## Hardware limitations (firmware)
-
-- Controller-only (no device mode — `++mode 0` returns an error)
-- No secondary addressing
-- 8-bit EOS comparison only
 
 ## Origin and relationship to linux-gpib
 
