@@ -348,10 +348,42 @@ impl<T: Transport> GpibController<T> {
         self.transport.write_bulk(&pkt).await?;
 
         let started = std::time::Instant::now();
-        let read_fut = self.transport.read_bulk(max_len + 1);
+        let mut read_fut = Box::pin(self.transport.read_bulk(max_len + 1));
         let timeout = std::time::Duration::from_millis(self.timeout_ms as u64);
-        match tokio::time::timeout(timeout, read_fut).await {
-            Ok(Ok(raw)) => {
+        let mut salvaged = false;
+        let outcome = match tokio::time::timeout(timeout, read_fut.as_mut()).await {
+            Ok(r) => Some(r),
+            Err(_) if self.listen_only => {
+                // A capture read times out on every quiet interval by design —
+                // but everything the armed read has collected so far is
+                // buffered inside the in-flight transfer, and dropping the
+                // future discards it. Measured: an entire print collected at
+                // full speed and thrown away here is indistinguishable from
+                // "no bytes ever arrived", which is exactly the §14.15
+                // mystery. So on timeout, abort the *adapter* side: the
+                // firmware ends the transfer with a trailing flags byte,
+                // which completes the still-pending host read with the data.
+                let flush = self
+                    .transport
+                    .control_in(CONTROL_REQUEST, XFER_ABORT, XA_FLUSH, 2)
+                    .await;
+                if let Err(e) = &flush {
+                    tracing::debug!("capture timeout: abort request failed: {e:#}");
+                }
+                salvaged = true;
+                tokio::time::timeout(std::time::Duration::from_millis(1000), read_fut.as_mut())
+                    .await
+                    .ok()
+            }
+            Err(_) => None,
+        };
+        drop(read_fut);
+        if salvaged {
+            // Finalize the abort so the next read starts from a clean engine.
+            let _ = self.abort(false).await;
+        }
+        match outcome {
+            Some(Ok(raw)) => {
                 let (data, eom, trailing) = decode_gpib_read_response(&raw);
                 // The trailing byte is the discriminator docs/CAPTURE.md §14.18
                 // was missing: UNADDRESSED arriving *immediately* means the
@@ -374,11 +406,11 @@ impl<T: Transport> GpibController<T> {
                 }
                 Ok((data, eom))
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 self.recover_from_stall().await;
                 Err(e)
             }
-            Err(_) => {
+            None => {
                 // Do NOT pulse IFC while capturing. `recover_from_stall` ends
                 // with an interface clear, which is right for a wedged
                 // addressed transfer and catastrophic for a capture: a read
@@ -388,20 +420,11 @@ impl<T: Transport> GpibController<T> {
                 // This is `docs/CAPTURE.md` §4.1, observed rather than
                 // predicted: on the 82357 it silently destroyed every capture.
                 if self.listen_only {
+                    // The salvage above already asked the adapter to abort and
+                    // the transfer still never completed; clean up the pipe.
                     let _ = self.abort(true).await;
                     let _ = self.abort(false).await;
                     self.transport.drain_write_complete().await;
-                    // Resynchronise the bulk pipe. `tokio::time::timeout`
-                    // above *drops* the in-flight read rather than waiting for
-                    // it, so the adapter's response to the abandoned transfer
-                    // arrives afterwards with nobody expecting it — and the
-                    // next read consumes it as data. The symptom is a lone
-                    // `0xfb` in the capture stream, which is this adapter's
-                    // own WR_REGS response code, not instrument bytes.
-                    //
-                    // A capture read times out by design on every quiet
-                    // interval, so without this the pipe desynchronises within
-                    // seconds of entering the mode.
                     self.transport.drain_bulk_in().await;
                 } else {
                     self.recover_from_stall().await;
@@ -476,18 +499,19 @@ impl<T: Transport> GpibController<T> {
         Ok(self.bus_lines().await?.srq)
     }
 
-    /// Enter or leave unaddressed-listen. **Not yet verified against an
-    /// instrument on this adapter.**
+    /// Enter or leave unaddressed-listen. **Verified on hardware**: an HP
+    /// 53310A print captured complete through an 82357B (a well-formed PCL
+    /// page, same format as the NI fixture).
     ///
-    /// The chip reaches the right state — `0x21 NDAC REN`, a genuinely ready
-    /// listener, better than the NI manages — but no capture has yet collected
-    /// bytes. `docs/CAPTURE.md` §14.15 records four theories tried and refuted
-    /// at the bench; §14.18 records what studying the adapter then found: it
-    /// refuses reads unless it considers itself a listener, it tracks that
-    /// state from the command bytes it transmits, a refused read is reported
-    /// as an *immediate* empty response trailed by `ATRF_UNADDRESSED`, and
-    /// until now that byte was discarded, so "refused" and "quiet bus" were
-    /// indistinguishable.
+    /// It took three faults to get here, each masking the next —
+    /// `docs/CAPTURE.md` §14.18-§14.19 tell the story. In short: the adapter
+    /// refuses reads unless it considers itself a listener (tracked from the
+    /// command bytes it transmits, reported only via a trailing
+    /// `ATRF_UNADDRESSED` this backend used to discard); the chip needs
+    /// holdoff-on-all or it free-runs the acceptor handshake and discards
+    /// every byte while the talker sees a perfect listener; and the read
+    /// timeout path abandoned the in-flight transfer with the collected data
+    /// buffered inside it.
     pub async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
         // Ordering is the whole game here. The adapter refuses reads unless it
         // considers itself a listener, and it tracks that state from the
@@ -530,11 +554,30 @@ impl<T: Transport> GpibController<T> {
             address: TMS_AUXCR,
             value: if enable { AUX_LON | AUX_CS } else { AUX_LON },
         }];
+        if !enable {
+            // Leave holdoff-on-all behind with the mode; ordinary controller
+            // operation runs without it, as init configured.
+            regs.push(RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_HLDA,
+            });
+        }
         if enable {
-            // Release any DAC holdoff already in effect, or the talker stays
-            // blocked on the byte we are sitting on. Note init already clears
-            // holdoff-on-EOI (it writes AUX_HLDE without AUX_CS), so unlike the
-            // TNT4882 there is no holdoff *mode* left to turn off here.
+            // Holdoff on every data byte. Without this the chip is a *free
+            // running* acceptor: it completes the handshake for each byte on
+            // its own and the byte is gone before the collection engine can
+            // take it — the talker finishes its whole transmission convinced
+            // it had a listener, and the capture stays empty. Measured
+            // against a 53310A printing: instrument satisfied, zero bytes
+            // collected. The kernel reference does the same for ordinary
+            // reads (`nec7210_read` holds off after every byte and releases
+            // explicitly). An armed read is what releases each holdoff.
+            regs.push(RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_HLDA | AUX_CS,
+            });
+            // Release any holdoff already in effect from before the mode
+            // change, so a talker mid-byte is not left blocked on entry.
             regs.push(RegisterPairlet {
                 address: TMS_AUXCR,
                 value: AUX_VAL,

@@ -130,6 +130,10 @@ pub const TMS_PPR: u8 = 0x06;
 pub const AUX_CS: u8 = 0x80;
 pub const AUX_CHIP_RESET: u8 = 0x00;
 pub const AUX_INVAL: u8 = 0x01;
+/// Holdoff on all data bytes: the chip stops the acceptor handshake after
+/// every byte until the holdoff is released. Without it a listening chip
+/// free-runs the handshake and data passes through uncollected.
+pub const AUX_HLDA: u8 = 0x03;
 pub const AUX_HLDE: u8 = 0x04;
 pub const AUX_NBAF: u8 = 0x05;
 pub const AUX_LON: u8 = 0x09;

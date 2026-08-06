@@ -1137,3 +1137,50 @@ the host — so `set_listen_only` now aborts and drains unconditionally after
 its self-addressing attempt. Mode entry on an empty bus leaves the lines at
 `ATN | REN`; that is the §14.15 hold-ATN-at-idle behaviour, and ATN release
 belongs to the armed read, not to mode entry.
+
+### 14.19 Resolved: 82357B listen-only capture works
+
+An HP 53310A print captured complete through an 82357B: 30,745 bytes, byte
+level identical in format to the NI fixture — same PCL preamble
+(`\e*r640S\e*rA\e*b74W…`), full raster body, proper `\e*rB` terminator. Two
+further faults beyond §14.18's gate, each of which masked the next, and each
+invisible without the previous one fixed:
+
+**The chip free-ran the acceptor handshake.** With listen-only raised and no
+RFD holdoff configured, the TMS9914 completes the handshake for every byte on
+its own; the data is gone before the collection engine can take it. The
+talker finishes its entire transmission convinced it had a listener — it did:
+the chip, acknowledging bytes into the void. Init clears holdoff mode (the
+kernel init sweep it mirrors does the same, correctly for a *controller*),
+and mode entry's `AUX_VAL` release — added to fix §14.16's "no ready
+listeners" — completed the free-run. The fix is `AUX_HLDA | AUX_CS`
+(holdoff on all) at mode entry, cleared on exit, exactly the discipline
+`nec7210_read` uses per byte. Confirmed at the bench in isolation: with
+holdoff set and *no* read armed, a print accepts one byte and then holds —
+NRFD stays asserted and the talker waits — where before it "printed
+successfully" into nothing.
+
+**The timeout path discarded everything an armed read had collected.**
+`tokio::time::timeout` *drops* the in-flight bulk transfer, and with it every
+byte buffered inside. A capture read times out on every quiet interval by
+design, and a print smaller than the 64 KiB request that does not end in EOI
+never completes the read on its own — so the engine collected entire pages at
+full speed and the host threw them away, indistinguishable from "no bytes
+ever arrived". §14.15's theory table even contains the mechanism ("the abort
+discards the page") — it was rejected only because `end_on_eoi` was assumed
+to terminate reads early, and this instrument does not assert EOI mid-page.
+The fix: on timeout in listen-only, do not abandon the transfer — send
+`XFER_ABORT` while the bulk read is still pending; the adapter ends the
+transfer with a trailing flags byte (`ATRF_ABORT`), the pending read
+completes with the data, and the salvaged bytes go to the client. A quiet
+interval now returns an empty successful read rather than an error.
+
+With all three fixed, the capture loop runs: armed reads salvage on every
+timeout, holdoff parks the talker across re-arm gaps (NRFD held, no bytes
+lost in the gap), and the §14.18 logging distinguishes refusal, quiet, and
+collection at a glance.
+
+Found and not yet fixed, noted for later: the capture front-end's
+client-departure watcher did not fire when a client was killed mid-session —
+the loop kept arming reads until the mode was toggled off (`src/capture.rs`,
+the `watcher` select arm).
