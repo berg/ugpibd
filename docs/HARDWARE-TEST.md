@@ -248,6 +248,60 @@ With it running, `nc localhost 1234` then `++addr <PAD>`, `++auto 1`, `*IDN?`
 should return the same IDN string as Test 3. `contrib/smoke_test.py --pad <PAD>`
 exercises both front-ends and reports any mismatch between them.
 
+## Optional: Bus capture probe (design groundwork)
+
+Answers three of the open questions in `CAPTURE.md` using only the existing
+`read` path, so it needs no new daemon features. Worth running before any of
+that design is built, because the third question decides how much of it is
+needed at all.
+
+`contrib/bus_capture_probe.py`, with a running daemon.
+
+### C1: does a talk-only source reach an ordinary read?
+
+The 34401A and 53132A both do talk-only, and neither plots, so this is
+checkable without a plotting instrument and with human-readable output.
+
+    ./bus_capture_probe.py --talk-only-pad 23
+
+Put the instrument in TALK ONLY at the prompt. `read()` already addresses
+itself as listener and drops to standby, so a talk-only source may already
+land in our lap. The script then asks you to take it *out* of talk-only and
+repeats the read as a control arm — without that, an instrument answering
+normal addressing looks identical to success.
+
+If this passes, talk-only logging needs no new backend primitive.
+
+### C2: does talk-only monopolise the bus?
+
+    ./bus_capture_probe.py --talk-only-pad 23 --other-pad 3
+
+KE5FX warns that some instruments in talk-only prevent all other GPIB
+traffic. With two instruments on the bus that is directly checkable. Either
+answer is a result; the point is to stop repeating it as a rumour.
+
+### C3: does the plotting instrument expect a plotter that answers?
+
+    ./bus_capture_probe.py --plot-pad 3 --capture-file plot.hpgl
+
+Press PLOT at the prompt (or pass `--plot-cmd`). The script captures whatever
+arrives, then looks for HP-GL *output* instructions — `OI`, `OE`, `OP`, `OS`
+and friends — in the stream.
+
+* **No queries:** the instrument dumps and never looks back. Passive capture
+  is sufficient (`CAPTURE.md` cases 1/2), and device mode is not needed.
+* **Queries present:** the instrument is talking *to* a plotter and expects
+  answers. That is case 3/4, and needs device mode plus a plotter persona.
+
+It also reports inter-chunk gaps and whether EOI terminated the plot. The gaps
+are what a client-side inactivity threshold should be chosen from rather than
+guessed; EOI decides whether the daemon needs to convey it out-of-band at all
+(`CAPTURE.md` §5).
+
+Nothing captured at all is also informative, but ambiguous between "addresses
+the plotter itself" and "needs an unaddressed listener" — separating those
+needs `bus_lines()` and a look at ATN.
+
 ## Validated configurations
 
 - **82357B** (`MY47100427`) + HP 34401A at PAD 23 and HP 53132A at PAD 3, on

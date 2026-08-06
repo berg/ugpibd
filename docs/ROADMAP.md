@@ -50,6 +50,10 @@ misleading here.
 the *controller* would present, which is meaningless for a controller-only
 implementation. `++mode 0` (device mode) is correctly rejected as unsupported.
 
+`++mode 0` is the one worth revisiting: real Prologix device mode dumps received
+data straight to the client, which is the same primitive an unaddressed-listen
+capture needs. See `CAPTURE.md` for the design that would close it.
+
 ## 4. Secondary addressing
 
 `setup_init` programs the NI adapter with secondary addressing disabled
@@ -76,3 +80,87 @@ the type numbers. If it turns out to belong to the TLS story, fold this into
 item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
+
+## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
+
+Removed as an open gap, recorded because the failure mode is invisible and
+cost a whole bench session's worth of false negatives before it was understood.
+
+The bulk pipe on both adapters is strictly request/response. One stale reply
+desynchronises every transaction after it, and the symptom is not "the adapter
+is broken" but *plausible wrong answers*: reads return nothing, captures come
+up empty, and an instrument that is working perfectly looks like it is doing
+nothing. The NI reports `missing chunk start id`; the 82357 reports
+`unexpected response byte 0xfa, expected 0xfb`, or silently delivers its own
+`0xfb` response code as if it were instrument data.
+
+Two causes, both fixed:
+
+* **Cancelling a bus read mid-transfer.** The capture loop selected on the
+  client socket against the USB read, so a disconnect dropped a future holding
+  an in-flight bulk transfer. The adapter still sent its response and nobody
+  consumed it. Socket reads are cancel-safe in tokio; USB transfers are not,
+  and the two must not be selected against each other. Disconnects are now
+  noticed *between* reads.
+* **Starting against a pipe left dirty by a dead predecessor.** `init` now
+  drains stale responses first. Before that, a fresh daemon failed its first
+  init and succeeded on the second — the retry "worked" only because it
+  consumed the leftovers, which is why this looked like flakiness rather than
+  a bug.
+
+The general lesson for this codebase: never cancel a future that owns a USB
+transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
+resynchronised afterwards, not merely abandoned.
+
+## 6. The NI adapter fails to initialize on an empty bus
+
+**Now:** reported from the bench — with a GPIB-USB-HS/HS+ attached and no
+instrument powered on the bus, the daemon does not come up. Not yet reproduced
+under controlled conditions or diagnosed, so this entry records the report
+rather than a root cause.
+
+**Why it matters more than its position in this list suggests:** it is a
+first-use blocker. Plugging in an adapter before wiring up instruments is the
+obvious way to try the daemon, and it fails at exactly that moment.
+
+**Where to look first:** `ni_usb_hs::init()` (`src/backend/ni_usb_hs/mod.rs:183`)
+ends by sending command bytes — `send_command(&[GPIB_UNL, talk_address(my_pad)],
+false)` at line 225 — and command bytes are handshaken like any others. With no
+devices attached nobody drives NDAC/NRFD, so that write can fail or time out,
+and an init that treats it as fatal would refuse to start on a bus that is
+merely empty. `skip_check_for_command_acceptors = 1` in both kernel drivers
+(`agilent_82357a.c:1462`, `ni_usb_gpib.c:2411`) suggests upstream hit the same
+class of problem and chose to ignore the acceptor check.
+
+**What "fixed" means:** an empty bus is a legitimate state, not an error. The
+daemon should start, serve clients, and let individual operations fail with
+"no listener" — which they already do correctly.
+
+## 7. Read-after-write is decided by sniffing for `?`
+
+**Now:** the HiSLIP front-end reads the instrument only when the command just
+written contains a question mark — `let expect_response = cmd.contains(&b'?')`
+(`src/hislip/server.rs:761`).
+
+**Why:** it is the cheap heuristic, and for ordinary SCPI traffic it is almost
+always right.
+
+**Where it is wrong, both observed rather than theoretical:**
+
+- *False positive.* A `?` inside a string argument — `DISP:TEXT "why?"` — makes
+  the daemon attempt a read that nothing will answer, so a valid command
+  reports a timeout.
+- *False negative.* Any output the instrument produces without being asked:
+  talk-only sources, plot dumps, anything unsolicited. This is why the HiSLIP
+  front-end cannot capture at all (`docs/CAPTURE.md` §14.2).
+
+**The better mechanism, which we already have the parts for:** serial-poll for
+MAV and read if it is set. The instrument answers this question itself — a
+34401A with data pending returned status `0x10` (MAV) on the bench — and
+`GpibInstrument::execute` already serial-polls around the read for the SRQ path
+(`src/hislip/instrument.rs:75-89`). Deciding *whether* to read from MAV rather
+than from the command text would fix both failure modes at once.
+
+**Watch out:** MAV is not free — it is an extra bus transaction per write, and
+the existing poll is deliberately placed *before* the read for SRQ reasons.
+Moving to MAV means being careful not to disturb that ordering.

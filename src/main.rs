@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -44,6 +44,37 @@ struct Args {
     /// Enable the Prologix-compatible front-end (disabled by default).
     #[arg(long)]
     enable_prologix: bool,
+
+    /// Start in unaddressed-listen ("listen only") mode, for capturing from a
+    /// talk-only instrument. This only sets the initial state: the mode is
+    /// switched at runtime with `++lon`, so a socket- or systemd-activated
+    /// daemon is never stuck in the wrong one.
+    ///
+    /// Mutually exclusive with ordinary traffic while it is on — writes are
+    /// refused, and reads take whatever is on the bus rather than addressing
+    /// an instrument.
+    #[arg(long)]
+    listen_only: bool,
+
+    /// Come up as a GPIB *device* at this primary address instead of as a
+    /// controller, for instruments that drive their own plot transfer.
+    ///
+    /// Releases system control: no IFC, no REN, and we answer only when some
+    /// other controller addresses us. An SR620 with its plotter address set to
+    /// 5 emits nothing at all until a device exists at 5 — see docs/CAPTURE.md.
+    ///
+    /// Like --listen-only this only sets the initial state; `++dev` switches it
+    /// at runtime.
+    #[arg(long)]
+    listen_address: Option<u8>,
+
+    /// TCP port for the raw capture stream (0 disables, the default).
+    ///
+    /// On connect it streams bytes off the bus and nothing else — no framing,
+    /// no headers — so `nc localhost 1235 > plot.bin` is the whole client.
+    /// Requires listen-only mode; see `docs/CAPTURE.md`.
+    #[arg(long, default_value_t = 0)]
+    capture_port: u16,
 
     /// List attached supported USB-GPIB adapters (with their port ids) and exit.
     #[arg(long)]
@@ -137,6 +168,28 @@ async fn main() -> Result<()> {
     let (ctrl, adapter_port) =
         ugpibd::backend::open_selected(&selector, backend, args.timeout_ms).await?;
 
+    if let Some(addr) = args.listen_address {
+        ctrl.lock()
+            .await
+            .set_device_mode(Some(addr))
+            .await
+            .context("--listen-address requested but the adapter refused it")?;
+        info!("started as a GPIB device at address {addr}; ++dev off returns to controller mode");
+    }
+
+    if args.listen_only {
+        // Fail loudly rather than starting in the wrong mode: a daemon that
+        // silently came up as an ordinary controller would present a listener
+        // that is never ready, and the talk-only instrument it was started for
+        // would refuse to transmit with no indication why.
+        ctrl.lock()
+            .await
+            .set_listen_only(true)
+            .await
+            .context("--listen-only requested but the adapter refused it")?;
+        info!("started in listen-only mode; ++lon 0 returns to controller mode");
+    }
+
     let prologix_listener = if args.enable_prologix {
         let l = TcpListener::bind(format!("{}:{}", args.bind, args.port)).await?;
         info!("prologix listening on {}:{}", args.bind, args.port);
@@ -153,11 +206,27 @@ async fn main() -> Result<()> {
         None
     };
 
+    let capture_listener = if args.capture_port != 0 {
+        let l = TcpListener::bind(format!("{}:{}", args.bind, args.capture_port)).await?;
+        info!("capture listening on {}:{}", args.bind, args.capture_port);
+        Some(l)
+    } else {
+        None
+    };
+
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
             .expect("failed to install Ctrl-C handler");
+    };
+
+    let capture_ctrl = ctrl.clone();
+    let capture_fut = async move {
+        match capture_listener {
+            Some(listener) => ugpibd::capture::run(listener, capture_ctrl).await,
+            None => std::future::pending::<Result<()>>().await,
+        }
     };
 
     let prologix_ctrl = ctrl.clone();
@@ -199,6 +268,7 @@ async fn main() -> Result<()> {
     let result = tokio::select! {
         result = prologix_fut => result,
         result = hislip_fut => result,
+        result = capture_fut => result,
         _ = removal => {
             info!("adapter at USB port {adapter_port} was unplugged, shutting down");
             adapter_gone = true;

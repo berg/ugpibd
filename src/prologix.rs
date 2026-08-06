@@ -16,6 +16,14 @@ pub enum LineResult {
     },
     /// Report whether the SRQ line is currently asserted.
     Srq,
+    /// Enter/leave unaddressed-listen, or report it when the argument is None.
+    ListenOnly(Option<bool>),
+    /// Become a device at an address, stop being one, or report the state.
+    DeviceMode(Option<Option<u8>>),
+    /// Report all eight GPIB control lines. A ugpibd extension, not a real
+    /// Prologix command: `++srq` answers one bit of the same register, and
+    /// diagnosing a bus needs the other seven.
+    BusLines,
     /// Forward data to GPIB instrument.
     Forward {
         pad: u8,
@@ -219,6 +227,28 @@ impl PrologixState {
                 _ => LineResult::Error("++mode requires 0 or 1".into()),
             },
             "srq" => LineResult::Srq,
+            // ++lines — dump the bus status register. Not Prologix; see the
+            // LineResult variant.
+            "lines" => LineResult::BusLines,
+            // ++lon [0|1] — unaddressed listen. A ugpibd extension. Runtime
+            // switchable on purpose: the daemon is usually socket/systemd
+            // activated, so a mode reachable only by restarting with a
+            // different flag would not be reachable in practice.
+            // ++dev [addr|off] — act as a GPIB device rather than a controller.
+            "dev" => match args {
+                "" => LineResult::DeviceMode(None),
+                "off" => LineResult::DeviceMode(Some(None)),
+                a => match a.parse::<u8>() {
+                    Ok(n) if n <= 30 => LineResult::DeviceMode(Some(Some(n))),
+                    _ => LineResult::Error("++dev requires an address 0-30, or off".into()),
+                },
+            },
+            "lon" => match args {
+                "" => LineResult::ListenOnly(None),
+                "0" => LineResult::ListenOnly(Some(false)),
+                "1" => LineResult::ListenOnly(Some(true)),
+                _ => LineResult::Error("++lon requires 0 or 1".into()),
+            },
             // ++spoll [pad] — serial-poll the given address, or the currently
             // addressed instrument when no argument is given.
             "spoll" => match parse_optional_pad(args, self.addr) {

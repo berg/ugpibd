@@ -221,6 +221,21 @@ async fn interrupt_poller(
 }
 
 impl Transport for UsbTransport {
+    /// Drain the bulk-in pipe. Best-effort and quiet: on a clean pipe the
+    /// first read simply times out.
+    async fn drain_bulk_in(&self) {
+        for _ in 0..8 {
+            let read = self.read_bulk(1024);
+            match tokio::time::timeout(std::time::Duration::from_millis(50), read).await {
+                Ok(Ok(buf)) if !buf.is_empty() => {
+                    tracing::debug!(bytes = buf.len(), "drained a stale adapter response");
+                }
+                _ => return,
+            }
+        }
+        tracing::warn!("82357 still had queued responses after 8 drain attempts");
+    }
+
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         Some(UsbTransport::subscribe_srq(self))
     }
