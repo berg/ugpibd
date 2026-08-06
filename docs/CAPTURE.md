@@ -1180,7 +1180,12 @@ timeout, holdoff parks the talker across re-arm gaps (NRFD held, no bytes
 lost in the gap), and the §14.18 logging distinguishes refusal, quiet, and
 collection at a glance.
 
-Found and not yet fixed, noted for later: the capture front-end's
-client-departure watcher did not fire when a client was killed mid-session —
-the loop kept arming reads until the mode was toggled off (`src/capture.rs`,
-the `watcher` select arm).
+Found and fixed in the same session: the capture front-end's
+client-departure watcher did not fire when a client vanished mid-session —
+the loop kept arming reads until the mode was toggled off. The watcher was
+an inline future polled non-blockingly between reads; the doc comment above
+it said "a separate task setting a flag", and the doc was right. It is now a
+spawned task owning the read half, setting an atomic flag the loop checks
+between reads. Verified against both a gracefully-closing and a killed
+client: departure noticed within one read cycle, single-client slot
+released, next client accepted.

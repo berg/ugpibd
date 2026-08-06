@@ -59,33 +59,39 @@ const CHUNK: usize = 65536;
 /// is checked *between* reads. A departing client therefore waits up to one
 /// read timeout to be noticed, which is a fine price for never corrupting the
 /// adapter.
-async fn stream_to(ctrl: &SharedBackend, sock: &mut TcpStream) -> Result<()> {
+///
+/// It must really be a *spawned task*, not an inline future polled
+/// non-blockingly between reads: the polled version shipped first and was
+/// measured missing a killed client entirely — the loop kept arming reads
+/// until the mode was toggled off (`docs/CAPTURE.md` §14.19). A task is
+/// driven by the runtime the moment the EOF event arrives, independent of
+/// where this loop happens to be blocked.
+async fn stream_to(ctrl: &SharedBackend, sock: TcpStream) -> Result<()> {
     let mut total: u64 = 0;
-    let (mut rx, mut tx) = sock.split();
+    let (mut rx, mut tx) = sock.into_split();
 
     // A capture client sends nothing, so any readable event is EOF or an error.
-    let watcher = async move {
-        let mut scratch = [0u8; 1];
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gone_setter = gone.clone();
+    let watcher = tokio::spawn(async move {
+        let mut scratch = [0u8; 64];
         loop {
             match rx.read(&mut scratch).await {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => break,
                 Ok(_) => continue,
             }
         }
-    };
-    tokio::pin!(watcher);
+        gone_setter.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    // The task owns the read half and dies with the loop; make sure it cannot
+    // outlive this session and hold the socket.
+    let _abort_on_drop = AbortOnDrop(&watcher);
 
     loop {
-        // Non-blocking check for departure. Cancelling a socket read is safe —
-        // tokio's AsyncRead is cancel-safe — which is precisely what is *not*
-        // true of the USB transfer below, and why that one is never selected on.
-        let mut departed = false;
-        tokio::select! {
-            biased;
-            _ = &mut watcher => departed = true,
-            _ = std::future::ready(()) => {}
-        }
-        if departed {
+        // Departure check between reads only. Cancelling a socket read would
+        // be safe — tokio's AsyncRead is cancel-safe — but cancelling the USB
+        // transfer below is not, which is why the read is never selected on.
+        if gone.load(std::sync::atomic::Ordering::Relaxed) {
             info!("capture: client went away after {total} bytes");
             return Ok(());
         }
@@ -130,6 +136,16 @@ async fn stream_to(ctrl: &SharedBackend, sock: &mut TcpStream) -> Result<()> {
     }
 }
 
+/// Abort a spawned task when the guard goes out of scope, so the watcher
+/// cannot outlive its capture session.
+struct AbortOnDrop<'a>(&'a tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Accept capture clients on `listener` and stream the bus to them.
 ///
 /// One client at a time, matching the rest of the daemon: two clients cannot
@@ -170,7 +186,7 @@ pub async fn run(listener: TcpListener, ctrl: SharedBackend) -> Result<()> {
         let ctrl2 = ctrl.clone();
         let busy2 = busy.clone();
         tokio::spawn(async move {
-            if let Err(e) = stream_to(&ctrl2, &mut sock).await {
+            if let Err(e) = stream_to(&ctrl2, sock).await {
                 warn!("capture client error: {e:#} addr={peer}");
             } else {
                 info!("capture client disconnected addr={peer}");
