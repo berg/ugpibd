@@ -100,6 +100,17 @@ pub const CMDR_CLRSC: u8 = 0x02; // clear system controller
 pub const TNT_ONE_CHIP_BIT: u8 = 0x01; // HSSEL
 pub const TNT_IMR0_ALWAYS_BITS: u8 = 0x80;
 
+// ADMR listen-only / talk-only bits (`nec7210_registers.h:134-135`). Setting
+// HR_LON makes the chip an *unaddressed* listener: it accepts every data byte
+// on the bus regardless of who is addressed.
+pub const HR_LON: u8 = 0x40;
+pub const HR_TON: u8 = 0x80;
+
+// Finish Handshake — releases an RFD holdoff that is currently in effect
+// (`nec7210.c:365-377`). Clearing the holdoff *mode* does not release a holdoff
+// already asserted, so both are needed.
+pub const AUX_FH: u8 = 0x03;
+
 // ADR/ADMR values used when secondary addressing is disabled.
 pub const ADR_DISABLE_SAD: u8 = 0xe0; // HR_ARS | HR_DT | HR_DL
 pub const ADMR_DISABLE_SAD: u8 = 0x31; // HR_TRM0 | HR_TRM1 | HR_ADM0

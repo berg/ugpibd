@@ -26,6 +26,85 @@ use select::UsbSelector;
 /// The daemon shares one opened adapter across both front-ends behind this.
 pub type SharedBackend = Arc<Mutex<dyn GpibBackend>>;
 
+/// A live read of the eight GPIB control lines.
+///
+/// Level, not edge: this answers "what is the bus doing *right now*". That is
+/// what separates diagnoses which otherwise look identical from the data path
+/// — an instrument that is silent from one that is talking to somebody else,
+/// or a read that returns nothing because nothing was sent from one that
+/// returns nothing because another controller holds ATN.
+///
+/// Both supported chips expose these in a single register with the same bit
+/// layout (TMS9914 `BSR`, TNT4882 `BSR`), so the decode is shared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusLines {
+    pub ren: bool,
+    pub ifc: bool,
+    pub srq: bool,
+    pub eoi: bool,
+    pub nrfd: bool,
+    pub ndac: bool,
+    pub dav: bool,
+    pub atn: bool,
+    /// The register byte this was decoded from, so callers can report what was
+    /// actually read and not only our interpretation of it.
+    pub raw: u8,
+}
+
+impl BusLines {
+    pub const REN: u8 = 0x01;
+    pub const IFC: u8 = 0x02;
+    pub const SRQ: u8 = 0x04;
+    pub const EOI: u8 = 0x08;
+    pub const NRFD: u8 = 0x10;
+    pub const NDAC: u8 = 0x20;
+    pub const DAV: u8 = 0x40;
+    pub const ATN: u8 = 0x80;
+
+    pub fn from_bsr(raw: u8) -> Self {
+        Self {
+            ren: raw & Self::REN != 0,
+            ifc: raw & Self::IFC != 0,
+            srq: raw & Self::SRQ != 0,
+            eoi: raw & Self::EOI != 0,
+            nrfd: raw & Self::NRFD != 0,
+            ndac: raw & Self::NDAC != 0,
+            dav: raw & Self::DAV != 0,
+            atn: raw & Self::ATN != 0,
+            raw,
+        }
+    }
+}
+
+impl std::fmt::Display for BusLines {
+    /// `0x29 REN EOI NDAC` — the raw byte first, then the asserted lines.
+    ///
+    /// The raw byte is not redundant: if the bit order is ever wrong on some
+    /// adapter, a reading that names the wrong lines is indistinguishable from
+    /// a strange bus unless the byte it came from is also on screen.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#04x}", self.raw)?;
+        for (on, name) in [
+            (self.atn, "ATN"),
+            (self.dav, "DAV"),
+            (self.ndac, "NDAC"),
+            (self.nrfd, "NRFD"),
+            (self.eoi, "EOI"),
+            (self.srq, "SRQ"),
+            (self.ifc, "IFC"),
+            (self.ren, "REN"),
+        ] {
+            if on {
+                write!(f, " {name}")?;
+            }
+        }
+        if self.raw == 0 {
+            write!(f, " (none asserted)")?;
+        }
+        Ok(())
+    }
+}
+
 /// A single GPIB controller adapter, addressing instruments on its bus by
 /// primary address (`pad`). Methods take `&mut self`; the daemon shares one
 /// instance across both front-ends behind an `Arc<Mutex<dyn GpibBackend>>`.
@@ -99,6 +178,79 @@ pub trait GpibBackend: Send + Sync {
     /// and silently breaks any script that polls for service requests.
     async fn srq_asserted(&mut self) -> Result<bool> {
         anyhow::bail!("{} cannot read the SRQ line", self.name())
+    }
+
+    /// Read all eight GPIB control lines as they stand right now.
+    ///
+    /// A superset of `srq_asserted`, and the tool for telling apart failures
+    /// that look identical from the data path: whether a read returned nothing
+    /// because nothing was sent, or because another controller holds ATN and
+    /// we are no longer in charge.
+    ///
+    /// The default refuses for the same reason `srq_asserted` does — a
+    /// fabricated all-clear reading is indistinguishable from a real one, and
+    /// would mislead exactly the person trying to diagnose a bus.
+    async fn bus_lines(&mut self) -> Result<BusLines> {
+        anyhow::bail!("{} cannot read the GPIB control lines", self.name())
+    }
+
+    /// Enter or leave unaddressed-listen ("listen only") mode.
+    ///
+    /// Two things change together, and both are required — the second is the
+    /// one that is easy to miss:
+    ///
+    /// 1. The chip becomes an **unaddressed listener**, accepting every data
+    ///    byte on the bus regardless of who is addressed. This is the only way
+    ///    to receive from a talk-only source, which by construction has no
+    ///    address to point a read at (`docs/CAPTURE.md` §14.2).
+    /// 2. The **RFD holdoff is released**. Normal operation holds NRFD between
+    ///    reads so bytes are not dropped, but that presents a listener which is
+    ///    never ready, and a talk-only talker will refuse to transmit to it —
+    ///    an HP 53310A reports "no ready listeners?" (§4.7). While capturing we
+    ///    must be continuously ready, which means giving up that flow control.
+    ///
+    /// Because of (2) this is **mutually exclusive with ordinary controller
+    /// traffic**: with the holdoff gone, bytes can arrive between reads with
+    /// nowhere to go. Callers must refuse addressed operations while it is on
+    /// rather than let them silently corrupt a capture.
+    ///
+    /// Runtime-switchable by design: both halves are register writes needing no
+    /// re-initialisation, so this is a mode the daemon enters and leaves, not a
+    /// mode it must be started in.
+    async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
+        let _ = enable;
+        anyhow::bail!("{} cannot enter listen-only mode", self.name())
+    }
+
+    /// Whether unaddressed-listen is currently on.
+    fn listen_only(&self) -> bool {
+        false
+    }
+
+    /// Become an addressable *device* at `address`, or return to controller.
+    ///
+    /// This is not listen-only. In listen-only we are still controller and
+    /// simply accept every byte; here we stop being a controller at all —
+    /// system control is released, REN and IFC are dropped, and we sit at a
+    /// primary address waiting for somebody else to address us.
+    ///
+    /// It is what an instrument that drives its own plot transfer needs. An
+    /// SR620 with a plotter address configured emits **nothing at all** until a
+    /// device exists at that address: sampled continuously while PRINT was
+    /// pressed, not one bus line moved (`docs/CAPTURE.md` §14.17). Listen-only
+    /// cannot help there, because there is no traffic to listen to.
+    ///
+    /// Note what this costs: we are no longer controller-in-charge, so the
+    /// "pulse IFC to recover the bus" escape hatch does not apply while it is
+    /// on. Returning to controller mode re-initialises the adapter.
+    async fn set_device_mode(&mut self, address: Option<u8>) -> Result<()> {
+        let _ = address;
+        anyhow::bail!("{} cannot act as a GPIB device", self.name())
+    }
+
+    /// The address we are answering to as a device, if any.
+    fn device_address(&self) -> Option<u8> {
+        None
     }
 
     /// Subscribe to service-request notifications, for adapters that can report
@@ -258,6 +410,55 @@ mod tests {
     use agilent_82357::protocol::{
         USB_PID_82357A, USB_PID_82357A_PREINIT, USB_PID_82357B, USB_PID_82357B_PREINIT,
     };
+
+    #[test]
+    fn bus_lines_decode_each_bit_in_isolation() {
+        for (bit, get) in [
+            (BusLines::REN, (|l: &BusLines| l.ren) as fn(&BusLines) -> bool),
+            (BusLines::IFC, |l| l.ifc),
+            (BusLines::SRQ, |l| l.srq),
+            (BusLines::EOI, |l| l.eoi),
+            (BusLines::NRFD, |l| l.nrfd),
+            (BusLines::NDAC, |l| l.ndac),
+            (BusLines::DAV, |l| l.dav),
+            (BusLines::ATN, |l| l.atn),
+        ] {
+            let lines = BusLines::from_bsr(bit);
+            assert!(get(&lines), "bit {bit:#04x} did not decode to its own line");
+            // and nothing else came along with it
+            assert_eq!(lines.raw, bit);
+            let others = [
+                lines.ren, lines.ifc, lines.srq, lines.eoi, lines.nrfd, lines.ndac, lines.dav,
+                lines.atn,
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert_eq!(others, 1, "bit {bit:#04x} decoded to more than one line");
+        }
+    }
+
+    /// The bit order in `agilent_82357/protocol.rs` was established on hardware,
+    /// not from a datasheet: an idle bus read `0x29` and the same bus with an
+    /// instrument asserting SRQ read `0x2d`. Pin both, so a future reshuffle of
+    /// the constants has to explain itself against a real measurement.
+    #[test]
+    fn bus_lines_match_the_readings_the_bit_order_was_derived_from() {
+        let idle = BusLines::from_bsr(0x29);
+        assert!(idle.ren && idle.eoi && idle.ndac);
+        assert!(!idle.srq && !idle.atn && !idle.dav && !idle.ifc && !idle.nrfd);
+
+        let with_srq = BusLines::from_bsr(0x2d);
+        assert!(with_srq.srq, "0x2d is 0x29 plus SRQ");
+        assert!(with_srq.ren && with_srq.eoi && with_srq.ndac);
+    }
+
+    #[test]
+    fn bus_lines_display_leads_with_the_raw_byte() {
+        assert_eq!(BusLines::from_bsr(0x29).to_string(), "0x29 NDAC EOI REN");
+        assert_eq!(BusLines::from_bsr(0x00).to_string(), "0x00 (none asserted)");
+        assert_eq!(BusLines::from_bsr(0x80).to_string(), "0x80 ATN");
+    }
 
     #[test]
     fn preinit_pid_recognized_per_model() {

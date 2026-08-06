@@ -110,6 +110,41 @@ async fn handle_connection(
                 // healthy bus with nothing requesting service.
                 Err(e) => warn!("gpib srq check failed: {e:#}"),
             },
+            LineResult::ListenOnly(None) => {
+                let v = u8::from(ctrl.lock().await.listen_only());
+                writer.write_all(format!("{v}\n").as_bytes()).await?;
+            }
+            LineResult::ListenOnly(Some(enable)) => {
+                if let Err(e) = ctrl.lock().await.set_listen_only(enable).await {
+                    warn!("gpib set_listen_only({enable}) failed: {e:#}");
+                    writer
+                        .write_all(format!("error: {e}\n").as_bytes())
+                        .await?;
+                }
+            }
+            LineResult::DeviceMode(None) => {
+                let msg = match ctrl.lock().await.device_address() {
+                    Some(a) => a.to_string(),
+                    None => "off".to_string(),
+                };
+                writer.write_all(format!("{msg}\n").as_bytes()).await?;
+            }
+            LineResult::DeviceMode(Some(target)) => {
+                if let Err(e) = ctrl.lock().await.set_device_mode(target).await {
+                    warn!("gpib set_device_mode({target:?}) failed: {e:#}");
+                    writer
+                        .write_all(format!("error: {e}\n").as_bytes())
+                        .await?;
+                }
+            }
+            LineResult::BusLines => match ctrl.lock().await.bus_lines().await {
+                Ok(lines) => {
+                    writer.write_all(format!("{lines}\n").as_bytes()).await?;
+                }
+                // Same rule as ++srq: no invented all-clear reading, because it
+                // would be indistinguishable from a real one.
+                Err(e) => warn!("gpib bus line read failed: {e:#}"),
+            },
             LineResult::DeviceClear { pad } => {
                 if let Err(e) = ctrl.lock().await.device_clear(pad).await {
                     warn!("gpib device_clear failed: {e:#}");

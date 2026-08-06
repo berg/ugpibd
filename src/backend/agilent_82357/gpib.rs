@@ -26,6 +26,15 @@ pub trait Transport {
     /// Called during error recovery to re-synchronize with the firmware.
     fn drain_write_complete(&self) -> impl std::future::Future<Output = ()> + Send;
 
+    /// Read and discard whatever the adapter still owes us, so an abandoned
+    /// transfer cannot desynchronise the next one.
+    ///
+    /// Defaulted to a no-op: this is a property of a real USB pipe, and a mock
+    /// transport with pre-queued responses would have them eaten.
+    fn drain_bulk_in(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
     /// Receiver for service-request notifications, when the transport has a
     /// path that reports them. `None` means this transport cannot observe SRQ,
     /// which callers must treat as "unknown", never as "no SRQ".
@@ -40,6 +49,7 @@ pub struct GpibController<T: Transport> {
     pub eos_char: u8,
     pub eos_enabled: bool,
     pub hw_control_bits: u8,
+    pub listen_only: bool,
 }
 
 impl<T: Transport> GpibController<T> {
@@ -50,6 +60,7 @@ impl<T: Transport> GpibController<T> {
             eos_char: b'\n',
             eos_enabled: false,
             hw_control_bits: 0,
+            listen_only: false,
         }
     }
 
@@ -86,6 +97,12 @@ impl<T: Transport> GpibController<T> {
     /// Matches the kernel driver's `agilent_82357a_init()` with t1_nano_sec=800,
     /// then requests system controller and pulses IFC + asserts REN.
     pub async fn init(&mut self, my_pad: u8) -> Result<()> {
+        // Clear anything a dead predecessor left queued before trusting a
+        // single response byte. Without this a fresh daemon fails its first
+        // init with `unexpected response byte 0xfa, expected 0xfb` and
+        // succeeds on the second — the retry "works" only by consuming the
+        // leftovers, which reads as flakiness rather than as a bug.
+        self.transport.drain_bulk_in().await;
         // Batch 1: light FAIL LED and pulse reset
         let batch1 = [
             RegisterPairlet {
@@ -283,6 +300,9 @@ impl<T: Transport> GpibController<T> {
     /// clears talkers, not listeners. Making ourselves the talker with MTA is
     /// what unaddresses any previous talker, since there can only be one.
     pub async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
+        if self.listen_only {
+            anyhow::bail!("cannot write while in listen-only mode (++lon 0 to leave)");
+        }
         let addr_cmd = [GPIB_UNL, talk_address(0), listen_address(pad)];
         self.send_command_bytes(&addr_cmd).await?;
         self.send_data_bytes(data, send_eoi).await
@@ -293,14 +313,38 @@ impl<T: Transport> GpibController<T> {
     /// bus participants to idle — otherwise a device left addressed as talker
     /// will hang the next transaction.
     pub async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
-        let addr_cmd = [GPIB_UNL, listen_address(0), talk_address(pad)];
-        self.send_command_bytes(&addr_cmd).await?;
+        // In listen-only, address ourselves as sole listener and designate no
+        // talker: the talk-only source is already talking and has no address to
+        // name. Measured on the NI backend — sending no command bytes at all
+        // captures nothing, and naming `MTA(0)` designates a talker that does
+        // not exist. See `docs/CAPTURE.md` §14.15.
+        // In listen-only we were addressed when the mode was entered and are in
+        // standby; re-addressing per read would assert ATN on every re-arm and
+        // abort a transfer in flight.
+        if !self.listen_only {
+            let addr_cmd = [GPIB_UNL, listen_address(0), talk_address(pad)];
+            self.send_command_bytes(&addr_cmd).await?;
+        }
         let gts = [RegisterPairlet {
             address: TMS_AUXCR,
             value: AUX_GTS,
         }];
         self.write_registers(&gts).await?;
-        let pkt = encode_gpib_read(max_len as u32, self.eos_enabled, self.eos_char);
+        let pkt = encode_gpib_read(
+            max_len as u32,
+            self.eos_enabled,
+            self.eos_char,
+            // End on EOI even while capturing. Removing it was a mistake:
+            // with no termination flag the firmware can only end the read on
+            // count, and `max_len` is 64 KiB, so a print smaller than that
+            // never completes — it times out, and the timeout path aborts and
+            // drains, discarding every byte it had collected.
+            //
+            // The re-arm gap this was meant to avoid was a theory about the NI
+            // adapter that turned out to be wrong; the real fault there was the
+            // addressing (§14.12).
+            true,
+        );
         self.transport.write_bulk(&pkt).await?;
 
         let read_fut = self.transport.read_bulk(max_len + 1);
@@ -312,7 +356,33 @@ impl<T: Transport> GpibController<T> {
                 Err(e)
             }
             Err(_) => {
-                self.recover_from_stall().await;
+                // Do NOT pulse IFC while capturing. `recover_from_stall` ends
+                // with an interface clear, which is right for a wedged
+                // addressed transfer and catastrophic for a capture: a read
+                // timeout is the *normal* idle state of a capture loop, and
+                // IFC would reset the bus, knock a talk-only instrument out of
+                // its mode, and discard the transfer it was meant to salvage.
+                // This is `docs/CAPTURE.md` §4.1, observed rather than
+                // predicted: on the 82357 it silently destroyed every capture.
+                if self.listen_only {
+                    let _ = self.abort(true).await;
+                    let _ = self.abort(false).await;
+                    self.transport.drain_write_complete().await;
+                    // Resynchronise the bulk pipe. `tokio::time::timeout`
+                    // above *drops* the in-flight read rather than waiting for
+                    // it, so the adapter's response to the abandoned transfer
+                    // arrives afterwards with nobody expecting it — and the
+                    // next read consumes it as data. The symptom is a lone
+                    // `0xfb` in the capture stream, which is this adapter's
+                    // own WR_REGS response code, not instrument bytes.
+                    //
+                    // A capture read times out by design on every quiet
+                    // interval, so without this the pipe desynchronises within
+                    // seconds of entering the mode.
+                    self.transport.drain_bulk_in().await;
+                } else {
+                    self.recover_from_stall().await;
+                }
                 anyhow::bail!("gpib read timed out after {} ms", self.timeout_ms)
             }
         }
@@ -343,7 +413,7 @@ impl<T: Transport> GpibController<T> {
         }];
         self.write_registers(&gts).await?;
 
-        let pkt = encode_gpib_read(1, false, 0);
+        let pkt = encode_gpib_read(1, false, 0, true);
         self.transport.write_bulk(&pkt).await?;
 
         // One data byte plus the trailing flags byte.
@@ -380,14 +450,94 @@ impl<T: Transport> GpibController<T> {
     /// line low produces no edge and is never announced. Callers use this to
     /// tell "still asserted, keep looking" from "released, nothing pending".
     pub async fn srq_asserted(&mut self) -> Result<bool> {
+        Ok(self.bus_lines().await?.srq)
+    }
+
+    /// Enter or leave unaddressed-listen. **Does not work on this adapter yet.**
+    ///
+    /// The chip reaches the right state — `0x21 NDAC REN`, a genuinely ready
+    /// listener, better than the NI manages — but no bytes are collected. See
+    /// `docs/CAPTURE.md` §14.15, which records four theories tried and refuted
+    /// so they are not tried again. Kept rather than removed so that "tried and
+    /// does not work" stays distinguishable from "nobody tried", per the
+    /// roadmap's rule about untested adapters.
+    pub async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
+        // On the TMS9914 the aux-command set/clear bit is AUX_CS, so 0x89 sets
+        // listen-only and 0x09 clears it.
+        let mut regs = vec![RegisterPairlet {
+            address: TMS_AUXCR,
+            value: if enable { AUX_LON | AUX_CS } else { AUX_LON },
+        }];
+        if enable {
+            // Release any DAC holdoff already in effect, or the talker stays
+            // blocked on the byte we are sitting on. Note init already clears
+            // holdoff-on-EOI (it writes AUX_HLDE without AUX_CS), so unlike the
+            // TNT4882 there is no holdoff *mode* left to turn off here.
+            regs.push(RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_VAL,
+            });
+        }
+        self.write_registers(&regs).await?;
+        if enable {
+            // Also announce ourselves as a listener on the bus, in case the
+            // adapter arms its read engine off the addressing rather than off
+            // the listen-only bit. (It does not appear to — see
+            // `docs/CAPTURE.md` §14.15 — but the command is harmless and the
+            // NI needs its equivalent.)
+            //
+            // Failure is expected and ignored: with only a talk-only
+            // instrument on the bus these command bytes have no acceptor. What
+            // must not happen is the IFC that `send_command_bytes` pulses on
+            // failure, which would reset the bus and undo the mode.
+            if let Err(e) = self.try_command_bytes(&[GPIB_UNL, listen_address(0)]).await {
+                tracing::debug!("listen-only self-addressing not accepted: {e:#}");
+                self.transport.drain_bulk_in().await;
+            }
+            // Go to standby *after* the addressing. Command bytes are sent with
+            // ATN asserted, so doing this first leaves ATN up afterwards — and
+            // with ATN asserted no data can move at all.
+            let gts = [RegisterPairlet {
+                address: TMS_AUXCR,
+                value: AUX_GTS,
+            }];
+            self.write_registers(&gts).await?;
+        }
+        // Beyond that, no addressing per read, unlike the NI backend.
+        //
+        // `AUX_LON | AUX_CS` is a *true* hardware listen-only on the TMS9914
+        // (`tms9914.h:262`, with the `AUX_CS` set/clear convention), where the
+        // TNT4882's `HR_LON` is not enough on its own and has to reach LACS
+        // through the addressing path. Measured: this sequence alone put the
+        // 82357 at `0x21 NDAC REN`, a ready listener, which is better than the
+        // NI ever manages.
+        //
+        // Adding `UNL, MLA(0)` here made it worse, and instructively. Those
+        // command bytes need an acceptor, and with only a talk-only instrument
+        // on the bus there is none, so `send_command_bytes` failed — and its
+        // failure path calls `recover_from_stall`, which pulses IFC and leaves
+        // the bulk pipe dirty. The capture then delivered a single `0xfb`,
+        // which is this adapter's own WR_REGS response code rather than
+        // instrument data.
+        self.listen_only = enable;
+        tracing::info!(listen_only = enable, "unaddressed listen (82357)");
+        Ok(())
+    }
+
+    /// Read the bus status register and decode all eight control lines.
+    ///
+    /// Reading `BSR` has no side effects, unlike ISR0/ISR1 at offsets 0 and 1,
+    /// which clear pending interrupt status on read and would steal
+    /// notifications from the interrupt endpoint.
+    pub async fn bus_lines(&mut self) -> Result<crate::backend::BusLines> {
         let mut regs = [RegisterPairlet {
             address: TMS_BSR,
             value: 0,
         }];
         self.read_registers(&mut regs).await?;
-        let bsr = regs[0].value;
-        tracing::debug!(bsr = ?format_args!("{bsr:#04x}"), "bus status");
-        Ok(bsr & BSR_SRQ != 0)
+        let lines = crate::backend::BusLines::from_bsr(regs[0].value);
+        tracing::debug!(bus = %lines, "bus status");
+        Ok(lines)
     }
 
     /// Best-effort recovery after a stalled transfer: flush the in-flight USB
@@ -413,6 +563,21 @@ impl<T: Transport> GpibController<T> {
         // IFC itself produces register writes which we've already awaited;
         // drain again just to be safe.
         self.transport.drain_write_complete().await;
+    }
+
+    /// Send command bytes without the stall recovery.
+    ///
+    /// `send_command_bytes` pulses IFC when a command is not accepted, which is
+    /// right for a wedged addressed transfer and wrong when the command is
+    /// speculative. Addressing ourselves as listener on a bus whose only other
+    /// device is talk-only has no acceptor and legitimately fails; resetting
+    /// the bus over that would undo the mode we are trying to enter.
+    async fn try_command_bytes(&mut self, cmd: &[u8]) -> Result<()> {
+        let pkt = encode_gpib_command(cmd);
+        self.transport.write_bulk(&pkt).await?;
+        self.wait_write_or_timeout().await?;
+        self.get_xfer_status().await?;
+        Ok(())
     }
 
     async fn send_command_bytes(&mut self, cmd: &[u8]) -> Result<()> {
@@ -539,6 +704,15 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     }
     async fn srq_asserted(&mut self) -> Result<bool> {
         self.srq_asserted().await
+    }
+    async fn bus_lines(&mut self) -> Result<crate::backend::BusLines> {
+        self.bus_lines().await
+    }
+    async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
+        self.set_listen_only(enable).await
+    }
+    fn listen_only(&self) -> bool {
+        self.listen_only
     }
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()

@@ -93,7 +93,7 @@ fn gpib_command_packet() {
 
 #[test]
 fn gpib_read_packet_eoi_only() {
-    let pkt = encode_gpib_read(512, false, 0x0a);
+    let pkt = encode_gpib_read(512, false, 0x0a, true);
     assert_eq!(pkt[0], BulkCmd::Read as u8);
     let flags = pkt[3];
     assert!(flags & ReadFlag::EndOnEoi as u8 != 0);
@@ -105,7 +105,7 @@ fn gpib_read_packet_eoi_only() {
 
 #[test]
 fn gpib_read_packet_with_eos() {
-    let pkt = encode_gpib_read(512, true, b'\n');
+    let pkt = encode_gpib_read(512, true, b'\n', true);
     let flags = pkt[3];
     assert!(flags & ReadFlag::EndOnEosChar as u8 != 0);
     assert_eq!(pkt[8], b'\n');

@@ -432,6 +432,28 @@ fn find_device(port: Option<&str>) -> Result<(nusb::DeviceInfo, u16)> {
 
 #[async_trait::async_trait]
 impl NiTransport for NiUsbTransport {
+    /// Read and discard whatever the adapter still owes us, so a daemon that
+    /// starts against a pipe left dirty by a dead predecessor recovers on the
+    /// first attempt instead of the second.
+    ///
+    /// Best-effort and quiet about the healthy case: on a clean adapter the
+    /// first read simply times out.
+    async fn drain_stale_responses(&self) {
+        for _ in 0..8 {
+            let read = self.bulk_in(1024);
+            match tokio::time::timeout(std::time::Duration::from_millis(50), read).await {
+                Ok(Ok(buf)) if !buf.is_empty() => {
+                    tracing::warn!(
+                        bytes = buf.len(),
+                        "discarded a stale adapter response from a previous session"
+                    );
+                }
+                _ => return,
+            }
+        }
+        tracing::warn!("adapter still had queued responses after 8 drain attempts");
+    }
+
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         Some(NiUsbTransport::subscribe_srq(self))
     }

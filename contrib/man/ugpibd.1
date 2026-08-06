@@ -88,6 +88,32 @@ Print help and exit. The first line carries the version.
 .TP
 .BR \-V ", " \-\-version
 Print the version and exit.
+.TP
+.B \-\-capture\-port \fIPORT\fR
+Serve a raw capture stream on \fIPORT\fR (0, the default, disables it). On
+connect it streams bytes off the bus with no framing, headers or
+interpretation, so
+.B nc localhost 1235 > plot.bin
+is a complete client. Requires one of the capture modes below; one client at a
+time.
+.TP
+.B \-\-listen\-only
+Start as an unaddressed listener, for an instrument that goes talk\-only and
+drives the bus itself. Equivalent to
+.B ++lon 1
+at runtime; writes are refused while it is on.
+.TP
+.B \-\-listen\-address \fIADDR\fR
+Start as a GPIB \fIdevice\fR at primary address \fIADDR\fR rather than as a
+controller, for an instrument that addresses its plotter itself. Releases
+system control: no IFC, no REN, and the daemon answers only when another
+controller addresses it. Equivalent to
+.B ++dev \fIADDR\fR
+at runtime.
+.PP
+Both capture modes only set the \fIinitial\fR state; each is switched at
+runtime, so a socket\- or systemd\-activated daemon is never stuck in the
+wrong one.
 .SH ENVIRONMENT
 .TP
 .B RUST_LOG

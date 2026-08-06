@@ -93,7 +93,19 @@ pub const TMS_BSR: u8 = 0x03;
 //
 // Watch out for NDAC (0x20): idle listeners hold it asserted, so mistaking it
 // for SRQ reads as "someone is always requesting service".
+//
+// The empirical order above is corroborated by the kernel's own header —
+// `tms9914.h:236-243` defines BSR_REN_BIT..BSR_ATN_BIT as 0x01..0x80 in this
+// same sequence — and by the TNT4882, whose bus status register uses an
+// identical layout (`ni_usb_hs/protocol.rs:60-67`).
+pub const BSR_REN: u8 = 0x01;
+pub const BSR_IFC: u8 = 0x02;
 pub const BSR_SRQ: u8 = 0x04;
+pub const BSR_EOI: u8 = 0x08;
+pub const BSR_NRFD: u8 = 0x10;
+pub const BSR_NDAC: u8 = 0x20;
+pub const BSR_DAV: u8 = 0x40;
+pub const BSR_ATN: u8 = 0x80;
 
 // TMS9914 write register addresses
 pub const TMS_IMR0: u8 = 0x00;
@@ -110,6 +122,8 @@ pub const AUX_INVAL: u8 = 0x01;
 pub const AUX_HLDE: u8 = 0x04;
 pub const AUX_NBAF: u8 = 0x05;
 pub const AUX_LON: u8 = 0x09;
+/// Release a DAC holdoff, valid command byte (`AUX_INVAL | AUX_CS`).
+pub const AUX_VAL: u8 = 0x81;
 pub const AUX_TON: u8 = 0x0a;
 pub const AUX_GTS: u8 = 0x0b;
 pub const AUX_TCA: u8 = 0x0c;
@@ -285,9 +299,23 @@ fn build_write_packet(flags: u8, data: &[u8]) -> Vec<u8> {
 
 /// Encode a DATA_PIPE_CMD_READ request packet.
 /// `eos_enabled`: also terminate on `eos_char`.
-pub fn encode_gpib_read(max_len: u32, eos_enabled: bool, eos_char: u8) -> Vec<u8> {
-    let mut flags = ReadFlag::EndOnEoi as u8 | ReadFlag::NoAddress as u8;
-    if eos_enabled {
+/// `end_on_eoi` is false for capture. A capture is a stream, not a message:
+/// ending the read whenever the talker asserts EOI returns control to the host
+/// mid-page and opens a re-arm gap, and a talk-only talker that finds no ready
+/// listener in that gap gives up — an HP 53310A reports "printing aborted"
+/// partway through. Where a page ends is the client's problem
+/// (`docs/CAPTURE.md` §5), so the read should end on length or timeout only.
+pub fn encode_gpib_read(
+    max_len: u32,
+    eos_enabled: bool,
+    eos_char: u8,
+    end_on_eoi: bool,
+) -> Vec<u8> {
+    let mut flags = ReadFlag::NoAddress as u8;
+    if end_on_eoi {
+        flags |= ReadFlag::EndOnEoi as u8;
+    }
+    if eos_enabled && end_on_eoi {
         flags |= ReadFlag::EndOnEosChar as u8;
     }
     let mut out = Vec::with_capacity(9);

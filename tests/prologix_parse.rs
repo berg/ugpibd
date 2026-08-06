@@ -219,3 +219,57 @@ fn with_addr_sets_initial_address_and_keeps_defaults() {
     assert_eq!(s.eos_mode, PrologixState::default().eos_mode);
     assert_eq!(s.eoi, PrologixState::default().eoi);
 }
+
+// --- capture-mode commands (ugpibd extensions, not real Prologix) ---
+
+#[test]
+fn lines_takes_no_argument() {
+    let mut s = PrologixState::default();
+    assert!(matches!(s.handle_line("++lines"), LineResult::BusLines));
+}
+
+#[test]
+fn lon_sets_clears_and_queries() {
+    let mut s = PrologixState::default();
+    assert!(matches!(s.handle_line("++lon 1"), LineResult::ListenOnly(Some(true))));
+    assert!(matches!(s.handle_line("++lon 0"), LineResult::ListenOnly(Some(false))));
+    // No argument asks rather than assumes: the answer lives in the backend,
+    // not in this parser, so it must not be guessed here.
+    assert!(matches!(s.handle_line("++lon"), LineResult::ListenOnly(None)));
+}
+
+#[test]
+fn lon_rejects_anything_but_0_or_1() {
+    let mut s = PrologixState::default();
+    for bad in ["++lon 2", "++lon yes", "++lon -1", "++lon 1 1"] {
+        assert!(
+            matches!(s.handle_line(bad), LineResult::Error(_)),
+            "{bad} should have been refused"
+        );
+    }
+}
+
+#[test]
+fn dev_takes_an_address_or_off_or_queries() {
+    let mut s = PrologixState::default();
+    assert!(matches!(s.handle_line("++dev 5"), LineResult::DeviceMode(Some(Some(5)))));
+    assert!(matches!(s.handle_line("++dev 0"), LineResult::DeviceMode(Some(Some(0)))));
+    assert!(matches!(s.handle_line("++dev 30"), LineResult::DeviceMode(Some(Some(30)))));
+    assert!(matches!(s.handle_line("++dev off"), LineResult::DeviceMode(Some(None))));
+    assert!(matches!(s.handle_line("++dev"), LineResult::DeviceMode(None)));
+}
+
+/// 31 is not a primary address — it is the untalk/unlisten code — so it must be
+/// refused here for the same reason `++addr 31` is. An instrument in talk-only
+/// reports itself as "address 31", and accepting it would invite pointing the
+/// daemon at a device that by construction cannot be addressed.
+#[test]
+fn dev_rejects_31_and_other_non_addresses() {
+    let mut s = PrologixState::default();
+    for bad in ["++dev 31", "++dev 255", "++dev -1", "++dev five", "++dev on"] {
+        assert!(
+            matches!(s.handle_line(bad), LineResult::Error(_)),
+            "{bad} should have been refused"
+        );
+    }
+}

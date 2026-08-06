@@ -109,6 +109,44 @@ is written without reading. The address is fixed for the session.
 1234 for scripts written against `prologix-gpib-async` or raw sockets. Supported
 `++` commands and their quirks: [docs/PROLOGIX.md](docs/PROLOGIX.md).
 
+## Capturing plots and prints
+
+Instruments that plot or print to GPIB do not answer queries — they drive the
+bus at a listener, and until one exists they emit nothing at all. Two modes
+cover the two ways they do it, and which one an instrument needs is a property
+of the instrument, not a preference:
+
+| The instrument | Mode | Example |
+|---|---|---|
+| goes talk-only and drives the bus | `++lon 1` | HP 53310A, which prints PCL raster |
+| addresses a plotter at a configured address | `++dev <addr>` | SRS SR620, which plots HP-GL to address 5 |
+
+Both stream raw bytes to `--capture-port`, with no framing and no
+interpretation:
+
+```
+ugpibd --enable-prologix --capture-port 1235
+printf '++mode 1\n++dev 5\n' | nc -q1 localhost 1234    # or ++lon 1
+nc localhost 1235 > plot.hpgl                            # then press PLOT
+```
+
+`--listen-only` and `--listen-address <addr>` set the same modes at startup for
+a unit dedicated to capture; both are switchable at runtime, so a
+socket-activated daemon is never stuck in the wrong one.
+
+Two things worth knowing before you debug a silent capture:
+
+* **Device mode gives up system control.** No REN, no IFC, and the daemon is no
+  longer controller-in-charge, so ordinary instrument traffic is refused until
+  you leave the mode.
+* **A capture holds the bus.** Other clients see up to one read timeout of
+  added latency, and a capture client that stops reading stalls the talker —
+  which on GPIB blocks every device, not just that transfer.
+
+`++lines` dumps the eight bus control lines and is the first thing to reach for
+when nothing arrives: it distinguishes an instrument that is silent from one
+that is talking to somebody else. See [docs/CAPTURE.md](docs/CAPTURE.md).
+
 ## Running as a service
 
 The packaged `ugpibd.service` is deliberately not started or enabled on

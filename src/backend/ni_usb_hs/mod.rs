@@ -93,6 +93,19 @@ pub trait NiTransport: Send + Sync {
         None
     }
 
+    /// Discard any responses the adapter still owes from a previous session.
+    ///
+    /// The bulk pipe is strictly request/response, so one stale reply
+    /// desynchronises every transaction after it: the symptom is `missing chunk
+    /// start id` on this adapter and `unexpected response byte` on the 82357.
+    /// It happens whenever a host dies with a transfer in flight, which made a
+    /// fresh daemon fail its first init and succeed on the second — the retry
+    /// "worked" only because it consumed the leftovers.
+    ///
+    /// Defaulted to a no-op: this is a property of a real USB pipe, and a mock
+    /// transport with pre-queued responses would have them eaten.
+    async fn drain_stale_responses(&self) {}
+
     /// Re-arm the adapter's interrupt monitor for `mask`.
     ///
     /// Separate from `control_in` because it must be serialised against whole
@@ -108,6 +121,8 @@ pub trait NiTransport: Send + Sync {
 pub struct NiUsbHsBackend<T: NiTransport> {
     transport: T,
     my_pad: u8,
+    listen_only: bool,
+    device_address: Option<u8>,
     eos_char: u8,
     eos_enabled: bool,
     timeout_ms: u32,
@@ -118,6 +133,8 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
         Self {
             transport,
             my_pad: 0,
+            listen_only: false,
+            device_address: None,
             eos_char: b'\n',
             eos_enabled: false,
             timeout_ms,
@@ -182,6 +199,9 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
 impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     async fn init(&mut self, my_pad: u8) -> Result<()> {
         self.my_pad = my_pad;
+        // Clear anything left queued by a dead predecessor before trusting a
+        // single response byte.
+        self.transport.drain_stale_responses().await;
         // Readiness handshake: the adapter needs a moment after enumeration.
         usb::wait_for_ready(&self.transport).await?;
         // Monitor nothing while the chip is being reconfigured, per the kernel
@@ -267,6 +287,15 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
+        // Refuse rather than corrupt: in listen-only we are not the controller
+        // of this transfer and the RFD holdoff is released, so addressing
+        // anyone would both fail and disturb a capture in progress.
+        if self.listen_only {
+            anyhow::bail!("cannot write while in listen-only mode (++lon 0 to leave)");
+        }
+        if self.device_address.is_some() {
+            anyhow::bail!("cannot write while in device mode: we are not the controller");
+        }
         // Address controller as talker (pad 0), instrument as listener.
         let cmd = [GPIB_UNL, talk_address(self.my_pad), listen_address(pad)];
         self.send_command(&cmd, true).await?;
@@ -301,9 +330,32 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // the HiSLIP server ask for 64 KiB, one byte past the limit, which would
         // otherwise wrap the encoded count to zero and read nothing at all.
         let max_len = max_len.min(MAX_TRANSFER_LEN);
-        // Address controller as listener (pad 0), instrument as talker.
-        let cmd = [GPIB_UNL, listen_address(self.my_pad), talk_address(pad)];
-        self.send_command(&cmd, true).await?;
+        if self.device_address.is_some() {
+            // We are not the controller. Sending command bytes is not ours to
+            // do; just take whatever the controller addresses us to receive.
+            let req = encode_data_read(
+                max_len,
+                self.eos_mode(),
+                self.eos_char,
+                timeout_code(self.timeout_ms),
+            );
+            let resp_cap = (max_len / 30 + 1) * 0x20 + 0x20;
+            let resp = self.transact(&req, resp_cap).await?;
+            return parse_data_read_response(&resp, max_len).context("ni device read");
+        }
+        // Address ourselves as sole listener in listen-only, naming no talker:
+        // a talk-only source has no address (31 is the untalk code) and is
+        // already talking. This per-read addressing is what was measured
+        // working — 558 rows, complete (`docs/CAPTURE.md` §14.15). The 82357
+        // needs the addressing hoisted out of the read instead, because it
+        // asserts ATN differently; do not "unify" these without re-measuring
+        // both.
+        let cmd: &[u8] = if self.listen_only {
+            &[GPIB_UNL, listen_address(self.my_pad)]
+        } else {
+            &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)]
+        };
+        self.send_command(cmd, true).await?;
         let req = encode_data_read(
             max_len,
             self.eos_mode(),
@@ -390,6 +442,106 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn srq_asserted(&mut self) -> Result<bool> {
+        Ok(self.bus_lines().await?.srq)
+    }
+
+    async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
+        // Preserve the binary-EOS bit the init sequence computes; it lives in
+        // the same AUXRA write as the holdoff bit, so rewriting one without it
+        // would silently turn binary mode off.
+        let bin = if self.eos_mode() & 0x0400 != 0 {
+            HR_BIN
+        } else {
+            0
+        };
+        let regs = if enable {
+            vec![
+                // Unaddressed listener.
+                NiRegister::new(SUBDEV_TNT4882, REG_ADMR, ADMR_DISABLE_SAD | HR_LON),
+                // Holdoff mode off, *then* finish any handshake already held
+                // off. Clearing the mode alone leaves an asserted holdoff
+                // asserted, and the talker stays blocked on the byte we are
+                // already sitting on.
+                //
+                // AUXMR only. `setup_init` also writes the AUXRA value to
+                // REG_AUXCR, but that is an init-context alias: REG_AUXCR and
+                // REG_SPMR are both offset 0x06, so outside init the same write
+                // lands in the serial-poll mode register and sets RSV — making
+                // the adapter assert SRQ. Mirroring it here broke capture until
+                // it was removed.
+                NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUXRA | bin),
+                NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUX_FH),
+            ]
+        } else {
+            // Leaving is not the inverse of entering. Clearing HR_LON and
+            // restoring the holdoff bit leaves the chip still holding NDAC and
+            // NRFD, and it can no longer address anyone — measured on a
+            // GPIB-USB-HS+, where an *IDN? after ++lon 0 failed with "no
+            // listener on bus" and the lines stayed at 0x31.
+            //
+            // So leave by re-initialising to a known-good controller state
+            // rather than by hand-crafting an inverse of a sequence whose
+            // TNT4882 semantics are not documented here. This pulses IFC,
+            // which is acceptable and arguably correct: taking the bus back is
+            // exactly what leaving capture mode means.
+            self.listen_only = false;
+            let my_pad = self.my_pad;
+            self.init(my_pad).await.context("ni leave listen-only")?;
+            tracing::info!("left listen-only; controller re-initialised");
+            return Ok(());
+        };
+        self.register_write(&regs)
+            .await
+            .context("ni enter listen-only")?;
+        self.listen_only = enable;
+        tracing::info!(listen_only = enable, "unaddressed listen");
+        Ok(())
+    }
+
+    fn listen_only(&self) -> bool {
+        self.listen_only
+    }
+
+    async fn set_device_mode(&mut self, address: Option<u8>) -> Result<()> {
+        let Some(addr) = address else {
+            // Back to controller. Re-initialise rather than trying to invert
+            // the sequence below: `init` retakes system control and pulses IFC,
+            // which is exactly what reclaiming the bus means.
+            self.device_address = None;
+            let my_pad = self.my_pad;
+            self.init(my_pad).await.context("ni leave device mode")?;
+            tracing::info!("left device mode; controller re-initialised");
+            return Ok(());
+        };
+        if addr > 30 {
+            anyhow::bail!("device address {addr} is out of range (0-30)");
+        }
+        // Release system control, in the order the kernel driver uses
+        // (`ni_usb_gpib.c:1087-1103`): drop REN, drop IFC, disable system
+        // control, then clear the system-controller bit. Dropping REN first
+        // matters — it is what returns every instrument on the bus to local,
+        // and we are about to stop being the controller that asserted it.
+        let regs = vec![
+            NiRegister::new(SUBDEV_TNT4882, REG_ADR, addr & 0x1f),
+            NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUX_CREN),
+            NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUX_CIFC),
+            NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUX_DSC),
+            NiRegister::new(SUBDEV_TNT4882, REG_CMDR, CMDR_CLRSC),
+        ];
+        self.register_write(&regs)
+            .await
+            .context("ni enter device mode")?;
+        self.device_address = Some(addr);
+        self.listen_only = false;
+        tracing::info!(address = addr, "device mode: no longer controller");
+        Ok(())
+    }
+
+    fn device_address(&self) -> Option<u8> {
+        self.device_address
+    }
+
+    async fn bus_lines(&mut self) -> Result<crate::backend::BusLines> {
         let vals = self
             .register_read(&[(SUBDEV_TNT4882, REG_BSR)])
             .await
@@ -397,7 +549,9 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         let bsr = *vals
             .first()
             .ok_or_else(|| anyhow::anyhow!("ni bus status read returned no data"))?;
-        Ok(bsr & BCSR_SRQ != 0)
+        let lines = crate::backend::BusLines::from_bsr(bsr);
+        tracing::debug!(bus = %lines, "bus status");
+        Ok(lines)
     }
 
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
@@ -562,6 +716,54 @@ mod tests {
     fn op_ok() -> Vec<u8> {
         // 12-byte status response, error 0, count 0.
         vec![0u8; 12]
+    }
+
+    /// A backend that cannot do a thing must say so rather than quietly
+    /// succeeding — the roadmap's "no plausible lies" rule. A silent success
+    /// here would leave a caller believing it was capturing when it was not.
+    #[tokio::test]
+    async fn mode_switches_report_their_own_state() {
+        let t = MockTransport::new(init_responses());
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.init(0).await.unwrap();
+        assert!(!be.listen_only());
+        assert_eq!(be.device_address(), None);
+    }
+
+    /// 31 is the untalk code, not a primary address. Accepting it would point
+    /// the daemon at an address that by construction cannot be addressed.
+    #[tokio::test]
+    async fn device_mode_rejects_addresses_above_30() {
+        let t = MockTransport::new(init_responses());
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.init(0).await.unwrap();
+        for bad in [31u8, 32, 255] {
+            assert!(
+                be.set_device_mode(Some(bad)).await.is_err(),
+                "address {bad} should have been refused"
+            );
+            assert_eq!(be.device_address(), None, "a refused address must not stick");
+        }
+    }
+
+    /// Writing while capturing cannot work and must not be attempted: in
+    /// listen-only the RFD holdoff is released and in device mode we are not
+    /// the controller at all. Failing loudly beats corrupting a capture.
+    #[tokio::test]
+    async fn writes_are_refused_while_capturing() {
+        let mut responses = init_responses();
+        responses.push(reg_write_ok(3)); // set_listen_only registers
+        responses.push(op_ok()); // listen-only addressing
+        let t = MockTransport::new(responses);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.init(0).await.unwrap();
+        be.set_listen_only(true).await.unwrap();
+        assert!(be.listen_only());
+        let err = be.write(5, b"*IDN?", true).await.unwrap_err().to_string();
+        assert!(
+            err.contains("listen-only"),
+            "refusal should name the mode, got: {err}"
+        );
     }
 
     #[tokio::test]

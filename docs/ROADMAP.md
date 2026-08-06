@@ -50,6 +50,10 @@ misleading here.
 the *controller* would present, which is meaningless for a controller-only
 implementation. `++mode 0` (device mode) is correctly rejected as unsupported.
 
+`++mode 0` is the one worth revisiting: real Prologix device mode dumps received
+data straight to the client, which is the same primitive an unaddressed-listen
+capture needs. See `CAPTURE.md` for the design that would close it.
+
 ## 4. Secondary addressing
 
 `setup_init` programs the NI adapter with secondary addressing disabled
@@ -76,3 +80,34 @@ the type numbers. If it turns out to belong to the TLS story, fold this into
 item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
+
+## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
+
+Removed as an open gap, recorded because the failure mode is invisible and
+cost a whole bench session's worth of false negatives before it was understood.
+
+The bulk pipe on both adapters is strictly request/response. One stale reply
+desynchronises every transaction after it, and the symptom is not "the adapter
+is broken" but *plausible wrong answers*: reads return nothing, captures come
+up empty, and an instrument that is working perfectly looks like it is doing
+nothing. The NI reports `missing chunk start id`; the 82357 reports
+`unexpected response byte 0xfa, expected 0xfb`, or silently delivers its own
+`0xfb` response code as if it were instrument data.
+
+Two causes, both fixed:
+
+* **Cancelling a bus read mid-transfer.** The capture loop selected on the
+  client socket against the USB read, so a disconnect dropped a future holding
+  an in-flight bulk transfer. The adapter still sent its response and nobody
+  consumed it. Socket reads are cancel-safe in tokio; USB transfers are not,
+  and the two must not be selected against each other. Disconnects are now
+  noticed *between* reads.
+* **Starting against a pipe left dirty by a dead predecessor.** `init` now
+  drains stale responses first. Before that, a fresh daemon failed its first
+  init and succeeded on the second — the retry "worked" only because it
+  consumed the leftovers, which is why this looked like flakiness rather than
+  a bug.
+
+The general lesson for this codebase: never cancel a future that owns a USB
+transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
+resynchronised afterwards, not merely abandoned.

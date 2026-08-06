@@ -37,10 +37,35 @@ is what IEEE-488 says happens. `++llo` sends Local Lockout, which is universal:
 it disables the local key on every device on the bus, and dropping REN is the
 only way to clear it.
 
-See [ROADMAP.md](ROADMAP.md) for the remaining gaps.
+### ugpibd extensions
+
+Not Prologix commands. They exist because `++srq` answers one bit of a register
+whose other seven bits are what you need when a capture is silent, and because
+capture has to be reachable at runtime — the daemon is usually socket- or
+systemd-activated, so a mode settable only by restarting with a different flag
+would not be settable in practice.
+
+| Command | Effect |
+|---|---|
+| `++lines` | Dump the eight bus control lines, e.g. `0x31 NDAC NRFD REN` |
+| `++lon [0\|1]` | Unaddressed listen, for a talk-only instrument. No argument queries |
+| `++dev [addr\|off]` | Act as a GPIB *device* at `addr` instead of as a controller. No argument queries |
+
+`++lon` and `++dev` are mutually exclusive with ordinary traffic: writes are
+refused while either is on, because in listen-only the RFD holdoff is released
+and in device mode the daemon is not the controller at all. Leaving either mode
+re-initialises the adapter, which pulses IFC — that is the point, since
+reclaiming the bus is what leaving means.
+
+See [CAPTURE.md](CAPTURE.md) for which instruments need which, and
+[ROADMAP.md](ROADMAP.md) for the remaining gaps.
 
 ## Hardware limitations (adapter firmware)
 
-- Controller-only — no device mode, so `++mode 0` returns an error
+- `++mode 0` returns an error. This is *not* because the hardware is
+  controller-only — `++dev` above is a working device mode on the NI adapters,
+  and an SR620 plots to it. It is that Prologix device mode also implies
+  dumping received data inline on the same connection, which `--capture-port`
+  does instead. See ROADMAP item 3.
 - No secondary addressing
 - 8-bit EOS comparison only
