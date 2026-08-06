@@ -1078,3 +1078,62 @@ wire would settle it in one capture.
 
 C2 (does talk-only monopolise the bus) needs two instruments attached at once,
 one of them talking.
+
+### 14.18 The adapter refuses reads it does not consider itself addressed for
+
+Where §14.15 ended ("the fault is in what the adapter requires before it will
+collect bytes in this mode — and it wants study rather than more attempts at
+the bench"), studying the adapter delivered. What follows is the observed
+behavioural contract.
+
+**The adapter can refuse a read outright, and says so.** A read issued while
+the adapter does not consider itself a listener is not armed at all: it
+completes *immediately*, with zero data bytes and a trailing flags byte of
+`ATRF_UNADDRESSED` (`0x80`). This is a different observable from an armed
+read on a quiet bus, which runs until count, terminator, or host timeout.
+
+**Whether it considers itself a listener follows the addressing it transmits.**
+The adapter tracks the command bytes it is asked to send: `MLA(us)` marks it a
+listener, `UNL` un-marks it, `MTA(us)` / `UNT` do the same for talking — the
+same job as `check_my_address_state()` in the kernel's `tms9914.c`, done
+inside the adapter. `AUX_LON | AUX_CS` raises the same listener state
+standing. This is why ordinary controller reads always worked: their
+`UNL, MLA(0), MTA(pad)` preamble re-marks the adapter a listener every time.
+And it is why order in `set_listen_only` was a landmine: sending `UNL` *after*
+raising listen-only silently un-marks the adapter, and every capture read
+thereafter is refused. The addressing now goes first, the mode bit last.
+Command bytes that fail to handshake (no acceptor on the bus) do not count —
+which retroactively invalidates one §14.15 theory-table entry: "the adapter
+must see `MLA(us)` go by — tried, didn't help" was never actually tested,
+because that MLA never completed its handshake.
+
+The listener state is also lost on adapter reset and USB suspend/resume.
+Notably *not* on the list: `XFER_ABORT`, so the capture loop's timeout path
+is innocent.
+
+**A refused read and a quiet bus were indistinguishable — now they are not.**
+`decode_gpib_read_response` used to discard the trailing flags byte unless it
+was EOI/EOS, so a capture stream fed by refused reads (instant, empty,
+`ATRF_UNADDRESSED`) looked identical to one fed by armed reads on a silent
+bus (timeout, empty). Every §14.15 bench session ran blind to this
+distinction. The backend now logs the trailing byte and the read duration,
+and warns specifically on `ATRF_UNADDRESSED`. Next bench session, that one
+log line picks the branch: refusals mean the listener state got dropped
+(the causes are enumerated above); genuine timeouts while an instrument is
+talking mean the fault is below the protocol layer, and the USB capture of a
+working driver that §14.15 wanted becomes the right tool — with the narrower
+question "what does an armed read look like".
+
+**Verified on hardware** (82357B, empty bus): with listen-only raised, a
+capture read *arms* — it ran the full host timeout on the silent bus. With
+the listener state dropped, the identical read returned in 0 ms with zero
+bytes and trailing `ATRF_UNADDRESSED`, and the new warn line fired. The
+refusal-vs-quiet-bus discriminator works; what still needs an instrument is
+whether the armed read then collects (`examples/lon_gate_probe.rs` is the
+probe). One incidental find, fixed in the same change: after a command send
+that fails for lack of an acceptor, the adapter answers nothing further on
+the bulk pipe until `XFER_ABORT` — and the failure can look like success from
+the host — so `set_listen_only` now aborts and drains unconditionally after
+its self-addressing attempt. Mode entry on an empty bus leaves the lines at
+`ATN | REN`; that is the §14.15 hold-ATN-at-idle behaviour, and ATN release
+belongs to the armed read, not to mode entry.
