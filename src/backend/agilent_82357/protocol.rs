@@ -41,7 +41,18 @@ pub enum ReadFlag {
 }
 
 pub const ATRF_EOI: u8 = 0x01;
+pub const ATRF_ATN: u8 = 0x02;
+pub const ATRF_IFC: u8 = 0x04;
 pub const ATRF_EOS: u8 = 0x08;
+pub const ATRF_ABORT: u8 = 0x10;
+pub const ATRF_COUNT: u8 = 0x20;
+pub const ATRF_DEAD_BUS: u8 = 0x40;
+/// The adapter refused the read outright: it did not consider itself a
+/// listener, never armed the transfer, and answered with this flag alone.
+/// See `docs/CAPTURE.md` §14.18 — a read that ends this way returns
+/// *immediately*, which is the observable difference between "refused" and
+/// "armed but the bus stayed quiet" (a timeout).
+pub const ATRF_UNADDRESSED: u8 = 0x80;
 
 pub const XFER_ABORT: u16 = 0xa0;
 pub const XFER_STATUS: u16 = 0xb0;
@@ -119,6 +130,10 @@ pub const TMS_PPR: u8 = 0x06;
 pub const AUX_CS: u8 = 0x80;
 pub const AUX_CHIP_RESET: u8 = 0x00;
 pub const AUX_INVAL: u8 = 0x01;
+/// Holdoff on all data bytes: the chip stops the acceptor handshake after
+/// every byte until the holdoff is released. Without it a listening chip
+/// free-runs the handshake and data passes through uncollected.
+pub const AUX_HLDA: u8 = 0x03;
 pub const AUX_HLDE: u8 = 0x04;
 pub const AUX_NBAF: u8 = 0x05;
 pub const AUX_LON: u8 = 0x09;
@@ -328,14 +343,41 @@ pub fn encode_gpib_read(
     out
 }
 
-/// Returns (data_bytes, end_of_message) from a bulk-IN read response.
-/// The last byte of the response is the trailing flags byte; it is stripped.
-pub fn decode_gpib_read_response(raw: &[u8]) -> (Vec<u8>, bool) {
+/// Returns (data_bytes, end_of_message, trailing_flags) from a bulk-IN read
+/// response. The last byte of the response is the trailing flags byte; it is
+/// stripped from the data and returned so callers can tell *why* the read
+/// ended — the non-EOI/EOS reasons (`ATRF_UNADDRESSED` above all) are the
+/// diagnostic this backend went a long time without.
+pub fn decode_gpib_read_response(raw: &[u8]) -> (Vec<u8>, bool, u8) {
     if raw.is_empty() {
-        return (vec![], false);
+        return (vec![], false, 0);
     }
     let trailing = raw[raw.len() - 1];
     let data = raw[..raw.len() - 1].to_vec();
     let eom = trailing & (ATRF_EOI | ATRF_EOS) != 0;
-    (data, eom)
+    (data, eom, trailing)
+}
+
+/// Human-readable termination reasons for a trailing flags byte, for logs.
+pub fn describe_read_termination(trailing: u8) -> String {
+    let names = [
+        (ATRF_EOI, "EOI"),
+        (ATRF_ATN, "ATN"),
+        (ATRF_IFC, "IFC"),
+        (ATRF_EOS, "EOS"),
+        (ATRF_ABORT, "ABORT"),
+        (ATRF_COUNT, "COUNT"),
+        (ATRF_DEAD_BUS, "DEAD_BUS"),
+        (ATRF_UNADDRESSED, "UNADDRESSED"),
+    ];
+    let set: Vec<&str> = names
+        .iter()
+        .filter(|(bit, _)| trailing & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if set.is_empty() {
+        format!("{trailing:#04x} (none)")
+    } else {
+        format!("{trailing:#04x} ({})", set.join("|"))
+    }
 }

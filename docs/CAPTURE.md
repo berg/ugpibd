@@ -1078,3 +1078,114 @@ wire would settle it in one capture.
 
 C2 (does talk-only monopolise the bus) needs two instruments attached at once,
 one of them talking.
+
+### 14.18 The adapter refuses reads it does not consider itself addressed for
+
+Where §14.15 ended ("the fault is in what the adapter requires before it will
+collect bytes in this mode — and it wants study rather than more attempts at
+the bench"), studying the adapter delivered. What follows is the observed
+behavioural contract.
+
+**The adapter can refuse a read outright, and says so.** A read issued while
+the adapter does not consider itself a listener is not armed at all: it
+completes *immediately*, with zero data bytes and a trailing flags byte of
+`ATRF_UNADDRESSED` (`0x80`). This is a different observable from an armed
+read on a quiet bus, which runs until count, terminator, or host timeout.
+
+**Whether it considers itself a listener follows the addressing it transmits.**
+The adapter tracks the command bytes it is asked to send: `MLA(us)` marks it a
+listener, `UNL` un-marks it, `MTA(us)` / `UNT` do the same for talking — the
+same job as `check_my_address_state()` in the kernel's `tms9914.c`, done
+inside the adapter. `AUX_LON | AUX_CS` raises the same listener state
+standing. This is why ordinary controller reads always worked: their
+`UNL, MLA(0), MTA(pad)` preamble re-marks the adapter a listener every time.
+And it is why order in `set_listen_only` was a landmine: sending `UNL` *after*
+raising listen-only silently un-marks the adapter, and every capture read
+thereafter is refused. The addressing now goes first, the mode bit last.
+Command bytes that fail to handshake (no acceptor on the bus) do not count —
+which retroactively invalidates one §14.15 theory-table entry: "the adapter
+must see `MLA(us)` go by — tried, didn't help" was never actually tested,
+because that MLA never completed its handshake.
+
+The listener state is also lost on adapter reset and USB suspend/resume.
+Notably *not* on the list: `XFER_ABORT`, so the capture loop's timeout path
+is innocent.
+
+**A refused read and a quiet bus were indistinguishable — now they are not.**
+`decode_gpib_read_response` used to discard the trailing flags byte unless it
+was EOI/EOS, so a capture stream fed by refused reads (instant, empty,
+`ATRF_UNADDRESSED`) looked identical to one fed by armed reads on a silent
+bus (timeout, empty). Every §14.15 bench session ran blind to this
+distinction. The backend now logs the trailing byte and the read duration,
+and warns specifically on `ATRF_UNADDRESSED`. Next bench session, that one
+log line picks the branch: refusals mean the listener state got dropped
+(the causes are enumerated above); genuine timeouts while an instrument is
+talking mean the fault is below the protocol layer, and the USB capture of a
+working driver that §14.15 wanted becomes the right tool — with the narrower
+question "what does an armed read look like".
+
+**Verified on hardware** (82357B, empty bus): with listen-only raised, a
+capture read *arms* — it ran the full host timeout on the silent bus. With
+the listener state dropped, the identical read returned in 0 ms with zero
+bytes and trailing `ATRF_UNADDRESSED`, and the new warn line fired. The
+refusal-vs-quiet-bus discriminator works; what still needs an instrument is
+whether the armed read then collects (`examples/lon_gate_probe.rs` is the
+probe). One incidental find, fixed in the same change: after a command send
+that fails for lack of an acceptor, the adapter answers nothing further on
+the bulk pipe until `XFER_ABORT` — and the failure can look like success from
+the host — so `set_listen_only` now aborts and drains unconditionally after
+its self-addressing attempt. Mode entry on an empty bus leaves the lines at
+`ATN | REN`; that is the §14.15 hold-ATN-at-idle behaviour, and ATN release
+belongs to the armed read, not to mode entry.
+
+### 14.19 Resolved: 82357B listen-only capture works
+
+An HP 53310A print captured complete through an 82357B: 30,745 bytes, byte
+level identical in format to the NI fixture — same PCL preamble
+(`\e*r640S\e*rA\e*b74W…`), full raster body, proper `\e*rB` terminator. Two
+further faults beyond §14.18's gate, each of which masked the next, and each
+invisible without the previous one fixed:
+
+**The chip free-ran the acceptor handshake.** With listen-only raised and no
+RFD holdoff configured, the TMS9914 completes the handshake for every byte on
+its own; the data is gone before the collection engine can take it. The
+talker finishes its entire transmission convinced it had a listener — it did:
+the chip, acknowledging bytes into the void. Init clears holdoff mode (the
+kernel init sweep it mirrors does the same, correctly for a *controller*),
+and mode entry's `AUX_VAL` release — added to fix §14.16's "no ready
+listeners" — completed the free-run. The fix is `AUX_HLDA | AUX_CS`
+(holdoff on all) at mode entry, cleared on exit, exactly the discipline
+`nec7210_read` uses per byte. Confirmed at the bench in isolation: with
+holdoff set and *no* read armed, a print accepts one byte and then holds —
+NRFD stays asserted and the talker waits — where before it "printed
+successfully" into nothing.
+
+**The timeout path discarded everything an armed read had collected.**
+`tokio::time::timeout` *drops* the in-flight bulk transfer, and with it every
+byte buffered inside. A capture read times out on every quiet interval by
+design, and a print smaller than the 64 KiB request that does not end in EOI
+never completes the read on its own — so the engine collected entire pages at
+full speed and the host threw them away, indistinguishable from "no bytes
+ever arrived". §14.15's theory table even contains the mechanism ("the abort
+discards the page") — it was rejected only because `end_on_eoi` was assumed
+to terminate reads early, and this instrument does not assert EOI mid-page.
+The fix: on timeout in listen-only, do not abandon the transfer — send
+`XFER_ABORT` while the bulk read is still pending; the adapter ends the
+transfer with a trailing flags byte (`ATRF_ABORT`), the pending read
+completes with the data, and the salvaged bytes go to the client. A quiet
+interval now returns an empty successful read rather than an error.
+
+With all three fixed, the capture loop runs: armed reads salvage on every
+timeout, holdoff parks the talker across re-arm gaps (NRFD held, no bytes
+lost in the gap), and the §14.18 logging distinguishes refusal, quiet, and
+collection at a glance.
+
+Found and fixed in the same session: the capture front-end's
+client-departure watcher did not fire when a client vanished mid-session —
+the loop kept arming reads until the mode was toggled off. The watcher was
+an inline future polled non-blockingly between reads; the doc comment above
+it said "a separate task setting a flag", and the doc was right. It is now a
+spawned task owning the read half, setting an atomic flag the loop checks
+between reads. Verified against both a gracefully-closing and a killed
+client: departure noticed within one read cycle, single-client slot
+released, next client accepted.
