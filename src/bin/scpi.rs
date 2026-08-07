@@ -16,6 +16,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use tokio::runtime::{Builder, Runtime};
 use ugpibd::hislip::client::HislipClient;
+use ugpibd::hislip::server::query_hint;
 use ugpibd::hislip::STANDARD_PORT;
 
 /// Vendor id the client advertises in the HiSLIP Initialize handshake.
@@ -113,7 +114,7 @@ fn handle_line(rt: &Runtime, client: &mut HislipClient, line: &str) -> Step {
 
     let result: Result<()> = if let Some(rest) = trimmed.strip_prefix("++") {
         handle_meta(rt, client, rest)
-    } else if trimmed.contains('?') {
+    } else if query_hint(trimmed.as_bytes()) {
         rt.block_on(client.query(trimmed.as_bytes()))
             .map(|resp| print_response(&resp))
     } else {

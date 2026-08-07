@@ -68,16 +68,43 @@ impl Device for GpibInstrument {
         let mut srq = ctrl.subscribe_srq();
 
         ctrl.write(self.pad, cmd, true).await?;
-        if !expect_response {
-            return Ok(Execution::default());
-        }
 
         // Poll before draining, not after. If the instrument is already asking
         // for service this is the one moment its own status byte can still be
         // read; afterwards the condition is gone. Measured on an HP 34401A:
         // SRQ comes up 5-13 ms after the write, and the poll returns 0x50.
         let mut service_request = None;
-        if ctrl.srq_asserted().await.unwrap_or(false) {
+        if !expect_response {
+            // The command text says no response, but the text is only a hint
+            // (`ROADMAP` gap 7, both directions observed): ask the instrument
+            // instead. One serial poll — if MAV is set, output is pending
+            // (unsolicited, or a query the hint missed) and skipping the read
+            // would strand it in the output queue where it corrupts the *next*
+            // exchange. If this poll catches RQS it must also be surfaced:
+            // reading the status byte cleared it, and dropping it here would
+            // eat a service request.
+            match ctrl.serial_poll(self.pad).await {
+                Ok(stb) => {
+                    if stb & STB_RQS != 0 {
+                        service_request = Some(stb);
+                    }
+                    if stb & STB_MAV == 0 {
+                        return Ok(Execution {
+                            data: None,
+                            service_request,
+                        });
+                    }
+                    debug!("MAV set after a write the hint called response-less; reading");
+                }
+                Err(e) => {
+                    debug!("post-write MAV poll failed: {e:#}");
+                    return Ok(Execution {
+                        data: None,
+                        service_request,
+                    });
+                }
+            }
+        } else if ctrl.srq_asserted().await.unwrap_or(false) {
             match ctrl.serial_poll(self.pad).await {
                 Ok(stb) if stb & STB_RQS != 0 => service_request = Some(stb),
                 // SRQ is a wired-OR: somebody else on the bus is holding it.
