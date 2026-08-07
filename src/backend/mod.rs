@@ -414,7 +414,10 @@ mod tests {
     #[test]
     fn bus_lines_decode_each_bit_in_isolation() {
         for (bit, get) in [
-            (BusLines::REN, (|l: &BusLines| l.ren) as fn(&BusLines) -> bool),
+            (
+                BusLines::REN,
+                (|l: &BusLines| l.ren) as fn(&BusLines) -> bool,
+            ),
             (BusLines::IFC, |l| l.ifc),
             (BusLines::SRQ, |l| l.srq),
             (BusLines::EOI, |l| l.eoi),

@@ -742,7 +742,11 @@ mod tests {
                 be.set_device_mode(Some(bad)).await.is_err(),
                 "address {bad} should have been refused"
             );
-            assert_eq!(be.device_address(), None, "a refused address must not stick");
+            assert_eq!(
+                be.device_address(),
+                None,
+                "a refused address must not stick"
+            );
         }
     }
 

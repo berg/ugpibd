@@ -231,11 +231,20 @@ fn lines_takes_no_argument() {
 #[test]
 fn lon_sets_clears_and_queries() {
     let mut s = PrologixState::default();
-    assert!(matches!(s.handle_line("++lon 1"), LineResult::ListenOnly(Some(true))));
-    assert!(matches!(s.handle_line("++lon 0"), LineResult::ListenOnly(Some(false))));
+    assert!(matches!(
+        s.handle_line("++lon 1"),
+        LineResult::ListenOnly(Some(true))
+    ));
+    assert!(matches!(
+        s.handle_line("++lon 0"),
+        LineResult::ListenOnly(Some(false))
+    ));
     // No argument asks rather than assumes: the answer lives in the backend,
     // not in this parser, so it must not be guessed here.
-    assert!(matches!(s.handle_line("++lon"), LineResult::ListenOnly(None)));
+    assert!(matches!(
+        s.handle_line("++lon"),
+        LineResult::ListenOnly(None)
+    ));
 }
 
 #[test]
@@ -252,11 +261,26 @@ fn lon_rejects_anything_but_0_or_1() {
 #[test]
 fn dev_takes_an_address_or_off_or_queries() {
     let mut s = PrologixState::default();
-    assert!(matches!(s.handle_line("++dev 5"), LineResult::DeviceMode(Some(Some(5)))));
-    assert!(matches!(s.handle_line("++dev 0"), LineResult::DeviceMode(Some(Some(0)))));
-    assert!(matches!(s.handle_line("++dev 30"), LineResult::DeviceMode(Some(Some(30)))));
-    assert!(matches!(s.handle_line("++dev off"), LineResult::DeviceMode(Some(None))));
-    assert!(matches!(s.handle_line("++dev"), LineResult::DeviceMode(None)));
+    assert!(matches!(
+        s.handle_line("++dev 5"),
+        LineResult::DeviceMode(Some(Some(5)))
+    ));
+    assert!(matches!(
+        s.handle_line("++dev 0"),
+        LineResult::DeviceMode(Some(Some(0)))
+    ));
+    assert!(matches!(
+        s.handle_line("++dev 30"),
+        LineResult::DeviceMode(Some(Some(30)))
+    ));
+    assert!(matches!(
+        s.handle_line("++dev off"),
+        LineResult::DeviceMode(Some(None))
+    ));
+    assert!(matches!(
+        s.handle_line("++dev"),
+        LineResult::DeviceMode(None)
+    ));
 }
 
 /// 31 is not a primary address — it is the untalk/unlisten code — so it must be
@@ -266,7 +290,13 @@ fn dev_takes_an_address_or_off_or_queries() {
 #[test]
 fn dev_rejects_31_and_other_non_addresses() {
     let mut s = PrologixState::default();
-    for bad in ["++dev 31", "++dev 255", "++dev -1", "++dev five", "++dev on"] {
+    for bad in [
+        "++dev 31",
+        "++dev 255",
+        "++dev -1",
+        "++dev five",
+        "++dev on",
+    ] {
         assert!(
             matches!(s.handle_line(bad), LineResult::Error(_)),
             "{bad} should have been refused"

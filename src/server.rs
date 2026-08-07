@@ -117,9 +117,7 @@ async fn handle_connection(
             LineResult::ListenOnly(Some(enable)) => {
                 if let Err(e) = ctrl.lock().await.set_listen_only(enable).await {
                     warn!("gpib set_listen_only({enable}) failed: {e:#}");
-                    writer
-                        .write_all(format!("error: {e}\n").as_bytes())
-                        .await?;
+                    writer.write_all(format!("error: {e}\n").as_bytes()).await?;
                 }
             }
             LineResult::DeviceMode(None) => {
@@ -132,9 +130,7 @@ async fn handle_connection(
             LineResult::DeviceMode(Some(target)) => {
                 if let Err(e) = ctrl.lock().await.set_device_mode(target).await {
                     warn!("gpib set_device_mode({target:?}) failed: {e:#}");
-                    writer
-                        .write_all(format!("error: {e}\n").as_bytes())
-                        .await?;
+                    writer.write_all(format!("error: {e}\n").as_bytes()).await?;
                 }
             }
             LineResult::BusLines => match ctrl.lock().await.bus_lines().await {
