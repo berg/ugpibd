@@ -73,7 +73,10 @@ impl From<Option<Vec<u8>>> for Execution {
 #[async_trait::async_trait]
 pub trait Device: Send + Sync + 'static {
     /// Execute a full query: write `cmd` to the instrument with EOI on the
-    /// last byte, then (if `expect_response`) read a response.
+    /// last byte, then read a response. `expect_response` is a *hint* from the
+    /// command text: when true the device commits to an addressed read; when
+    /// false it may still read if the instrument reports pending output (MAV),
+    /// so a mis-hinted query is recovered rather than stranded.
     async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Execution>;
 
     /// Send a GPIB trigger (GET) to the instrument.
@@ -758,7 +761,7 @@ where
                 // instead of leaving this task parked on a lock it no longer
                 // wants.
                 entry.wait_for_access().await;
-                let expect_response = cmd.contains(&b'?');
+                let expect_response = query_hint(&cmd);
                 debug!(
                     "exec ({} bytes, expect_response={}): {}",
                     cmd.len(),
@@ -1453,6 +1456,39 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// Whether a command looks like a query: a `?` *outside* string literals.
+///
+/// This is a hint, not the decision — the device's `execute` asks the
+/// instrument itself (MAV in the status byte) whether output is pending, so a
+/// missed query here still gets its response read. What the hint controls is
+/// the expensive path: blocking on an addressed read that nothing will answer.
+/// `DISP:TEXT "why?"` must not look like a query, or a valid command reports a
+/// timeout — observed, not theoretical.
+///
+/// SCPI string literals are single- or double-quoted, and a doubled quote
+/// inside is an escape. The scan does not need to understand the escape: `""`
+/// reads as close-then-reopen, which keeps the text between quotes either way.
+/// An unterminated literal quotes the rest of the message, which errs toward
+/// "not a query" — the MAV check downstream covers it.
+pub fn query_hint(cmd: &[u8]) -> bool {
+    let mut quote: Option<u8> = None;
+    for &b in cmd {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'?' => return true,
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 fn escape_bytes_truncated(bytes: &[u8], max: usize) -> String {
     if bytes.len() <= max {
         escape_bytes(bytes)
@@ -1466,6 +1502,37 @@ fn escape_bytes_truncated(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_hint_finds_ordinary_queries() {
+        assert!(query_hint(b"*IDN?"));
+        assert!(query_hint(b"MEAS:VOLT:DC?"));
+        assert!(query_hint(b":SYST:ERR?\n"));
+        assert!(query_hint(b"CONF:VOLT:DC 10; :READ?"));
+    }
+
+    #[test]
+    fn query_hint_ignores_question_marks_inside_strings() {
+        assert!(!query_hint(b"DISP:TEXT \"why?\""));
+        assert!(!query_hint(b"DISP:TEXT 'why?'"));
+        // Doubled-quote escape keeps the text quoted.
+        assert!(!query_hint(b"DISP:TEXT \"he said \"\"what?\"\"\""));
+    }
+
+    #[test]
+    fn query_hint_sees_queries_next_to_strings() {
+        assert!(query_hint(b"DISP:TEXT \"ready\"; *OPC?"));
+        // A quote character of the other kind inside a literal does not close it.
+        assert!(query_hint(b"DISP:TEXT 'a \"b'; *ESR?"));
+    }
+
+    #[test]
+    fn query_hint_plain_commands_are_not_queries() {
+        assert!(!query_hint(b"*RST"));
+        assert!(!query_hint(b"SYST:REM"));
+        // Unterminated literal errs toward "not a query".
+        assert!(!query_hint(b"DISP:TEXT \"oops?"));
+    }
 
     #[test]
     fn parse_pad() {

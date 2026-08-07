@@ -135,32 +135,3 @@ class of problem and chose to ignore the acceptor check.
 **What "fixed" means:** an empty bus is a legitimate state, not an error. The
 daemon should start, serve clients, and let individual operations fail with
 "no listener" — which they already do correctly.
-
-## 7. Read-after-write is decided by sniffing for `?`
-
-**Now:** the HiSLIP front-end reads the instrument only when the command just
-written contains a question mark — `let expect_response = cmd.contains(&b'?')`
-(`src/hislip/server.rs:761`).
-
-**Why:** it is the cheap heuristic, and for ordinary SCPI traffic it is almost
-always right.
-
-**Where it is wrong, both observed rather than theoretical:**
-
-- *False positive.* A `?` inside a string argument — `DISP:TEXT "why?"` — makes
-  the daemon attempt a read that nothing will answer, so a valid command
-  reports a timeout.
-- *False negative.* Any output the instrument produces without being asked:
-  talk-only sources, plot dumps, anything unsolicited. This is why the HiSLIP
-  front-end cannot capture at all (`docs/CAPTURE.md` §14.2).
-
-**The better mechanism, which we already have the parts for:** serial-poll for
-MAV and read if it is set. The instrument answers this question itself — a
-34401A with data pending returned status `0x10` (MAV) on the bench — and
-`GpibInstrument::execute` already serial-polls around the read for the SRQ path
-(`src/hislip/instrument.rs:75-89`). Deciding *whether* to read from MAV rather
-than from the command text would fix both failure modes at once.
-
-**Watch out:** MAV is not free — it is an extra bus transaction per write, and
-the existing poll is deliberately placed *before* the read for SRQ reasons.
-Moving to MAV means being careful not to disturb that ordering.
