@@ -5,6 +5,81 @@ as its release notes, so it is written for someone deciding whether to upgrade
 rather than for someone reading the diff — `scripts/release` refuses to tag a
 version that has no entry here.
 
+## v0.6.0 — 2026-08-06
+
+Instruments that plot or print to GPIB can now be captured, on every adapter.
+The daemon starts on an empty bus. And whether a HiSLIP command gets a read
+after its write is now decided by the instrument, not by grepping the command
+for a question mark.
+
+### Capture plots and prints off the bus
+
+An instrument that plots or prints never answers a query: it drives the bus as
+a talker, and until a listener exists it emits nothing at all. Two new modes
+cover the two ways instruments do this — which one you need is a property of
+the instrument:
+
+- `++lon` / `--listen-only` — unaddressed listen, for a talk-only source
+- `++dev` / `--listen-address` — act as a GPIB device at a primary address,
+  for instruments that address their plotter
+
+Both stream raw bytes to `--capture-port`, unframed and uninterpreted; writes
+are refused while a mode is active, and leaving one re-initialises the
+controller. `++lines` reports the eight bus control lines — the first thing to
+reach for when a capture is silent, because it distinguishes an instrument
+that is not transmitting from one transmitting where we cannot hear it.
+
+Verified on real hardware on both adapter families: an HP 53310A prints a full
+page of PCL raster and an SRS SR620 plots HP-GL through device mode on the NI
+GPIB-USB-HS+, and the same 53310A print captures byte-identical through an
+82357B.
+
+Getting the 82357 there fixed real faults: without RFD holdoff the TMS9914
+acknowledged every byte on its own and the data was gone before the daemon
+could collect it (the talker finishes convinced it had a listener — it did),
+a timed-out read discarded everything it had already collected, and a read the
+adapter refused for not being a listener was indistinguishable from a quiet
+bus. Along the way, two general 82357 faults that produced plausible wrong
+answers rather than errors: a USB transfer cancelled mid-flight desynchronised
+the next transaction, and init did not drain a pipe left dirty by a dead
+predecessor.
+
+### The daemon starts on an empty bus
+
+Starting the daemon with the adapter plugged in but no instrument powered on
+failed as fatal — "no devices on the GPIB bus" — because init's trailing
+self-addressing needs an acceptor and there was none. Plugging in the adapter
+before the instruments is the obvious order to try, which made this a
+first-use blocker. The check is now non-fatal and quick: the daemon starts,
+serves clients, reports per-operation errors while the bus is empty, and an
+instrument powered on later answers its first query.
+
+### The instrument decides whether a write gets a read
+
+HiSLIP read-after-write was decided by sniffing the command text for `?`, with
+both failure directions seen at the bench: `DISP:TEXT "why?"` timed out and
+left `-410` in the instrument's error queue, and output the sniff missed was
+stranded to corrupt the next exchange. The text is now only a quote-aware
+hint — a `?` inside a string literal no longer looks like a query — and when
+the hint says write-only, the daemon serial-polls once after the write and
+reads anyway if MAV is set. The `ugpibd-scpi` client shared the same sniff
+(a false positive froze the REPL) and now shares the fix.
+
+### Docs
+
+The README is cut down to intro, adapters, install, and usage. Protocol detail
+moved to `docs/` — HiSLIP locking and SRQ semantics in `docs/HISLIP.md`, the
+`++` command reference in `docs/PROLOGIX.md`, capture internals in
+`docs/CAPTURE.md`.
+
+### Behaviour changes worth knowing before upgrading
+
+- Write-only HiSLIP commands carry the cost of one serial poll after the
+  write. Genuine queries keep the exact read path they had.
+- An empty bus at startup is no longer an error; operations report "no
+  devices" individually instead.
+- While a capture mode is active, writes are refused.
+
 ## v0.5.0 — 2026-08-02
 
 The HiSLIP front-end went from "works for one client at a time" to conformant.
