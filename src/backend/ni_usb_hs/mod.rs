@@ -160,7 +160,20 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
     /// Take control (assert ATN), send command bytes, then optionally return to
     /// standby. Command bytes are capped at 16 per transfer by the hardware.
     async fn send_command(&self, cmd: &[u8], standby_after: bool) -> Result<()> {
-        let tc = timeout_code(self.timeout_ms);
+        self.send_command_bounded(cmd, standby_after, self.timeout_ms)
+            .await
+    }
+
+    /// `send_command` with an explicit adapter-side timeout, for callers that
+    /// expect the transfer may legitimately find no acceptor (init on an empty
+    /// bus) and must not stall for the full bus timeout finding out.
+    async fn send_command_bounded(
+        &self,
+        cmd: &[u8],
+        standby_after: bool,
+        timeout_ms: u32,
+    ) -> Result<()> {
+        let tc = timeout_code(timeout_ms);
         self.transact(&encode_take_control(true), OP_RESP_LEN)
             .await?;
         for chunk in cmd.chunks(16) {
@@ -242,9 +255,23 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // where init should leave it anyway — while establishing the state whose
         // absence causes the failure. Untalking here instead would be worse
         // than useless: it clears the very bit we need.
-        self.send_command(&[GPIB_UNL, talk_address(my_pad)], false)
+        // Non-fatal, and on a short leash. Command bytes are handshaken like
+        // any others, so with no powered instrument on the bus there is no
+        // acceptor and this transfer cannot complete — and an empty bus is a
+        // legitimate state to start in, not an error (ROADMAP gap 6: failing
+        // here blocked first use, where plugging in the adapter before the
+        // instruments is the obvious order). Both in-tree kernel drivers make
+        // the same call with `skip_check_for_command_acceptors = 1`. The short
+        // timeout keeps an empty-bus startup quick; with an acceptor present
+        // the bytes complete in microseconds, so it cannot misfire. The cost
+        // when this is skipped is only the cold-adapter quirk returning for
+        // one transfer once instruments do appear.
+        if let Err(e) = self
+            .send_command_bounded(&[GPIB_UNL, talk_address(my_pad)], false, 100)
             .await
-            .context("ni init: address self as talker")?;
+        {
+            warn!("ni init: addressing found no acceptor (empty bus?), continuing: {e:#}");
+        }
 
         // Spend the first data write here, because a freshly plugged adapter
         // loses it. Its command path is fine — addressing is accepted and
@@ -716,6 +743,40 @@ mod tests {
     fn op_ok() -> Vec<u8> {
         // 12-byte status response, error 0, count 0.
         vec![0u8; 12]
+    }
+
+    fn op_err(code: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b[3] = code;
+        b
+    }
+
+    /// An empty bus is a legitimate state to start in, not an error. Command
+    /// bytes need an acceptor and a bus with no powered instrument has none,
+    /// so init's self-addressing cannot complete there — and failing init for
+    /// it blocked first use (plug in the adapter, then wire the instruments).
+    /// Individual operations still fail with "no listener", which is correct.
+    #[tokio::test]
+    async fn init_succeeds_on_an_empty_bus() {
+        for code in [
+            NIUSB_NO_BUS_ERROR,
+            NIUSB_NO_LISTENER_ERROR,
+            NIUSB_TIMEOUT_ERROR,
+        ] {
+            let responses = vec![
+                reg_write_ok(26),
+                op_ok(),         // IFC
+                reg_write_ok(1), // REN
+                op_ok(),         // priming: take control
+                op_err(code),    // priming: UNL + MTA finds no acceptor
+                op_ok(),         // priming: the discarded data write
+            ];
+            let t = MockTransport::new(responses);
+            let mut be = NiUsbHsBackend::new(t, 3000);
+            be.init(0)
+                .await
+                .unwrap_or_else(|e| panic!("init must survive error code {code}: {e:#}"));
+        }
     }
 
     /// A backend that cannot do a thing must say so rather than quietly

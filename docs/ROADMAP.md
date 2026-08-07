@@ -111,27 +111,3 @@ Two causes, both fixed:
 The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
-
-## 6. The NI adapter fails to initialize on an empty bus
-
-**Now:** reported from the bench — with a GPIB-USB-HS/HS+ attached and no
-instrument powered on the bus, the daemon does not come up. Not yet reproduced
-under controlled conditions or diagnosed, so this entry records the report
-rather than a root cause.
-
-**Why it matters more than its position in this list suggests:** it is a
-first-use blocker. Plugging in an adapter before wiring up instruments is the
-obvious way to try the daemon, and it fails at exactly that moment.
-
-**Where to look first:** `ni_usb_hs::init()` (`src/backend/ni_usb_hs/mod.rs:183`)
-ends by sending command bytes — `send_command(&[GPIB_UNL, talk_address(my_pad)],
-false)` at line 225 — and command bytes are handshaken like any others. With no
-devices attached nobody drives NDAC/NRFD, so that write can fail or time out,
-and an init that treats it as fatal would refuse to start on a bus that is
-merely empty. `skip_check_for_command_acceptors = 1` in both kernel drivers
-(`agilent_82357a.c:1462`, `ni_usb_gpib.c:2411`) suggests upstream hit the same
-class of problem and chose to ignore the acceptor check.
-
-**What "fixed" means:** an empty bus is a legitimate state, not an error. The
-daemon should start, serve clients, and let individual operations fail with
-"no listener" — which they already do correctly.
