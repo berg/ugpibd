@@ -264,6 +264,29 @@ pub trait GpibBackend: Send + Sync {
         None
     }
 
+    /// Send raw GPIB command bytes (ATN asserted), ending in standby.
+    ///
+    /// This is the interface-level primitive under VXI-11.2's Send Command
+    /// docmd and the bus-wide control sequences (DCL, GET-without-address):
+    /// the caller chooses the bytes, including addressing ones. The default
+    /// refuses: a backend that cannot do this must say so, not fake it.
+    async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
+        let _ = cmds;
+        anyhow::bail!("{} cannot send raw bus commands", self.name())
+    }
+
+    /// Drive the ATN line directly: take control (true) or go to standby
+    /// (false). VXI-11.2 ATN Control. Default refuses, as above — notably
+    /// the 82357 backend has no *verified* raw-ATN path yet.
+    async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        let _ = assert;
+        anyhow::bail!("{} cannot drive ATN directly", self.name())
+    }
+
+    /// The controller's own primary address, as configured at init. VXI-11.2
+    /// Bus Status selector 8.
+    fn controller_pad(&self) -> u8;
+
     /// Configure the end-of-string terminator used when reading.
     fn set_eos(&mut self, eos_char: u8, enabled: bool);
 
