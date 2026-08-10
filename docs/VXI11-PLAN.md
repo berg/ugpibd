@@ -271,6 +271,19 @@ Phase 1's PR description must show the hislip integration tests unchanged
 (not adapted — unchanged) and green. Any hislip test edit in later phases is
 a red flag to review, not a routine diff.
 
+## Roadmap discipline
+
+A phase that ships an honest refusal in place of an implementation is not
+done by default — that decision is Bryan's, not the implementer's. The
+push as a whole ends with **zero net-new ROADMAP entries**: entry 7 (the
+device_write timeout race) and entry 8's implementable items (unaddressed
+interface data path, Bus Address set, 82357 ATN) are closed by
+implementation before the series wraps — the first three in a dedicated
+debt-closing PR after the portmapper phase, the 82357 ATN during the
+phase-9 hardware sweep with the adapter attached. Pass Control alone
+remains refused, as an *agreed architectural decision* (the daemon is the
+sole controller), recorded in docs/VXI11.md rather than as a gap.
+
 ## Phases / PRs
 
 Sequential; each PR is self-contained with its tests and docs, merged before

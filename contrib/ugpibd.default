@@ -31,3 +31,8 @@ UGPIBD_OPTS="--bind 127.0.0.1"
 # them with `ugpibd --list` and pin one here, e.g.
 #   UGPIBD_OPTS="--bind 127.0.0.1 --usb-port 3-1.2"
 # One service instance drives one adapter.
+
+# Options for the optional ugpibd-portmap service (see ugpibd-portmap(1)).
+# The socket unit owns port 111; set --core-port here if --vxi11-port is
+# customized above.
+#UGPIBD_PORTMAP_OPTS="--core-port 9010"

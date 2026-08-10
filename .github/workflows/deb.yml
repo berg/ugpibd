@@ -82,10 +82,12 @@ jobs:
           ./scripts/gen-deb-changelog "${DEB_VERSION}" target/changelog.Debian
 
           DEB=$(cargo deb --deb-version "${DEB_VERSION}")
+          PORTMAP_DEB=$(cargo deb --variant portmap --deb-version "${DEB_VERSION}")
 
           # Absolute, so `apt-get install` cannot mistake it for a package name.
           echo "DEB=$(realpath "${DEB}")" >> "$GITHUB_ENV"
-          ls -l "${DEB}"
+          echo "PORTMAP_DEB=$(realpath "${PORTMAP_DEB}")" >> "$GITHUB_ENV"
+          ls -l "${DEB}" "${PORTMAP_DEB}"
 
       - name: Lint package
         run: |
@@ -95,7 +97,7 @@ jobs:
           # warnings are Debian-archive conventions that do not apply to packages
           # distributed via GitHub releases, e.g. initial-upload-closes-no-bugs
           # wanting the changelog to close an ITP bug.
-          lintian --fail-on error --tag-display-limit 0 "${DEB}"
+          lintian --fail-on error --tag-display-limit 0 "${DEB}" "${PORTMAP_DEB}"
 
       - name: Install, exercise, purge
         run: |
@@ -149,10 +151,43 @@ jobs:
           test ! -e /etc/default/ugpibd
           ! getent passwd ugpibd
 
+      - name: Install, exercise, purge (portmap)
+        run: |
+          set -x
+          sudo apt-get install -y "${PORTMAP_DEB}"
+          test -x /usr/bin/ugpibd-portmap
+          test -f /usr/share/man/man1/ugpibd-portmap.1.gz
+          ugpibd-portmap --help >/dev/null
+
+          # Units install and parse; nothing listens until the socket is
+          # enabled, which is the package's whole promise.
+          systemctl cat ugpibd-portmap.socket >/dev/null
+          systemctl cat ugpibd-portmap.service >/dev/null
+          test "$(systemctl is-enabled ugpibd-portmap.socket || true)" != "enabled"
+          test "$(systemctl is-active ugpibd-portmap.service || true)" != "active"
+
+          # Socket activation end to end: enable the socket, poke port 111
+          # with rpcinfo, and the activated service must answer. rpcinfo
+          # ships in the rpcbind package on ubuntu, whose socket also wants
+          # port 111 and Conflicts= with ours — install it first and stop it
+          # for good before our socket comes up.
+          sudo apt-get install -y rpcbind
+          sudo systemctl disable --now rpcbind.socket rpcbind.service 2>/dev/null || true
+          sudo systemctl enable --now ugpibd-portmap.socket
+          rpcinfo -p 127.0.0.1
+          rpcinfo -p 127.0.0.1 | grep -q 395183
+          systemctl is-active ugpibd-portmap.service
+
+          sudo systemctl disable --now ugpibd-portmap.socket
+          sudo apt-get purge -y ugpibd-portmap
+          test ! -e /usr/bin/ugpibd-portmap
+
       - uses: actions/upload-artifact@v5
         with:
           name: ugpibd-deb-${{ matrix.arch }}
-          path: ${{ env.DEB }}
+          path: |
+            ${{ env.DEB }}
+            ${{ env.PORTMAP_DEB }}
 
   blacklist:
     name: blacklist (all)
