@@ -509,6 +509,12 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         self.my_pad
     }
 
+    fn read_slice_ms(&self) -> Option<u32> {
+        // The timeout code table rounds up (1500 ms becomes a 3 s wait);
+        // 250 ms maps to the 300 ms step. See the VXI-11 read loop.
+        Some(250)
+    }
+
     /// Read the TNT4882 bus status register and report the live SRQ line.
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()

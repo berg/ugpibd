@@ -1322,7 +1322,12 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
             &shared.config,
             parms.io_timeout_ms,
         )));
-    const SLICE_MS: u32 = 250;
+    // Slice per the adapter's requirement: coarse-timeout hardware is
+    // polled; exact-timeout hardware gets the whole remaining budget in one
+    // read, because its timeout path may be heavyweight (the 82357 answers
+    // a timed-out read by aborting the transfer and pulsing IFC — fine
+    // when the budget is truly spent, ruinous every 250 ms).
+    let slice_ms = bus.read_slice_ms();
     let mut data: Vec<u8> = Vec::new();
     enum ReadEnd {
         Terminated(u32),
@@ -1340,7 +1345,10 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
         if remaining.is_zero() {
             break ReadEnd::Deadline;
         }
-        let slice = (remaining.as_millis() as u32).clamp(1, SLICE_MS);
+        let slice = match slice_ms {
+            Some(s) => (remaining.as_millis() as u32).clamp(1, s),
+            None => (remaining.as_millis() as u32).max(1),
+        };
         bus.set_timeout(slice);
         let attempt_started = tokio::time::Instant::now();
         let attempt = if link.is_interface() {
@@ -1385,7 +1393,24 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
                     break ReadEnd::Terminated(reason);
                 }
             }
-            Err(e) => break ReadEnd::Bus(e),
+            Err(e) => {
+                // A backend that reports its timeout as an error (the 82357)
+                // is saying "nothing arrived", not "the bus broke": treat it
+                // as deadline progress, not as I/O failure.
+                if format!("{e:#}").to_ascii_lowercase().contains("timed out")
+                    || format!("{e:#}").to_ascii_lowercase().contains("timeout")
+                {
+                    // Pace a backend that fast-fails its timeouts so this
+                    // cannot spin; a real adapter consumed the wait already.
+                    let spent = attempt_started.elapsed();
+                    let floor = std::time::Duration::from_millis(50);
+                    if spent < floor {
+                        tokio::time::sleep(floor - spent).await;
+                    }
+                    continue;
+                }
+                break ReadEnd::Bus(e);
+            }
         }
     };
     bus.set_eos(saved_eos.0, saved_eos.1);

@@ -112,13 +112,10 @@ The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
 
-## 8. 82357 ATN control is implemented but unverified
+## 8. 82357B regression pass outstanding
 
-**Now:** ATN Control on the 82357 is a transcription of the kernel
-driver's take-control path (AUX_TCA/AUX_GTS) that has not yet run on that
-adapter. Until the phase-9 bench sweep verifies it with the 82357
-attached, treat it as unproven.
-
-(Pass Control is not tracked here: refusing it is a signed-off
-architectural decision, documented in docs/VXI11.md under "Deviations" —
-the daemon is the bus's sole controller.)
+**Now:** ATN control is verified on the 82357A (assert, release, bus alive
+after — the same TMS9914 AUXCR path the B uses), along with the full
+VXI-11 sweep on that adapter. The 82357B still deserves its own pass for
+the paths that differ per model (the double-upload firmware quirk); this
+entry closes on that run.

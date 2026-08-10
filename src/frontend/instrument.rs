@@ -156,6 +156,11 @@ impl Held<'_> {
         self.ctrl.set_eos(eos_char, enabled);
     }
 
+    /// The adapter's read-slicing requirement; see the trait.
+    pub fn read_slice_ms(&self) -> Option<u32> {
+        self.ctrl.read_slice_ms()
+    }
+
     /// Read the instrument's serial-poll status byte.
     pub async fn serial_poll(&mut self) -> Result<u8> {
         self.ctrl.serial_poll(self.pad).await

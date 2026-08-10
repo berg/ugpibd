@@ -106,9 +106,8 @@ address by hand with Send Command, then transfer.
   strand them all. A conforming client sees a clean refusal on a command
   that only matters in multi-controller systems, which this daemon does
   not participate in.
-- **ATN Control on the 82357** is transcribed from the kernel driver's
-  take-control path but not yet bench-verified on that adapter (ROADMAP
-  entry 8, closing with the hardware sweep).
+- ~~ATN Control on the 82357~~ — verified on hardware (82357A): the
+  kernel-driver take-control transcription asserts and releases cleanly.
 
 ## Discovery
 
