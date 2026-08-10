@@ -6,6 +6,7 @@ pub mod frontend;
 pub mod hislip;
 pub mod prologix;
 pub mod server;
+pub mod vxi11;
 
 /// Version of this build, from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

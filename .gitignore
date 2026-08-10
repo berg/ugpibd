@@ -4,3 +4,4 @@ linux
 
 /site/
 /pool-in/
+.claude/*.local.md
