@@ -159,26 +159,41 @@ jobs:
           test -f /usr/share/man/man1/ugpibd-portmap.1.gz
           ugpibd-portmap --help >/dev/null
 
-          # Units install and parse; nothing listens until the socket is
-          # enabled, which is the package's whole promise.
-          systemctl cat ugpibd-portmap.socket >/dev/null
+          # The unit installs and parses; nothing runs until enabled, which
+          # is the package's whole promise.
           systemctl cat ugpibd-portmap.service >/dev/null
-          test "$(systemctl is-enabled ugpibd-portmap.socket || true)" != "enabled"
+          test "$(systemctl is-enabled ugpibd-portmap.service || true)" != "enabled"
           test "$(systemctl is-active ugpibd-portmap.service || true)" != "active"
 
-          # Socket activation end to end: enable the socket, poke port 111
-          # with rpcinfo, and the activated service must answer. rpcinfo
-          # ships in the rpcbind package on ubuntu, whose socket also wants
-          # port 111 and Conflicts= with ours — install it first and stop it
-          # for good before our socket comes up.
+          # Both automagic branches, end to end. rpcinfo ships in rpcbind.
           sudo apt-get install -y rpcbind
-          sudo systemctl disable --now rpcbind.socket rpcbind.service 2>/dev/null || true
-          sudo systemctl enable --now ugpibd-portmap.socket
+          # Branch 1: rpcbind present -> cooperate. Registration must appear
+          # in rpcbind's own table.
+          sudo systemctl start rpcbind.socket rpcbind.service 2>/dev/null || sudo systemctl start rpcbind
+          sudo systemctl enable --now ugpibd-portmap
+          sleep 2
+          systemctl is-active ugpibd-portmap.service
           rpcinfo -p 127.0.0.1
           rpcinfo -p 127.0.0.1 | grep -q 395183
-          systemctl is-active ugpibd-portmap.service
+          # rpcbind restart wipes the table; the maintainer re-registers.
+          # (30s self-check interval, so poke the service instead of waiting.)
+          sudo systemctl restart rpcbind
+          sudo systemctl restart ugpibd-portmap
+          sleep 2
+          rpcinfo -p 127.0.0.1 | grep -q 395183
+          # Withdraw on stop: the registration goes with the service.
+          sudo systemctl stop ugpibd-portmap
+          ! rpcinfo -p 127.0.0.1 | grep -q 395183
 
-          sudo systemctl disable --now ugpibd-portmap.socket
+          # Branch 2: no rpcbind -> serve port 111 ourselves.
+          sudo systemctl disable --now rpcbind.socket rpcbind.service 2>/dev/null || true
+          sudo systemctl start ugpibd-portmap
+          sleep 2
+          systemctl is-active ugpibd-portmap.service
+          rpcinfo -p 127.0.0.1
+          rpcinfo -p 127.0.0.1 | grep -q 395183
+
+          sudo systemctl disable --now ugpibd-portmap
           sudo apt-get purge -y ugpibd-portmap
           test ! -e /usr/bin/ugpibd-portmap
 

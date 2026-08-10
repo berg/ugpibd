@@ -174,3 +174,71 @@ async fn rpc_layer_errors() -> Result<()> {
     );
     Ok(())
 }
+
+/// The registration client: a portmapper that accepts (a stand-in for
+/// rpcbind, which our own fixed-table server deliberately is not) sees the
+/// right mapping; our own server's refusal comes back as Ok(false).
+#[tokio::test]
+async fn set_registration_against_acceptor_and_refuser() -> Result<()> {
+    // Minimal accepting portmapper: answer TRUE to any SET/UNSET.
+    let acceptor = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let acceptor_port = acceptor.local_addr()?.port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_in = seen.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 512];
+        loop {
+            let Ok((len, peer)) = acceptor.recv_from(&mut buf).await else {
+                return;
+            };
+            let Ok((header, args)) = rpc::decode_call(&buf[..len]) else {
+                continue;
+            };
+            let mut c = ugpibd::vxi11::xdr::Cursor::new(args);
+            seen_in
+                .lock()
+                .unwrap()
+                .push((header.proc, Mapping::decode(&mut c).unwrap()));
+            let mut body = Vec::new();
+            ugpibd::vxi11::xdr::put_bool(&mut body, true);
+            let _ = acceptor
+                .send_to(&rpc::reply_success(header.xid, &body), peer)
+                .await;
+        }
+    });
+
+    let mapping = Mapping {
+        prog: 0x0607AF,
+        vers: 1,
+        prot: portmap::IPPROTO_TCP,
+        port: 9010,
+    };
+    assert!(portmap::set_registration("127.0.0.1", acceptor_port, mapping, true).await?);
+    assert!(portmap::set_registration("127.0.0.1", acceptor_port, mapping, false).await?);
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], (portmap::PMAPPROC_SET, mapping));
+        assert_eq!(seen[1], (portmap::PMAPPROC_UNSET, mapping));
+    }
+
+    // Our own server refuses SET: the client reports that as a refusal, not
+    // a transport error.
+    let (_, udp) = start().await?;
+    assert!(!portmap::set_registration("127.0.0.1", udp.port(), mapping, true).await?);
+    Ok(())
+}
+
+/// The automagic's sensors: probe answers true against a live portmapper
+/// and false against a dead port; getport reads a mapping back.
+#[tokio::test]
+async fn probe_and_getport() -> Result<()> {
+    let (_, udp) = start().await?;
+    assert!(portmap::probe("127.0.0.1", udp.port()).await);
+    assert_eq!(portmap::getport("127.0.0.1", udp.port(), CORE).await?, 9010);
+
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let dead_port = dead.local_addr()?.port();
+    drop(dead);
+    assert!(!portmap::probe("127.0.0.1", dead_port).await);
+    Ok(())
+}

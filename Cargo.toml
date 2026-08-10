@@ -117,7 +117,6 @@ maintainer-scripts = "debian-portmap/"
 assets = [
     ["target/release/ugpibd-portmap", "usr/bin/", "755"],
     ["contrib/ugpibd-portmap.service", "usr/lib/systemd/system/ugpibd-portmap.service", "644"],
-    ["contrib/ugpibd-portmap.socket", "usr/lib/systemd/system/ugpibd-portmap.socket", "644"],
     ["contrib/man/ugpibd-portmap.1", "usr/share/man/man1/ugpibd-portmap.1", "644"],
     ["debian/copyright", "usr/share/doc/ugpibd-portmap/copyright", "644"],
 ]
