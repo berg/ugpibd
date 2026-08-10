@@ -2,7 +2,11 @@
 set -e
 
 case "$1" in
-configure) ;;
+configure)
+    echo "ugpibd-portmap installed; discovery is opt-in:" >&2
+    echo "    systemctl enable --now ugpibd-portmap" >&2
+    echo "  (registers with rpcbind when present, serves port 111 itself when not)" >&2
+    ;;
 abort-upgrade | abort-remove | abort-deconfigure) ;;
 *)
     echo "postinst called with unknown argument \`$1'" >&2
@@ -10,11 +14,11 @@ abort-upgrade | abort-remove | abort-deconfigure) ;;
     ;;
 esac
 
-# Register the units without enabling them: listening on port 111 is opt-in
-# via `systemctl enable --now ugpibd-portmap.socket`.
+# Register the unit without enabling it: discovery is opt-in via
+# `systemctl enable --now ugpibd-portmap`, which picks its own mode.
 if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
     if command -v deb-systemd-helper >/dev/null 2>&1; then
-        for unit in ugpibd-portmap.socket ugpibd-portmap.service; do
+        for unit in ugpibd-portmap.service; do
             deb-systemd-helper unmask "$unit" >/dev/null || true
             deb-systemd-helper update-state "$unit" >/dev/null || true
         done

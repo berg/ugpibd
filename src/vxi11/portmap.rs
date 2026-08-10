@@ -209,6 +209,124 @@ pub async fn run(
     unreachable!("both portmap loops run forever");
 }
 
+/// Register (or unregister) a mapping with a portmapper — normally the
+/// system rpcbind on localhost. PMAPPROC_SET/UNSET over UDP; rpcbind
+/// accepts these from local callers, which is the classic way an ONC-RPC
+/// service announces itself (this is what NFS does). Cooperating beats the
+/// alternative: two daemons fighting over port 111 with systemd Conflicts=
+/// turns into a restart war, as observed in the field.
+///
+/// Returns whether the portmapper said yes — FALSE is an answer (rpcbind
+/// refuses non-local or conflicting registrations), not a transport error.
+pub async fn set_registration(
+    host: &str,
+    port: u16,
+    mapping: Mapping,
+    register: bool,
+) -> anyhow::Result<bool> {
+    use super::rpc;
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    sock.connect((host, port)).await?;
+    let mut args = Vec::new();
+    mapping.encode(&mut args);
+    let proc = if register {
+        PMAPPROC_SET
+    } else {
+        PMAPPROC_UNSET
+    };
+    let call = rpc::encode_call(1, PMAP_PROG, PMAP_VERS, proc, &args);
+
+    // UDP: retry a couple of times before concluding nobody is home.
+    let mut buf = vec![0u8; 512];
+    for _attempt in 0..3 {
+        sock.send(&call).await?;
+        match tokio::time::timeout(std::time::Duration::from_millis(1000), sock.recv(&mut buf))
+            .await
+        {
+            Ok(len) => {
+                let len = len?;
+                return match rpc::decode_reply(&buf[..len], 1) {
+                    Ok(rpc::ReplyBody::Success(body)) => {
+                        let mut c = Cursor::new(body);
+                        Ok(c.bool()?)
+                    }
+                    Ok(other) => anyhow::bail!("portmapper answered {other:?}"),
+                    Err(e) => anyhow::bail!("bad portmapper reply: {e}"),
+                };
+            }
+            Err(_) => continue,
+        }
+    }
+    anyhow::bail!("no portmapper answered at {host}:{port} after 3 attempts")
+}
+
+/// Is a portmapper answering at `host:port`? One NULL call, short timeout.
+/// Probing also wakes a socket-activated rpcbind, which is exactly right:
+/// if the system *would* run rpcbind on demand, cooperation is the mode.
+pub async fn probe(host: &str, port: u16) -> bool {
+    use super::rpc;
+    let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
+        return false;
+    };
+    if sock.connect((host, port)).await.is_err() {
+        return false;
+    }
+    let call = rpc::encode_call(2, PMAP_PROG, PMAP_VERS, PMAPPROC_NULL, &[]);
+    let mut buf = [0u8; 128];
+    for _ in 0..2 {
+        if sock.send(&call).await.is_err() {
+            return false;
+        }
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), sock.recv(&mut buf)).await
+        {
+            return rpc::decode_reply(&buf[..len], 2).is_ok();
+        }
+    }
+    false
+}
+
+/// Look up one mapping (GETPORT) — the self-check of register mode.
+pub async fn getport(host: &str, port: u16, mapping: Mapping) -> anyhow::Result<u32> {
+    use super::rpc;
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    sock.connect((host, port)).await?;
+    let mut args = Vec::new();
+    mapping.encode(&mut args);
+    let call = rpc::encode_call(3, PMAP_PROG, PMAP_VERS, PMAPPROC_GETPORT, &args);
+    let mut buf = [0u8; 128];
+    sock.send(&call).await?;
+    let len = tokio::time::timeout(std::time::Duration::from_millis(1000), sock.recv(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("portmapper did not answer GETPORT"))??;
+    match rpc::decode_reply(&buf[..len], 3) {
+        Ok(rpc::ReplyBody::Success(body)) => Ok(Cursor::new(body).u32()?),
+        other => anyhow::bail!("bad GETPORT reply: {other:?}"),
+    }
+}
+
+/// Register mode's resident half: keep the registration alive against the
+/// portmapper at `host:port` until cancelled. An rpcbind restart wipes its
+/// table silently; the periodic self-check notices and re-registers, which
+/// is sturdier than tying unit lifecycles together.
+pub async fn maintain_registration(host: &str, port: u16, mapping: Mapping) -> ! {
+    use tracing::{info, warn};
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match getport(host, port, mapping).await {
+            Ok(p) if p == mapping.port => {}
+            Ok(_) => match set_registration(host, port, mapping, true).await {
+                Ok(true) => info!("re-registered with the portmapper (its table was reset)"),
+                Ok(false) => warn!("portmapper refuses re-registration; discovery is down"),
+                Err(e) => warn!("portmapper unreachable for re-registration: {e:#}"),
+            },
+            Err(e) => warn!("portmapper self-check failed: {e:#}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
