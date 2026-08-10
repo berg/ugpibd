@@ -21,7 +21,7 @@ use crate::backend::GpibBackend;
 
 /// Upper bound on a single bulk read. Matches the Prologix server's default so
 /// behavior is consistent across front-ends.
-const MAX_READ: usize = 65536;
+pub const MAX_READ: usize = 65536;
 
 /// A GPIB instrument addressable at `pad` on the shared bus.
 pub struct Instrument {
@@ -127,10 +127,33 @@ impl Held<'_> {
         self.ctrl.write(self.pad, data, send_eoi).await
     }
 
-    /// Address the instrument to talk and read until EOI, the byte limit, or
-    /// the bus timeout. Returns the data and whether END (EOI) terminated it.
-    pub async fn read(&mut self) -> Result<(Vec<u8>, bool)> {
-        self.ctrl.read(self.pad, MAX_READ).await
+    /// Address the instrument to talk and read until EOI, `max_len` bytes,
+    /// the configured end-of-string character, or the bus timeout. Returns
+    /// the data and whether END (EOI) terminated it. `max_len` is clamped to
+    /// [`MAX_READ`].
+    pub async fn read(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.ctrl.read(self.pad, max_len.min(MAX_READ)).await
+    }
+
+    /// Set the bus timeout for operations later in this tenure. The caller
+    /// owns restoration: nothing here remembers what the timeout was, and a
+    /// tenure that changes it must put the daemon default back before the
+    /// next front-end's traffic runs at the wrong one.
+    pub fn set_timeout(&mut self, timeout_ms: u32) {
+        self.ctrl.set_timeout(timeout_ms);
+    }
+
+    /// The current end-of-string configuration, for save/restore around a
+    /// per-operation terminator (VXI-11 termChar). Restoration matters
+    /// beyond this tenure: Prologix `++eos` state is persistent by that
+    /// protocol's contract.
+    pub fn eos(&self) -> (u8, bool) {
+        self.ctrl.eos()
+    }
+
+    /// Configure the end-of-string terminator used when reading.
+    pub fn set_eos(&mut self, eos_char: u8, enabled: bool) {
+        self.ctrl.set_eos(eos_char, enabled);
     }
 
     /// Read the instrument's serial-poll status byte.

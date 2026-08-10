@@ -267,6 +267,13 @@ pub trait GpibBackend: Send + Sync {
     /// Configure the end-of-string terminator used when reading.
     fn set_eos(&mut self, eos_char: u8, enabled: bool);
 
+    /// The current end-of-string configuration, so a front-end that needs a
+    /// different terminator for one operation (VXI-11 device_read's termChar)
+    /// can put back what another front-end configured — the Prologix `++eos`
+    /// state is persistent by that protocol's contract, and a sibling
+    /// front-end silently clearing it would break it.
+    fn eos(&self) -> (u8, bool);
+
     /// Set the per-operation GPIB timeout in milliseconds.
     fn set_timeout(&mut self, timeout_ms: u32);
 

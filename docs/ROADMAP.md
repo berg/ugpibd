@@ -111,3 +111,25 @@ Two causes, both fixed:
 The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
+
+## 7. VXI-11 device_write timeout replies can lose the race to the client
+
+**Now:** `device_read` enforces its io_timeout server-side, polling the bus
+in short slices, so its reply always beats the client's own RPC deadline
+(pyvisa-py grants io_timeout + 1 s). `device_write` hands the timeout to the
+adapter whole, and the NI code table rounds up — a 1500 ms write timeout
+waits 3 s on the bus, by which point pyvisa-py has declared the connection
+dead (`VI_ERROR_IO` instead of `VI_ERROR_TMO`, and the session desyncs).
+
+**Why:** a write, unlike a read, cannot be sliced: bytes already handshaken
+cannot be re-sent, so a per-slice timeout would fail slow-but-legitimate
+listeners mid-transfer.
+
+**Watch out:** only bites when a write actually times out — a stalled or
+absent listener — with an io_timeout whose adapter round-up exceeds the
+client's grace (roughly: not a power-of-table value above 500 ms).
+
+**Finishing it:** either chunk writes at the vxi11 layer (EOI only on the
+final chunk, per-chunk deadline = remaining budget, accepting that a chunk
+boundary mid-stall reports early), or teach backends to bound the whole
+transaction in software while using the next-larger hardware code.

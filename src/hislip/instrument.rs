@@ -112,7 +112,7 @@ impl Device for GpibInstrument {
             }
         }
 
-        let (data, end) = bus.read().await?;
+        let (data, end) = bus.read(crate::frontend::instrument::MAX_READ).await?;
         // Nothing back *and* no END is not an empty answer: the instrument was
         // addressed to talk and had nothing to say, which is what a query it
         // does not implement looks like from here (an HP 34401A asked `*LRN?`
