@@ -21,7 +21,10 @@ async fn main() -> anyhow::Result<()> {
     let mut client = Vxi11Client::connect(&host, port).await?;
     let intf = client.create_link("gpib0").await?;
     anyhow::ensure!(intf.error == 0, "interface link refused: {}", intf.error);
-    println!("interface link {} (abort port {})", intf.lid, intf.abort_port);
+    println!(
+        "interface link {} (abort port {})",
+        intf.lid, intf.abort_port
+    );
 
     const NAMES: [&str; 8] = [
         "REMOTE",
@@ -44,7 +47,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Send Command: UNL alone is harmless on any bus.
-    let resp = client.device_docmd(intf.lid, 0x020000, true, 1, &[0x3F]).await?;
+    let resp = client
+        .device_docmd(intf.lid, 0x020000, true, 1, &[0x3F])
+        .await?;
     anyhow::ensure!(resp.error == 0, "send command: error {}", resp.error);
     println!("send command (UNL) ok, echoed {:02x?}", resp.data_out);
 
@@ -56,7 +61,9 @@ async fn main() -> anyhow::Result<()> {
     // A device link must refuse docmd (RULE B.5.2) but still answer queries.
     let dev = client.create_link(&format!("gpib0,{pad}")).await?;
     anyhow::ensure!(dev.error == 0, "device link refused: {}", dev.error);
-    let resp = client.device_docmd(dev.lid, 0x020000, true, 1, &[0x3F]).await?;
+    let resp = client
+        .device_docmd(dev.lid, 0x020000, true, 1, &[0x3F])
+        .await?;
     anyhow::ensure!(
         resp.error == ErrorCode::OperationNotSupported.as_u32(),
         "docmd on device link should be 8, got {}",
