@@ -1,5 +1,5 @@
 [Unit]
-Description=ugpibd USB-GPIB daemon (HiSLIP + Prologix front-ends)
+Description=ugpibd USB-GPIB daemon (HiSLIP, VXI-11, and Prologix front-ends)
 Documentation=man:ugpibd(1)
 Documentation=https://github.com/berg/ugpibd
 After=network.target

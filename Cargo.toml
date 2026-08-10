@@ -59,8 +59,9 @@ suggests = "ugpibd-blacklist-linux-gpib"
 extended-description = """\
 ugpibd drives USB-to-GPIB adapters entirely from userspace over usbfs, with no \
 kernel GPIB driver involved, and exposes the attached instruments over TCP via \
-a HiSLIP server (the transport pyvisa prefers) and an optional \
-Prologix-compatible line protocol.
+HiSLIP and VXI-11 servers (either reachable with an ordinary pyvisa resource \
+string; VXI-11 additionally covers instruments that only produce output once \
+addressed to talk) and an optional Prologix-compatible line protocol.
 .
 Supported adapters: Agilent/Keysight 82357B, NI GPIB-USB-HS, and -- so far \
 untested on hardware -- the Agilent 82357A, NI GPIB-USB-HS+, KUSB-488A and \

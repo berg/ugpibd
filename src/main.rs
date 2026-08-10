@@ -16,7 +16,7 @@ use ugpibd::hislip;
 #[command(
     name = "ugpibd",
     version,
-    about = "USB-GPIB daemon with HiSLIP and Prologix TCP front-ends",
+    about = "USB-GPIB daemon with HiSLIP, VXI-11, and Prologix TCP front-ends",
     help_template = ugpibd::HELP_TEMPLATE
 )]
 struct Args {

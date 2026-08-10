@@ -1,6 +1,6 @@
 .TH UGPIBD 1 "2026-08-07" "ugpibd 0.6.0" "User Commands"
 .SH NAME
-ugpibd \- userspace daemon for USB-GPIB adapters (HiSLIP and Prologix front-ends)
+ugpibd \- userspace daemon for USB-GPIB adapters (HiSLIP, VXI-11, and Prologix front-ends)
 .SH SYNOPSIS
 .B ugpibd
 .RI [ OPTIONS ]
@@ -9,8 +9,9 @@ ugpibd \- userspace daemon for USB-GPIB adapters (HiSLIP and Prologix front-ends
 drives USB-to-GPIB adapters entirely from userspace over
 .IR usbfs ,
 with no kernel GPIB driver involved, and exposes the attached instruments over
-TCP. Two front-ends are available: a HiSLIP server (enabled by default, the
-transport pyvisa prefers) and a Prologix-compatible line protocol.
+TCP. Three front-ends are available: HiSLIP and VXI-11 servers (both enabled
+by default; VXI-11 additionally serves instruments that only produce output
+once addressed to talk) and a Prologix-compatible line protocol.
 .PP
 The Agilent adapters require a firmware upload on every attach.
 .B ugpibd

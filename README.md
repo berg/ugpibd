@@ -31,9 +31,10 @@ connected adapter by USB id.
 
 ## Install
 
-You get two binaries: the `ugpibd` daemon and the `ugpibd-scpi` client. The apt
-package also installs udev rules for adapter access, a systemd unit, and
-`/etc/default/ugpibd`.
+You get three binaries: the `ugpibd` daemon, the `ugpibd-scpi` client, and
+`ugpibd-portmap` (VXI-11 discovery on port 111 — shipped separately as the
+optional `ugpibd-portmap` apt package). The apt package also installs udev
+rules for adapter access, systemd units, and `/etc/default/ugpibd`.
 
 **macOS 12+ and Linux — Homebrew:**
 
@@ -69,44 +70,73 @@ ugpibd --list
 ugpibd
 ```
 
-It binds `127.0.0.1` and serves HiSLIP only. Use `--bind 0.0.0.0` for remote
-access, `--enable-prologix` for the Prologix port, and `RUST_LOG=ugpibd=debug`
-for protocol tracing.
+It binds `127.0.0.1` and serves HiSLIP (4880) and VXI-11 (9010). Use
+`--bind 0.0.0.0` for remote access, `--enable-prologix` for the Prologix
+port, and `RUST_LOG=ugpibd=debug` for protocol tracing.
 
 ## PyVISA
 
 ```python
 import pyvisa
 rm = pyvisa.ResourceManager("@py")
-inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")  # 15 = GPIB primary address
+inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")        # HiSLIP
+inst = rm.open_resource("TCPIP::localhost,9010::gpib0,15::INSTR")   # VXI-11
 print(inst.query("*IDN?"))
 ```
 
-The sub-address carries the GPIB primary address and may be written
-`hislip<N>`, `gpib<N>`, or bare `<N>`; `hislip0` means the daemon's
-`--default-address`. Locking, service requests, and the rest of the HiSLIP
-semantics are in [docs/HISLIP.md](docs/HISLIP.md).
+In both forms, `15` is the GPIB primary address. The HiSLIP sub-address may
+be written `hislip<N>`, `gpib<N>`, or bare `<N>`; `hislip0` means the
+daemon's `--default-address`, as does VXI-11's `inst0`. Locking, service
+requests, and the rest of each protocol's semantics are in
+[docs/HISLIP.md](docs/HISLIP.md) and [docs/VXI11.md](docs/VXI11.md).
+
+## VXI-11
+
+The second VISA front-end, on port 9010 (`--vxi11-port`). Same instruments,
+same locking (a lock taken over either protocol excludes the other), plus
+what only its wire protocol can offer: a client-driven `device_read`, so
+instruments that produce output only once addressed to talk — 859x screen
+dumps, plotter transfers, pre-488.2 gear generally — work here and cannot
+work over HiSLIP. A bare `gpib0` link addresses the interface itself
+(bus-wide clear, raw command bytes, bus status from the live control
+lines).
+
+For clients that discover VXI-11 through the portmapper instead of a port
+in the resource string (NI and Keysight VISA):
+
+```bash
+sudo apt install ugpibd-portmap
+sudo systemctl enable --now ugpibd-portmap
+```
+
+It registers with system rpcbind when one is running and serves port 111
+itself when none is. Details and conformance notes:
+[docs/VXI11.md](docs/VXI11.md).
 
 ## `ugpibd-scpi`
 
-A REPL bundled with the daemon, speaking the same HiSLIP transport pyvisa uses.
+A REPL bundled with the daemon, speaking any of its front-ends
+(`--transport hislip|vxi11|prologix`, default hislip).
 
 ```bash
-ugpibd-scpi --addr 15                      # instrument at GPIB address 15
-ugpibd-scpi --host bench-pi --port 4880    # no --addr: daemon's default PAD
+ugpibd-scpi --addr 15                       # instrument at GPIB address 15
+ugpibd-scpi --host bench-pi                 # no --addr: daemon's default PAD
+ugpibd-scpi --transport vxi11 --addr 18     # e.g. for ++read, below
 printf '++ren 1\n*RST\n*IDN?\n' | ugpibd-scpi --addr 15
 ```
 
-A line containing `?` is sent as a query and its reply printed; any other line
-is written without reading. The address is fixed for the session.
+A line the quote-aware hint calls a query (a `?` outside string literals) is
+sent and its reply printed; any other line is written without reading. The
+address is fixed for the session.
 
 | Command | Action |
 |---------|--------|
+| `++read` | explicit addressed read (vxi11/prologix) — for instruments that only talk when addressed |
 | `++clr` | Selected Device Clear |
 | `++trg` | GPIB trigger (GET) |
-| `++ren <0\|1>` | REN off / on |
+| `++ren <0\|1>` | remote / local — semantics differ per transport, see `++help` |
 | `++status` | print the serial-poll status byte |
-| `++help` | list meta-commands |
+| `++help` | full reference, including per-transport caveats |
 
 ## Prologix
 
