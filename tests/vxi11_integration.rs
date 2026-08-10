@@ -28,6 +28,10 @@ struct Observed {
     timeouts: Vec<u32>,
     /// eos state at the moment each read ran.
     eos_at_read: Vec<(u8, bool)>,
+    /// Raw bus-command bytes (DCL, GET, docmd Send Command).
+    bus_commands: Vec<Vec<u8>>,
+    /// ATN line transitions requested.
+    atn: Vec<bool>,
 }
 
 /// A scripted instrument: reads pop from `reads`; an empty script reads as
@@ -38,6 +42,7 @@ struct MockBackend {
     stb: Arc<std::sync::atomic::AtomicU8>,
     eos: (u8, bool),
     srq: tokio::sync::broadcast::Sender<()>,
+    srq_line: Arc<std::sync::atomic::AtomicBool>,
     observed: Arc<Mutex<Observed>>,
 }
 
@@ -46,13 +51,22 @@ struct MockBackend {
 struct MockInstrument {
     stb: Arc<std::sync::atomic::AtomicU8>,
     srq: tokio::sync::broadcast::Sender<()>,
+    srq_line: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MockInstrument {
-    /// Set the status byte and pull the SRQ line.
+    /// Set the status byte and pull the SRQ line (edge + level).
     fn raise_srq(&self, stb: u8) {
         self.stb.store(stb, std::sync::atomic::Ordering::Release);
+        self.srq_line
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = self.srq.send(());
+    }
+
+    /// Set the SRQ line *level* without an edge event.
+    fn set_srq_line(&self, high: bool) {
+        self.srq_line
+            .store(high, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -69,9 +83,11 @@ impl MockBackend {
         let observed = Arc::new(Mutex::new(Observed::default()));
         let stb = Arc::new(std::sync::atomic::AtomicU8::new(stb));
         let (srq, _) = tokio::sync::broadcast::channel(4);
+        let srq_line = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let instrument = MockInstrument {
             stb: stb.clone(),
             srq: srq.clone(),
+            srq_line: srq_line.clone(),
         };
         (
             Self {
@@ -79,6 +95,7 @@ impl MockBackend {
                 stb,
                 eos: (b'\n', false),
                 srq,
+                srq_line,
                 observed: observed.clone(),
             },
             observed,
@@ -150,6 +167,39 @@ impl GpibBackend for MockBackend {
 
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         Some(self.srq.subscribe())
+    }
+
+    async fn srq_asserted(&mut self) -> Result<bool> {
+        Ok(self.srq_line.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
+        self.observed
+            .lock()
+            .unwrap()
+            .bus_commands
+            .push(cmds.to_vec());
+        Ok(())
+    }
+
+    async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        self.observed.lock().unwrap().atn.push(assert);
+        Ok(())
+    }
+
+    fn controller_pad(&self) -> u8 {
+        21
+    }
+
+    async fn bus_lines(&mut self) -> Result<ugpibd::backend::BusLines> {
+        // REN and SRQ high, NDAC low: distinct values so the Bus Status
+        // selectors are distinguishable in tests.
+        Ok(ugpibd::backend::BusLines {
+            ren: true,
+            srq: true,
+            ndac: false,
+            ..Default::default()
+        })
     }
 
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
@@ -1009,5 +1059,211 @@ async fn enable_srq_unknown_lid_is_error_4() -> Result<()> {
         client.device_enable_srq(99, true, b"x").await?,
         ErrorCode::InvalidLinkIdentifier.as_u32()
     );
+    Ok(())
+}
+
+/// VXI-11.2 §B.5: the docmd set on an interface link — Send Command puts
+/// the raw bytes on the bus and echoes them; sizes off the Table B.1 grid
+/// answer 5; unknown commands 8 (RULE B.5.1).
+#[tokio::test]
+async fn docmd_send_command_and_validation() -> Result<()> {
+    let (backend, observed) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let intf = client.create_link("gpib0").await?;
+    ok(intf.error);
+
+    let resp = client
+        .device_docmd(intf.lid, 0x020000, true, 1, &[0x3F, 0x14])
+        .await?;
+    ok(resp.error);
+    assert_eq!(resp.data_out, [0x3F, 0x14], "echoed per RULE B.5.5");
+    assert_eq!(
+        observed.lock().unwrap().bus_commands[0],
+        vec![0x3F, 0x14],
+        "bytes reached the bus"
+    );
+
+    // Wrong datasize for Send Command (must be 1): parameter error, no bus
+    // traffic (RULE B.5.3).
+    let resp = client
+        .device_docmd(intf.lid, 0x020000, true, 2, &[0x3F])
+        .await?;
+    assert_eq!(resp.error, ErrorCode::ParameterError.as_u32());
+    assert_eq!(observed.lock().unwrap().bus_commands.len(), 1);
+
+    // Unknown command (RULE B.5.1).
+    let resp = client
+        .device_docmd(intf.lid, 0x02FF00, true, 1, &[])
+        .await?;
+    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
+    Ok(())
+}
+
+/// RULE B.5.6 / Table B.2: bus status selectors answer from the live lines
+/// and daemon state, in the client's declared byte order.
+#[tokio::test]
+async fn docmd_bus_status_selectors() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let intf = client.create_link("gpib0").await?;
+
+    // Mock lines: REN=1, SRQ=1, NDAC=0. Controller pad 21. Big-endian.
+    for (selector, expect) in [
+        (1u16, 1u16),
+        (2, 1),
+        (3, 0),
+        (4, 1),
+        (5, 1),
+        (6, 0),
+        (7, 0),
+        (8, 21),
+    ] {
+        let resp = client
+            .device_docmd(intf.lid, 0x020001, true, 2, &selector.to_be_bytes())
+            .await?;
+        ok(resp.error);
+        assert_eq!(resp.data_out, expect.to_be_bytes(), "selector {selector}");
+    }
+    // Little-endian client: same answers, mirrored bytes (RULE B.5.4).
+    let resp = client
+        .device_docmd(intf.lid, 0x020001, false, 2, &8u16.to_le_bytes())
+        .await?;
+    assert_eq!(resp.data_out, 21u16.to_le_bytes());
+    // Unknown selector: parameter error.
+    let resp = client
+        .device_docmd(intf.lid, 0x020001, true, 2, &9u16.to_be_bytes())
+        .await?;
+    assert_eq!(resp.error, ErrorCode::ParameterError.as_u32());
+    Ok(())
+}
+
+/// RULES B.5.7/B.5.8/B.5.11: ATN, REN, and IFC reach the bus; RULES
+/// B.5.9/B.5.10: pass control and bus-address set are honest 8s (with 5
+/// still winning for an illegal address).
+#[tokio::test]
+async fn docmd_line_controls_and_refusals() -> Result<()> {
+    let (backend, observed) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let intf = client.create_link("gpib0").await?;
+
+    ok(client
+        .device_docmd(intf.lid, 0x020002, true, 2, &1u16.to_be_bytes())
+        .await?
+        .error);
+    ok(client
+        .device_docmd(intf.lid, 0x020002, true, 2, &0u16.to_be_bytes())
+        .await?
+        .error);
+    assert_eq!(observed.lock().unwrap().atn, vec![true, false]);
+
+    ok(client
+        .device_docmd(intf.lid, 0x020003, true, 2, &1u16.to_be_bytes())
+        .await?
+        .error);
+
+    let resp = client
+        .device_docmd(intf.lid, 0x020010, true, 4, &[])
+        .await?;
+    ok(resp.error);
+    assert!(resp.data_out.is_empty(), "IFC returns empty data_out");
+
+    let resp = client
+        .device_docmd(intf.lid, 0x020004, true, 4, &5u32.to_be_bytes())
+        .await?;
+    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
+
+    let resp = client
+        .device_docmd(intf.lid, 0x02000A, true, 4, &31u32.to_be_bytes())
+        .await?;
+    assert_eq!(
+        resp.error,
+        ErrorCode::ParameterError.as_u32(),
+        "31 is illegal first"
+    );
+    let resp = client
+        .device_docmd(intf.lid, 0x02000A, true, 4, &12u32.to_be_bytes())
+        .await?;
+    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
+    Ok(())
+}
+
+/// RULE B.5.2: docmd on a *device* link performs nothing and answers 8.
+#[tokio::test]
+async fn docmd_on_a_device_link_is_error_8() -> Result<()> {
+    let (backend, observed) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let dev = client.create_link("gpib0,18").await?;
+    let resp = client
+        .device_docmd(dev.lid, 0x020000, true, 1, &[0x14])
+        .await?;
+    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
+    assert!(observed.lock().unwrap().bus_commands.is_empty());
+    Ok(())
+}
+
+/// VXI-11.2 RULES B.4.6/B.4.8/B.4.10/B.4.12 and the data-path refusals:
+/// interface clear is bus-wide DCL, interface trigger is unaddressed GET,
+/// remote/local/readstb/write/read on the interface answer 8.
+#[tokio::test]
+async fn interface_link_operations() -> Result<()> {
+    let (backend, observed) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let intf = client.create_link("gpib0").await?;
+
+    ok(client.device_clear(intf.lid).await?);
+    ok(client.device_trigger(intf.lid).await?);
+    {
+        let obs = observed.lock().unwrap();
+        assert_eq!(
+            obs.bus_commands,
+            vec![vec![0x14], vec![0x08]],
+            "DCL then GET"
+        );
+        assert!(obs.clears.is_empty(), "no addressed SDC");
+        assert!(obs.triggers.is_empty(), "no addressed GET");
+    }
+
+    let e8 = ErrorCode::OperationNotSupported.as_u32();
+    assert_eq!(client.device_remote(intf.lid).await?, e8);
+    assert_eq!(client.device_local(intf.lid).await?, e8);
+    assert_eq!(client.device_readstb(intf.lid, 0).await?.error, e8);
+    assert_eq!(
+        client.device_write(intf.lid, b"x", true, 0).await?.error,
+        e8
+    );
+    assert_eq!(client.device_read(intf.lid, 10, 0, None).await?.error, e8);
+    Ok(())
+}
+
+/// VXI-11.2 RULE B.4.14: enabling service requests while the SRQ line is
+/// already high delivers the notification immediately.
+#[tokio::test]
+async fn enable_srq_while_line_high_notifies_immediately() -> Result<()> {
+    let (backend, _, mock) = MockBackend::with_srq(vec![], 0x40);
+    let mut client = start_default(backend).await?;
+    let link = client.create_link("gpib0,18").await?;
+
+    let intr = ugpibd::vxi11::client::IntrServer::bind().await?;
+    let intr_port = intr.port()?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(intr.run(tx));
+    ok(client
+        .create_intr_chan(
+            std::net::Ipv4Addr::LOCALHOST,
+            intr_port,
+            vxi11::DEVICE_INTR_PROG,
+            vxi11::DEVICE_INTR_VERS,
+            vxi11::DEVICE_TCP,
+        )
+        .await?);
+
+    // The line is high *before* enable — no edge will ever come.
+    mock.set_srq_line(true);
+    ok(client.device_enable_srq(link.lid, true, b"late").await?);
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("B.4.14 notification never came")
+        .unwrap();
+    assert_eq!(handle, b"late");
     Ok(())
 }

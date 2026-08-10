@@ -165,4 +165,30 @@ impl Held<'_> {
     pub async fn srq_asserted(&mut self) -> Result<bool> {
         self.ctrl.srq_asserted().await
     }
+
+    /// Send raw GPIB command bytes (ATN asserted). Interface-level: the
+    /// caller chooses the bytes, addressing included.
+    pub async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
+        self.ctrl.send_bus_command(cmds).await
+    }
+
+    /// Drive the ATN line: take control (true) or standby (false).
+    pub async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        self.ctrl.set_atn(assert).await
+    }
+
+    /// A live read of the GPIB control lines.
+    pub async fn bus_lines(&mut self) -> Result<crate::backend::BusLines> {
+        self.ctrl.bus_lines().await
+    }
+
+    /// Pulse Interface Clear.
+    pub async fn ifc(&mut self) -> Result<()> {
+        self.ctrl.ifc().await
+    }
+
+    /// The controller's own primary address.
+    pub fn controller_pad(&self) -> u8 {
+        self.ctrl.controller_pad()
+    }
 }

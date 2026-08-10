@@ -133,3 +133,29 @@ client's grace (roughly: not a power-of-table value above 500 ms).
 final chunk, per-chunk deadline = remaining budget, accepting that a chunk
 boundary mid-stall reports early), or teach backends to bound the whole
 transaction in software while using the next-larger hardware code.
+
+## 8. VXI-11.2 interface-link gaps
+
+**Now:** the `gpib0` interface link supports the docmd set — send command,
+bus status, ATN control (NI only), REN control, IFC — plus bus-wide clear
+(DCL) and trigger-all (GET). Four things are refused with error 8 rather
+than implemented: unaddressed `device_write`/`device_read` on the interface
+link (RULES B.4.2/B.4.4 — no backend exposes an unaddressed data path),
+Pass Control (RULE B.5.9 — the daemon's architecture assumes it is the only
+controller; releasing CIC would strand every front-end), Bus Address *set*
+(RULE B.5.10 — no backend supports re-addressing the controller at
+runtime), and ATN control on the 82357 (no hardware-verified raw-ATN
+sequence for that adapter yet).
+
+**Why:** each needs new backend capability that cannot be verified without
+the corresponding bench setup; a refusal the client sees beats an
+unverified register poke.
+
+**Watch out:** clients that drive legacy instruments through interface
+links with custom addressing sequences (RECOMMENDATION B.1.1's use case)
+will hit the write/read refusals first.
+
+**Finishing it:** an unaddressed send/receive pair on `GpibBackend`
+(both chips have the primitive; the NI listen-only path is most of the
+receive side), a verified TMS9914 take-control sequence for the 82357, and
+a runtime re-address that re-runs the address-register part of init.

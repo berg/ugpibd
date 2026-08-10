@@ -267,6 +267,30 @@ impl Vxi11Client {
         let results = self.core(DESTROY_INTR_CHAN, &[]).await?;
         Ok(decode_device_error(&results)?)
     }
+
+    pub async fn device_docmd(
+        &mut self,
+        lid: i32,
+        cmd: i32,
+        network_order: bool,
+        datasize: i32,
+        data_in: &[u8],
+    ) -> Result<DeviceDocmdResp> {
+        let parms = DeviceDocmdParms {
+            lid,
+            flags: 0,
+            io_timeout_ms: 0,
+            lock_timeout_ms: 0,
+            cmd,
+            network_order,
+            datasize,
+            data_in: data_in.to_vec(),
+        };
+        let mut args = Vec::new();
+        parms.encode(&mut args);
+        let results = self.core(DEVICE_DOCMD, &args).await?;
+        Ok(DeviceDocmdResp::decode(&results)?)
+    }
 }
 
 /// A DEVICE_INTR server: what a VXI-11 *client* runs so the instrument side

@@ -463,6 +463,25 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         Ok(data.first().copied().unwrap_or(0))
     }
 
+    async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
+        // Take control, put the bytes on the bus under ATN, drop to standby:
+        // the same sequence every addressed operation here already uses.
+        self.send_command(cmds, true).await
+    }
+
+    async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        let req = if assert {
+            encode_take_control(true)
+        } else {
+            encode_go_to_standby()
+        };
+        self.transact(&req, OP_RESP_LEN).await.map(|_| ())
+    }
+
+    fn controller_pad(&self) -> u8 {
+        self.my_pad
+    }
+
     /// Read the TNT4882 bus status register and report the live SRQ line.
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()

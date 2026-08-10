@@ -78,19 +78,33 @@ impl Default for Config {
     }
 }
 
-/// Parse a create_link device name to a GPIB primary address.
+/// What a create_link device name resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceAddr {
+    /// A device at this primary address.
+    Pad(u8),
+    /// The IEEE 488.1 interface itself (VXI-11.2 RULE B.1.3): the link for
+    /// device_docmd and the bus-wide control sequences.
+    Interface,
+}
+
+/// Parse a create_link device name.
 ///
 /// Accepted spellings (VXI-11.2 §B.1): `gpib0,<pad>` addresses a device on
-/// the one bus this daemon controls; `inst0` and a bare `gpib0` mean the
-/// daemon's default PAD, matching the HiSLIP sub-address convention.
-/// Errors are create_link's own table (B.4): a secondary address parses but
-/// is refused with 21 until the backend can address one — not silently
-/// dropped; an interface number other than 0 is 3, device not accessible
-/// (the daemon has one bus); anything unparseable is 1, syntax error.
-pub fn parse_device_name(name: &str, default_pad: u8) -> Result<u8, ErrorCode> {
+/// the one bus this daemon controls; a bare `gpib0` is the *interface*
+/// (RULE B.1.3); `inst0` means the daemon's default PAD, matching the
+/// HiSLIP sub-address convention. Errors are create_link's own table
+/// (B.4): a secondary address parses but is refused with 21 until the
+/// backend can address one — not silently dropped; an interface number
+/// other than 0 is 3, device not accessible (the daemon has one bus);
+/// anything unparseable is 1, syntax error.
+pub fn parse_device_name(name: &str, default_pad: u8) -> Result<DeviceAddr, ErrorCode> {
     let name = name.trim().to_ascii_lowercase();
-    if name == "inst0" || name == "gpib0" {
-        return Ok(default_pad);
+    if name == "inst0" {
+        return Ok(DeviceAddr::Pad(default_pad));
+    }
+    if name == "gpib0" {
+        return Ok(DeviceAddr::Interface);
     }
     let Some(rest) = name.strip_prefix("gpib") else {
         return Err(ErrorCode::SyntaxError);
@@ -119,12 +133,15 @@ pub fn parse_device_name(name: &str, default_pad: u8) -> Result<u8, ErrorCode> {
         // address one yet. 21 is a loud refusal the client sees; swallowing
         // the sad and talking to the primary would answer the wrong device.
         Some(_) => Err(ErrorCode::InvalidAddress),
-        None => Ok(pad),
+        None => Ok(DeviceAddr::Pad(pad)),
     }
 }
 
 struct Link {
     lid: i32,
+    /// Interface links (bare `gpib0`) use `instrument` purely as a bus
+    /// handle; its PAD is never addressed by their operations.
+    kind: DeviceAddr,
     instrument: Arc<Instrument>,
     /// An abortable operation is running on this link right now. device_abort
     /// only terminates an *in-progress* call (OBSERVATION B.6.24); one that
@@ -150,7 +167,16 @@ impl Link {
     }
 
     fn resource(&self) -> String {
-        self.instrument.resource_key()
+        match self.kind {
+            // Locks on the interface link are scoped to the interface, not
+            // to whatever PAD its bus handle happens to carry.
+            DeviceAddr::Interface => "gpib0:intf".to_string(),
+            DeviceAddr::Pad(_) => self.instrument.resource_key(),
+        }
+    }
+
+    fn is_interface(&self) -> bool {
+        matches!(self.kind, DeviceAddr::Interface)
     }
 }
 
@@ -328,6 +354,9 @@ struct ConnState {
 struct IntrChannel {
     shutdown: Arc<Notify>,
     sender: tokio::task::JoinHandle<()>,
+    /// For notifications outside the forwarder's SRQ loop — RULE B.4.14's
+    /// enable-while-the-line-is-already-high case.
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl Drop for IntrChannel {
@@ -509,7 +538,23 @@ where
                 Some(link) => {
                     // OBSERVATION B.6.21: this state belongs to the link and
                     // ignores whether an interrupt channel currently exists.
-                    *link.srq_handle.lock().unwrap() = parms.enable.then_some(parms.handle);
+                    let was_enabled = {
+                        let mut handle = link.srq_handle.lock().unwrap();
+                        let was = handle.is_some();
+                        *handle = parms.enable.then(|| parms.handle.clone());
+                        was
+                    };
+                    // RULE B.4.14 (VXI-11.2): enabling while the SRQ line is
+                    // already high delivers a notification immediately — the
+                    // edge the forwarder waits for already happened.
+                    if parms.enable && !was_enabled {
+                        if let Some(intr) = &conn.intr {
+                            let high = link.instrument.srq_asserted().await.unwrap_or(false);
+                            if high {
+                                let _ = intr.tx.send(parms.handle);
+                            }
+                        }
+                    }
                     ErrorCode::NoError
                 }
                 // RULE B.6.94.
@@ -537,13 +582,8 @@ where
             encode_device_error(error.as_u32())
         }
         DEVICE_DOCMD => {
-            // Refused per-phase like the above, but with docmd's own
-            // response shape so a conforming client can decode it.
-            DeviceDocmdResp {
-                error: ErrorCode::OperationNotSupported.as_u32(),
-                data_out: Vec::new(),
-            }
-            .encode()
+            let parms = DeviceDocmdParms::decode(args).map_err(garbage)?;
+            device_docmd(shared, parms).await.encode()
         }
         _ => return Ok(rpc::reply_proc_unavail(xid)),
     };
@@ -566,14 +606,18 @@ where
         max_recv_size: 0,
     };
     let name = String::from_utf8_lossy(&parms.device).into_owned();
-    let pad = match parse_device_name(&name, shared.config.default_pad) {
-        Ok(pad) => pad,
+    let kind = match parse_device_name(&name, shared.config.default_pad) {
+        Ok(kind) => kind,
         Err(e) => {
             debug!("create_link refused for device name {name:?}: {e:?}");
             return refuse(e);
         }
     };
-    let instrument = instrument_for(pad);
+    let instrument = instrument_for(match kind {
+        DeviceAddr::Pad(pad) => pad,
+        // Bus handle only; interface operations never address this PAD.
+        DeviceAddr::Interface => shared.config.default_pad,
+    });
     let lid = {
         let mut links = shared.links.lock().unwrap();
         if links.links.len() >= shared.config.max_links {
@@ -584,6 +628,7 @@ where
             lid,
             Arc::new(Link {
                 lid,
+                kind,
                 instrument,
                 in_flight: AtomicBool::new(false),
                 aborted: AtomicBool::new(false),
@@ -676,6 +721,10 @@ async fn device_lock(shared: &Shared, parms: DeviceLockParms) -> ErrorCode {
 /// service on the wired-OR SRQ line.
 const STB_RQS: u8 = 0x40;
 
+/// IEEE 488.1 universal commands used by the interface link.
+const GPIB_DCL: u8 = 0x14;
+const GPIB_GET: u8 = 0x08;
+
 async fn create_intr_chan<F>(
     shared: &Arc<Shared>,
     instrument_for: &F,
@@ -761,6 +810,7 @@ where
     {
         let shared = shared.clone();
         let shutdown = shutdown.clone();
+        let tx = tx.clone();
         tokio::spawn(async move {
             debug!("vxi11 srq forwarder starting");
             // The broadcast carries edges; the line is a level. An SRQ
@@ -803,22 +853,33 @@ where
                         .filter(|l| l.srq_handle.lock().unwrap().is_some())
                         .collect()
                 };
-                // One poll per instrument, not per link.
+                // Device links are notified only when *their* instrument has
+                // RQS set — one poll per instrument. This deliberately
+                // diverges from VXI-11.2 RULE B.4.13, which notifies every
+                // enabled link on any line edge: the filtered form is what
+                // the bench validated (multidev isolation), and it spares
+                // clients a spurious wake per unrelated instrument. An
+                // interface link has no instrument to poll, so it gets the
+                // spec behavior: the line itself is its signal.
                 let mut polled: HashMap<String, bool> = HashMap::new();
                 for link in targets {
                     let resource = link.resource();
-                    let requesting = match polled.get(&resource) {
-                        Some(&r) => r,
-                        None => {
-                            let r = match link.instrument.serial_poll().await {
-                                Ok(stb) => stb & STB_RQS != 0,
-                                Err(e) => {
-                                    debug!("vxi11 srq poll failed: {e:#}");
-                                    false
-                                }
-                            };
-                            polled.insert(resource.clone(), r);
-                            r
+                    let requesting = if link.is_interface() {
+                        true
+                    } else {
+                        match polled.get(&resource) {
+                            Some(&r) => r,
+                            None => {
+                                let r = match link.instrument.serial_poll().await {
+                                    Ok(stb) => stb & STB_RQS != 0,
+                                    Err(e) => {
+                                        debug!("vxi11 srq poll failed: {e:#}");
+                                        false
+                                    }
+                                };
+                                polled.insert(resource.clone(), r);
+                                r
+                            }
                         }
                     };
                     debug!(
@@ -835,7 +896,11 @@ where
             }
         })
     };
-    conn.intr = Some(IntrChannel { shutdown, sender });
+    conn.intr = Some(IntrChannel {
+        shutdown,
+        sender,
+        tx,
+    });
     debug!(
         "vxi11 interrupt channel established to {host}:{}",
         parms.host_port
@@ -875,6 +940,202 @@ async fn acquire_access(
     }
 }
 
+/// VXI-11.2 §B.5: the interface command set. Table B.1 fixes each command's
+/// data_in length and datasize; a mismatch is error 5 before any action
+/// (RULE B.5.3). Values are unsigned integers of datasize bytes in the
+/// client's declared byte order (RULE B.5.4).
+async fn device_docmd(shared: &Shared, parms: DeviceDocmdParms) -> DeviceDocmdResp {
+    let fail = |error: ErrorCode| DeviceDocmdResp {
+        error: error.as_u32(),
+        data_out: Vec::new(),
+    };
+    let Some(link) = link_for(shared, parms.lid) else {
+        return fail(ErrorCode::InvalidLinkIdentifier);
+    };
+    // RULE B.5.2: docmd on a device link is 8, no action.
+    if !link.is_interface() {
+        return fail(ErrorCode::OperationNotSupported);
+    }
+    if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
+        return fail(e);
+    }
+
+    /// Decode data_in as one unsigned integer per RULE B.5.4.
+    fn uint_in(parms: &DeviceDocmdParms) -> u32 {
+        let mut value: u32 = 0;
+        let bytes: Box<dyn Iterator<Item = &u8>> = if parms.network_order {
+            Box::new(parms.data_in.iter())
+        } else {
+            Box::new(parms.data_in.iter().rev())
+        };
+        for b in bytes {
+            value = (value << 8) | u32::from(*b);
+        }
+        value
+    }
+
+    /// Encode one unsigned integer as datasize bytes per RULE B.5.4.
+    fn uint_out(value: u32, datasize: usize, network_order: bool) -> Vec<u8> {
+        let mut out: Vec<u8> = (0..datasize)
+            .map(|i| (value >> (8 * (datasize - 1 - i))) as u8)
+            .collect();
+        if !network_order {
+            out.reverse();
+        }
+        out
+    }
+
+    /// RULE B.5.3: the fixed length/datasize pairs from Table B.1.
+    fn sizes_ok(
+        parms: &DeviceDocmdParms,
+        len: std::ops::RangeInclusive<usize>,
+        datasize: i32,
+    ) -> bool {
+        len.contains(&parms.data_in.len()) && parms.datasize == datasize
+    }
+
+    let ok = |data_out: Vec<u8>| DeviceDocmdResp {
+        error: ErrorCode::NoError.as_u32(),
+        data_out,
+    };
+    let echo = |parms: &DeviceDocmdParms| ok(parms.data_in.clone());
+
+    let window = OpWindow::open(&link);
+    let result = match parms.cmd {
+        // Send Command: raw command bytes under ATN (RULE B.5.5).
+        0x020000 => {
+            if !sizes_ok(&parms, 0..=128, 1) {
+                return fail(ErrorCode::ParameterError);
+            }
+            let mut bus = link.instrument.hold().await;
+            match bus.send_bus_command(&parms.data_in).await {
+                Ok(()) => echo(&parms),
+                Err(e) => {
+                    debug!("docmd send-command failed: {e:#}");
+                    fail(ErrorCode::IoError)
+                }
+            }
+        }
+        // Bus Status (RULE B.5.6, Table B.2).
+        0x020001 => {
+            if !sizes_ok(&parms, 2..=2, 2) {
+                return fail(ErrorCode::ParameterError);
+            }
+            let selector = uint_in(&parms);
+            let value = match bus_status(&link, selector).await {
+                Ok(v) => v,
+                Err(code) => return fail(code),
+            };
+            ok(uint_out(value, 2, parms.network_order))
+        }
+        // ATN Control (RULE B.5.7).
+        0x020002 => {
+            if !sizes_ok(&parms, 2..=2, 2) {
+                return fail(ErrorCode::ParameterError);
+            }
+            let mut bus = link.instrument.hold().await;
+            match bus.set_atn(uint_in(&parms) != 0).await {
+                Ok(()) => echo(&parms),
+                Err(e) => {
+                    debug!("docmd ATN control failed: {e:#}");
+                    // The 82357 backend has no verified raw-ATN path; its
+                    // refusal surfaces here as 8, not as a fake success.
+                    fail(ErrorCode::OperationNotSupported)
+                }
+            }
+        }
+        // REN Control (RULE B.5.8).
+        0x020003 => {
+            if !sizes_ok(&parms, 2..=2, 2) {
+                return fail(ErrorCode::ParameterError);
+            }
+            match link.instrument.ren(uint_in(&parms) != 0).await {
+                Ok(()) => echo(&parms),
+                Err(e) => {
+                    debug!("docmd REN control failed: {e:#}");
+                    fail(ErrorCode::IoError)
+                }
+            }
+        }
+        // Pass Control (RULE B.5.9): this daemon is the one controller its
+        // architecture supports; releasing CIC would strand every front-end.
+        // Refused, and documented as a deliberate divergence (ROADMAP 8).
+        0x020004 => {
+            if !sizes_ok(&parms, 4..=4, 4) {
+                return fail(ErrorCode::ParameterError);
+            }
+            fail(ErrorCode::OperationNotSupported)
+        }
+        // Bus Address (RULE B.5.10): GET is not defined — only SET, which
+        // would re-address the controller at runtime. No backend supports
+        // that re-initialization yet; out-of-range is 5 first, then an
+        // honest 8 (ROADMAP 8).
+        0x02000A => {
+            if !sizes_ok(&parms, 4..=4, 4) {
+                return fail(ErrorCode::ParameterError);
+            }
+            if uint_in(&parms) > 30 {
+                return fail(ErrorCode::ParameterError);
+            }
+            fail(ErrorCode::OperationNotSupported)
+        }
+        // IFC Control (RULE B.5.11): datasize is unconstrained ("X"),
+        // data_in must be empty, data_out returns empty.
+        0x020010 => {
+            if !parms.data_in.is_empty() {
+                return fail(ErrorCode::ParameterError);
+            }
+            let mut bus = link.instrument.hold().await;
+            match bus.ifc().await {
+                Ok(()) => ok(Vec::new()),
+                Err(e) => {
+                    debug!("docmd IFC failed: {e:#}");
+                    fail(ErrorCode::IoError)
+                }
+            }
+        }
+        // RULE B.5.1: anything else is 8.
+        _ => fail(ErrorCode::OperationNotSupported),
+    };
+    if window.take_abort() {
+        return fail(ErrorCode::Abort);
+    }
+    result
+}
+
+/// Bus Status selectors (Table B.2), answered from the live control lines
+/// and the daemon's own state.
+async fn bus_status(link: &Link, selector: u32) -> Result<u32, ErrorCode> {
+    let live = |b: bool| u32::from(b);
+    match selector {
+        1..=3 => {
+            let mut bus = link.instrument.hold().await;
+            match bus.bus_lines().await {
+                Ok(lines) => Ok(match selector {
+                    1 => live(lines.ren),
+                    2 => live(lines.srq),
+                    _ => live(lines.ndac),
+                }),
+                Err(e) => {
+                    debug!("docmd bus-status line read failed: {e:#}");
+                    // A backend that cannot read the lines refuses; a made-up
+                    // line level would be a plausible lie.
+                    Err(ErrorCode::OperationNotSupported)
+                }
+            }
+        }
+        // System controller / controller-in-charge: this daemon is both, by
+        // architecture, whenever it is running as a controller at all.
+        4 | 5 => Ok(1),
+        // Addressed to talk / listen: the daemon addresses transiently
+        // inside bus transactions, and docmd itself holds the bus — so at
+        // the moment this question is answerable, the answer is no.
+        6 | 7 => Ok(0),
+        8 => Ok(u32::from(link.instrument.hold().await.controller_pad())),
+        _ => Err(ErrorCode::ParameterError),
+    }
+}
+
 fn link_for(shared: &Shared, lid: i32) -> Option<Arc<Link>> {
     shared.links.lock().unwrap().links.get(&lid).cloned()
 }
@@ -894,6 +1155,14 @@ async fn device_write(shared: &Shared, parms: DeviceWriteParms) -> DeviceWriteRe
             size: 0,
         };
     };
+    if link.is_interface() {
+        // RULE B.4.2 wants an unaddressed SEND DATA BYTES here; no backend
+        // exposes one yet. Refused, not faked — ROADMAP entry 8.
+        return DeviceWriteResp {
+            error: ErrorCode::OperationNotSupported.as_u32(),
+            size: 0,
+        };
+    }
     if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
         return DeviceWriteResp {
             error: e.as_u32(),
@@ -953,6 +1222,11 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
     let Some(link) = link_for(shared, parms.lid) else {
         return fail(ErrorCode::InvalidLinkIdentifier);
     };
+    if link.is_interface() {
+        // RULE B.4.4's unaddressed RECEIVE has no backend primitive either;
+        // ROADMAP entry 8.
+        return fail(ErrorCode::OperationNotSupported);
+    }
     // RULE B.6.23.1.b: requestSize zero terminates immediately with REQCNT —
     // zero bytes were requested and zero delivered.
     if parms.request_size == 0 {
@@ -1092,6 +1366,14 @@ async fn device_readstb(shared: &Shared, parms: DeviceGenericParms) -> DeviceRea
             stb: 0,
         };
     };
+    if link.is_interface() {
+        // VXI-11.2 defines readstb only for device links (B.4.7 has no
+        // interface rule); a status byte of "the interface" is not a thing.
+        return DeviceReadStbResp {
+            error: ErrorCode::OperationNotSupported.as_u32(),
+            stb: 0,
+        };
+    }
     if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
         return DeviceReadStbResp {
             error: e.as_u32(),
@@ -1134,15 +1416,37 @@ async fn device_simple(shared: &Shared, proc: u32, parms: DeviceGenericParms) ->
     }
     let window = OpWindow::open(&link);
     let instr = &link.instrument;
-    let outcome = match proc {
-        DEVICE_TRIGGER => instr.trigger().await,
-        DEVICE_CLEAR => instr.device_clear().await,
-        // B.6.8/B.6.9 of VXI-11.3 map these onto REN addressing; the
-        // instrument methods drive REN plus addressing, matching what the
-        // HiSLIP front-end does for its remote/local operations.
-        DEVICE_REMOTE => instr.go_to_remote().await,
-        DEVICE_LOCAL => instr.go_to_local().await,
-        _ => unreachable!("dispatch sends only the four generic procedures"),
+    let outcome = if link.is_interface() {
+        match proc {
+            // RULE B.4.8: GET without addressing — every currently-addressed
+            // listener triggers.
+            DEVICE_TRIGGER => {
+                let mut bus = instr.hold().await;
+                bus.send_bus_command(&[GPIB_GET]).await
+            }
+            // RULE B.4.6: bus-wide DCL, all devices.
+            DEVICE_CLEAR => {
+                let mut bus = instr.hold().await;
+                bus.send_bus_command(&[GPIB_DCL]).await
+            }
+            // RULES B.4.10/B.4.12: remote and local are per-device notions;
+            // the interface link answers 8.
+            DEVICE_REMOTE | DEVICE_LOCAL => {
+                return ErrorCode::OperationNotSupported.as_u32();
+            }
+            _ => unreachable!("dispatch sends only the four generic procedures"),
+        }
+    } else {
+        match proc {
+            DEVICE_TRIGGER => instr.trigger().await,
+            DEVICE_CLEAR => instr.device_clear().await,
+            // B.6.8/B.6.9 of VXI-11.3 map these onto REN addressing; the
+            // instrument methods drive REN plus addressing, matching what the
+            // HiSLIP front-end does for its remote/local operations.
+            DEVICE_REMOTE => instr.go_to_remote().await,
+            DEVICE_LOCAL => instr.go_to_local().await,
+            _ => unreachable!("dispatch sends only the four generic procedures"),
+        }
     };
     if window.take_abort() {
         return ErrorCode::Abort.as_u32();
@@ -1162,12 +1466,17 @@ mod tests {
 
     #[test]
     fn device_names_resolve_to_pads() {
-        assert_eq!(parse_device_name("gpib0,18", 5), Ok(18));
-        assert_eq!(parse_device_name("gpib0,0", 5), Ok(0));
-        assert_eq!(parse_device_name("gpib0,30", 5), Ok(30));
-        assert_eq!(parse_device_name("GPIB0,18", 5), Ok(18));
-        assert_eq!(parse_device_name(" inst0 ", 5), Ok(5));
-        assert_eq!(parse_device_name("gpib0", 5), Ok(5));
+        assert_eq!(parse_device_name("gpib0,18", 5), Ok(DeviceAddr::Pad(18)));
+        assert_eq!(parse_device_name("gpib0,0", 5), Ok(DeviceAddr::Pad(0)));
+        assert_eq!(parse_device_name("gpib0,30", 5), Ok(DeviceAddr::Pad(30)));
+        assert_eq!(parse_device_name("GPIB0,18", 5), Ok(DeviceAddr::Pad(18)));
+        assert_eq!(parse_device_name(" inst0 ", 5), Ok(DeviceAddr::Pad(5)));
+    }
+
+    /// VXI-11.2 RULE B.1.3: a bare interface name is the interface itself.
+    #[test]
+    fn a_bare_gpib0_is_the_interface() {
+        assert_eq!(parse_device_name("gpib0", 5), Ok(DeviceAddr::Interface));
     }
 
     #[test]

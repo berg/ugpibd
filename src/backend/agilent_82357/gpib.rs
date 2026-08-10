@@ -50,11 +50,15 @@ pub struct GpibController<T: Transport> {
     pub eos_enabled: bool,
     pub hw_control_bits: u8,
     pub listen_only: bool,
+    /// The controller's own primary address, retained from init for
+    /// VXI-11.2 Bus Status selector 8.
+    pub my_pad: u8,
 }
 
 impl<T: Transport> GpibController<T> {
     pub fn new(transport: T, timeout_ms: u32) -> Self {
         Self {
+            my_pad: 0,
             transport,
             timeout_ms,
             eos_char: b'\n',
@@ -97,6 +101,7 @@ impl<T: Transport> GpibController<T> {
     /// Matches the kernel driver's `agilent_82357a_init()` with t1_nano_sec=800,
     /// then requests system controller and pulses IFC + asserts REN.
     pub async fn init(&mut self, my_pad: u8) -> Result<()> {
+        self.my_pad = my_pad;
         // Clear anything a dead predecessor left queued before trusting a
         // single response byte. Without this a fresh daemon fails its first
         // init with `unexpected response byte 0xfa, expected 0xfb` and
@@ -745,6 +750,7 @@ impl<T: Transport> GpibController<T> {
 #[async_trait::async_trait]
 impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibController<T> {
     async fn init(&mut self, my_pad: u8) -> Result<()> {
+        self.my_pad = my_pad;
         self.init(my_pad).await
     }
     async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
@@ -792,6 +798,22 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()
     }
+    async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
+        // The same proven command-byte path the addressed operations use;
+        // the firmware raises ATN for command packets itself.
+        // Inherent method: resolution prefers it over this trait impl, so
+        // no recursion.
+        self.send_command_bytes(cmds).await
+    }
+
+    // set_atn deliberately keeps the refusing default: this adapter has no
+    // *verified* raw-ATN sequence yet (AUX_TCA is untested on hardware), and
+    // an unverified register poke is worse than an honest error 8.
+
+    fn controller_pad(&self) -> u8 {
+        self.my_pad
+    }
+
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
         self.eos_char = eos_char;
         self.eos_enabled = enabled;
