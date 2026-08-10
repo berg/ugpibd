@@ -249,6 +249,7 @@ async fn main() -> Result<()> {
     let hislip_ctrl = ctrl.clone();
     let default_pad = args.default_address;
     let locks = Arc::new(ugpibd::frontend::lock::LockRegistry::new());
+    let vxi11_locks = locks.clone();
 
     let prologix_fut = async move {
         match prologix_listener {
@@ -290,6 +291,9 @@ async fn main() -> Result<()> {
                 let config = ugpibd::vxi11::server::Config {
                     default_io_timeout_ms: args.timeout_ms,
                     default_pad,
+                    // The same registry HiSLIP enforces: a lock is a lock,
+                    // whichever protocol carried it.
+                    locks: vxi11_locks,
                     ..Default::default()
                 };
                 let instrument_for = move |pad: u8| {

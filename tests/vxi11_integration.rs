@@ -152,6 +152,12 @@ fn ok(code: u32) -> u32 {
     code
 }
 
+/// The server's host and port, for opening sibling connections.
+fn client_addr(client: &Vxi11Client) -> Result<(String, u16)> {
+    let addr = client.server_addr()?;
+    Ok((addr.ip().to_string(), addr.port()))
+}
+
 /// RULE B.6.3: create_link returns a usable lid, maxRecvSize ≥ 1024, and
 /// no error; lids are unique across links.
 #[tokio::test]
@@ -465,8 +471,8 @@ async fn generic_operations_reach_the_addressed_device() -> Result<()> {
     Ok(())
 }
 
-/// Phase boundaries are honest refusals: lock/enable_srq/intr_chan answer
-/// 8, unlock answers 12 (no lock is held — true), docmd answers 8 in its
+/// Phase boundaries are honest refusals: enable_srq and the interrupt
+/// channel answer 8 (their phase has not landed), docmd answers 8 in its
 /// own response shape.
 #[tokio::test]
 async fn unimplemented_procedures_refuse_honestly() -> Result<()> {
@@ -474,45 +480,27 @@ async fn unimplemented_procedures_refuse_honestly() -> Result<()> {
     let mut client = start_default(backend).await?;
     let link = client.create_link("gpib0,18").await?;
 
-    let mut lock_args = Vec::new();
-    ugpibd::vxi11::messages::DeviceLockParms {
+    let mut srq_args = Vec::new();
+    ugpibd::vxi11::messages::DeviceEnableSrqParms {
         lid: link.lid,
-        flags: 0,
-        lock_timeout_ms: 0,
+        enable: true,
+        handle: vec![1, 2, 3],
     }
-    .encode(&mut lock_args);
+    .encode(&mut srq_args);
     let reply = client
         .call(
             vxi11::DEVICE_CORE_PROG,
             vxi11::DEVICE_CORE_VERS,
-            vxi11::DEVICE_LOCK,
-            &lock_args,
+            vxi11::DEVICE_ENABLE_SRQ,
+            &srq_args,
         )
         .await?;
     let Reply::Success(results) = reply else {
-        panic!("lock refusal should be a VXI-11 error, not an RPC one");
+        panic!("enable_srq refusal should be a VXI-11 error, not an RPC one");
     };
     assert_eq!(
         ugpibd::vxi11::messages::decode_device_error(&results)?,
         ErrorCode::OperationNotSupported.as_u32()
-    );
-
-    let mut unlock_args = Vec::new();
-    ugpibd::vxi11::xdr::put_i32(&mut unlock_args, link.lid);
-    let reply = client
-        .call(
-            vxi11::DEVICE_CORE_PROG,
-            vxi11::DEVICE_CORE_VERS,
-            vxi11::DEVICE_UNLOCK,
-            &unlock_args,
-        )
-        .await?;
-    let Reply::Success(results) = reply else {
-        panic!("unlock should decode");
-    };
-    assert_eq!(
-        ugpibd::vxi11::messages::decode_device_error(&results)?,
-        ErrorCode::NoLockHeldByThisLink.as_u32()
     );
     Ok(())
 }
@@ -535,5 +523,290 @@ async fn rpc_level_errors_use_rpc_level_replies() -> Result<()> {
         client.call(vxi11::DEVICE_CORE_PROG, 1, 999, &[]).await?,
         Reply::Accepted(3), // PROC_UNAVAIL
     );
+    Ok(())
+}
+
+/// RULES B.6.17/B.6.25: with another link holding the lock, I/O without
+/// waitlock answers 11 immediately; the holder's own I/O proceeds.
+#[tokio::test]
+async fn a_lock_excludes_other_links_io() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let b = client.create_link("gpib0,18").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+
+    // The holder works; the stranger is refused with 11.
+    ok(client.device_write(a.lid, b"MINE", true, 0).await?.error);
+    let refused = client.device_write(b.lid, b"NOPE", true, 0).await?;
+    assert_eq!(refused.error, ErrorCode::DeviceLockedByAnotherLink.as_u32());
+    let refused = client.device_read(b.lid, 10, 0, None).await?;
+    assert_eq!(refused.error, ErrorCode::DeviceLockedByAnotherLink.as_u32());
+    Ok(())
+}
+
+/// Locks are per-*link* (RULE B.6.72's identity), so two links on one
+/// connection contend like strangers — and locks are scoped per instrument,
+/// so a different PAD is unaffected.
+#[tokio::test]
+async fn locks_bind_to_links_and_instruments() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let other_pad = client.create_link("gpib0,23").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+    ok(client
+        .device_write(other_pad.lid, b"FREE", true, 0)
+        .await?
+        .error);
+    Ok(())
+}
+
+/// RULE B.6.72: VXI-11 locks do not nest — the holder re-locking gets 11.
+#[tokio::test]
+async fn a_relock_by_the_holder_is_error_11() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+    assert_eq!(
+        client.device_lock(a.lid, false, 0).await?,
+        ErrorCode::DeviceLockedByAnotherLink.as_u32()
+    );
+    Ok(())
+}
+
+/// RULES B.6.78/B.6.80: unlock releases; without a lock held it answers 12.
+#[tokio::test]
+async fn unlock_releases_and_answers_12_without_a_lock() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let b = client.create_link("gpib0,18").await?;
+    assert_eq!(
+        client.device_unlock(a.lid).await?,
+        ErrorCode::NoLockHeldByThisLink.as_u32()
+    );
+    ok(client.device_lock(a.lid, false, 0).await?);
+    ok(client.device_unlock(a.lid).await?);
+    // Free again: the other link can take it.
+    ok(client.device_lock(b.lid, false, 0).await?);
+    Ok(())
+}
+
+/// RULES B.6.74/B.6.75: waitlock waits — granted the moment the holder
+/// releases, or 11 after lock_timeout.
+#[tokio::test]
+async fn waitlock_waits_and_times_out() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let b = client.create_link("gpib0,18").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+
+    // Times out: the holder is not letting go.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        client.device_lock(b.lid, true, 200).await?,
+        ErrorCode::DeviceLockedByAnotherLink.as_u32()
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+
+    // Granted on release: run the waiter on a second connection so the
+    // holder's unlock is not queued behind it.
+    let addr = client_addr(&client)?;
+    let waiter = tokio::spawn(async move {
+        let mut w = Vxi11Client::connect(&addr.0, addr.1).await?;
+        let c = w.create_link("gpib0,18").await?;
+        w.device_lock(c.lid, true, 10_000).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    ok(client.device_unlock(a.lid).await?);
+    assert_eq!(waiter.await??, ErrorCode::NoError.as_u32());
+    Ok(())
+}
+
+/// RULE B.6.9.2: destroying a link frees its lock.
+#[tokio::test]
+async fn destroy_link_frees_its_lock() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let b = client.create_link("gpib0,18").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+    ok(client.destroy_link(a.lid).await?);
+    ok(client.device_lock(b.lid, false, 0).await?);
+    Ok(())
+}
+
+/// RULE B.6.77: a broken connection releases its links' locks.
+#[tokio::test]
+async fn a_dropped_connection_frees_its_locks() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let addr = client_addr(&client)?;
+
+    let mut first = Vxi11Client::connect(&addr.0, addr.1).await?;
+    let held = first.create_link("gpib0,18").await?;
+    ok(first.device_lock(held.lid, false, 0).await?);
+    drop(first);
+
+    let mine = client.create_link("gpib0,18").await?;
+    // The teardown races this: poll briefly.
+    for attempt in 0.. {
+        if client.device_lock(mine.lid, false, 0).await? == ErrorCode::NoError.as_u32() {
+            return Ok(());
+        }
+        assert!(attempt < 50, "dropped connection's lock never freed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    unreachable!()
+}
+
+/// RULES B.6.3.1/B.6.6/B.6.7: create_link with lockDevice acquires the lock
+/// or creates nothing; without it, existing locks are ignored at link
+/// creation and bite at I/O time.
+#[tokio::test]
+async fn create_link_lock_device_acquires_or_refuses() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+
+    let locked = client.create_link_locked("gpib0,18", 0).await?;
+    ok(locked.error);
+
+    // A second locked create_link is refused (11) and leaves no link
+    // behind: its lid must not be destroyable.
+    let refused = client.create_link_locked("gpib0,18", 100).await?;
+    assert_eq!(refused.error, ErrorCode::DeviceLockedByAnotherLink.as_u32());
+
+    // An unlocked create_link succeeds (RULE B.6.6) but its I/O is gated.
+    let bystander = client.create_link("gpib0,18").await?;
+    ok(bystander.error);
+    assert_eq!(
+        client
+            .device_write(bystander.lid, b"X", true, 0)
+            .await?
+            .error,
+        ErrorCode::DeviceLockedByAnotherLink.as_u32()
+    );
+    Ok(())
+}
+
+/// Cross-front-end coherence: a lock taken through another protocol's
+/// registry identity (a HiSLIP session) excludes VXI-11 I/O, and a VXI-11
+/// lock excludes that identity — one registry, namespaced holders.
+#[tokio::test]
+async fn locks_are_coherent_across_front_ends() -> Result<()> {
+    use ugpibd::frontend::lock::{hislip_id, LockRegistry};
+    let registry = Arc::new(LockRegistry::new());
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let config = Config {
+        locks: registry.clone(),
+        ..Default::default()
+    };
+    let mut client = start(backend, config).await?;
+    let link = client.create_link("gpib0,18").await?;
+
+    // A HiSLIP session locks the instrument: VXI-11 I/O is excluded.
+    let hislip_session = hislip_id(7);
+    assert!(registry
+        .request("gpib18", hislip_session, "", std::time::Duration::ZERO)
+        .await
+        .is_success());
+    assert_eq!(
+        client.device_write(link.lid, b"X", true, 0).await?.error,
+        ErrorCode::DeviceLockedByAnotherLink.as_u32()
+    );
+    registry.release("gpib18", hislip_session);
+
+    // A VXI-11 lock excludes the HiSLIP session in turn.
+    ok(client.device_lock(link.lid, false, 0).await?);
+    assert!(!registry.has_access("gpib18", hislip_session));
+    Ok(())
+}
+
+/// RULES B.6.29/B.6.30/B.6.107: device_abort over the abort channel
+/// terminates an in-flight read with 23 — partial data included — and the
+/// link works afterwards.
+#[tokio::test]
+async fn abort_terminates_an_in_flight_read() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![(b"PART".to_vec(), false)], 0x42);
+    let mut client = start_default(backend).await?;
+    let link = client.create_link("gpib0,18").await?;
+    assert_ne!(link.abort_port, 0, "abort channel advertised");
+    let addr = client_addr(&client)?;
+
+    // Long read on its own connection; nothing terminates it but the abort.
+    let lid = link.lid;
+    let host = addr.0.clone();
+    let port = addr.1;
+    let reader = tokio::spawn(async move {
+        let mut r = Vxi11Client::connect(&host, port).await?;
+        // Same server, new connection: the link table is global.
+        r.device_read(lid, 20480, 30_000, None).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        ugpibd::vxi11::client::device_abort(&addr.0, link.abort_port, link.lid).await?,
+        ErrorCode::NoError.as_u32()
+    );
+    let resp = reader.await??;
+    assert_eq!(resp.error, ErrorCode::Abort.as_u32());
+    assert_eq!(resp.data, b"PART", "partial data survives the abort");
+
+    // The link is not poisoned: the next operation runs normally.
+    let stb = client.device_readstb(link.lid, 0).await?;
+    ok(stb.error);
+    assert_eq!(stb.stb, 0x42);
+    Ok(())
+}
+
+/// OBSERVATION B.6.24 and RULE B.6.108: an abort with nothing in flight is
+/// a delivered no-op, and an unknown lid answers 4.
+#[tokio::test]
+async fn abort_without_a_target_is_a_no_op() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![(b"ok".to_vec(), true)], 0);
+    let mut client = start_default(backend).await?;
+    let link = client.create_link("gpib0,18").await?;
+    let addr = client_addr(&client)?;
+
+    assert_eq!(
+        ugpibd::vxi11::client::device_abort(&addr.0, link.abort_port, link.lid).await?,
+        ErrorCode::NoError.as_u32()
+    );
+    assert_eq!(
+        ugpibd::vxi11::client::device_abort(&addr.0, link.abort_port, 999).await?,
+        ErrorCode::InvalidLinkIdentifier.as_u32()
+    );
+    // The idle abort did not poison the next operation.
+    let resp = client.device_read(link.lid, 20480, 0, None).await?;
+    ok(resp.error);
+    assert_eq!(resp.data, b"ok");
+    Ok(())
+}
+
+/// RULE B.6.76: an abort interrupts a waitlock'd device_lock wait.
+#[tokio::test]
+async fn abort_interrupts_a_lock_wait() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let a = client.create_link("gpib0,18").await?;
+    let b = client.create_link("gpib0,18").await?;
+    ok(client.device_lock(a.lid, false, 0).await?);
+    let addr = client_addr(&client)?;
+
+    let lid = b.lid;
+    let host = addr.0.clone();
+    let port = addr.1;
+    let waiter = tokio::spawn(async move {
+        let mut w = Vxi11Client::connect(&host, port).await?;
+        w.device_lock(lid, true, 30_000).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        ugpibd::vxi11::client::device_abort(&addr.0, b.abort_port, b.lid).await?,
+        ErrorCode::NoError.as_u32()
+    );
+    assert_eq!(waiter.await??, ErrorCode::Abort.as_u32());
     Ok(())
 }

@@ -55,15 +55,33 @@ impl LockResponse {
     }
 }
 
+/// A lock-holder identity. Front-ends namespace their own ids into this so a
+/// HiSLIP session and a VXI-11 link can never collide: the *tables* must be
+/// shared across protocols (a lock is a lock, whoever took it), but the
+/// identities must not be.
+pub type HolderId = u64;
+
+/// A HiSLIP session's registry identity.
+pub fn hislip_id(session_id: u16) -> HolderId {
+    0x0001_0000_0000 | HolderId::from(session_id)
+}
+
+/// A VXI-11 link's registry identity. Locks belong to the *link*, not the
+/// connection (VXI-11 RULE B.6.72 speaks of links), so two links on one
+/// connection contend like strangers.
+pub fn vxi11_id(lid: i32) -> HolderId {
+    0x0002_0000_0000 | HolderId::from(lid as u32)
+}
+
 /// Who holds what on one resource.
 #[derive(Debug, Default)]
 struct LockTable {
     /// Session holding the exclusive lock, and how deep its nesting is.
-    exclusive: Option<(u16, u32)>,
+    exclusive: Option<(HolderId, u32)>,
     /// The name the shared holders agreed on. `None` when none are left.
     shared_name: Option<String>,
     /// Shared holders and their nesting depth.
-    shared: HashMap<u16, u32>,
+    shared: HashMap<HolderId, u32>,
 }
 
 impl LockTable {
@@ -82,7 +100,7 @@ impl LockTable {
 
     /// A session may do I/O when it holds a lock itself — a shared holder
     /// among other shared holders qualifies — or when the resource is free.
-    fn grants_access(&self, id: u16) -> bool {
+    fn grants_access(&self, id: HolderId) -> bool {
         let holds = matches!(self.exclusive, Some((holder, _)) if holder == id)
             || self.shared.contains_key(&id);
         holds || self.is_empty()
@@ -112,7 +130,7 @@ impl LockRegistry {
     pub async fn request(
         &self,
         resource: &str,
-        id: u16,
+        id: HolderId,
         lock_string: &str,
         timeout: Duration,
     ) -> LockResponse {
@@ -133,7 +151,7 @@ impl LockRegistry {
     }
 
     /// One attempt at acquiring. `None` means "conflicts right now".
-    fn try_request(&self, resource: &str, id: u16, lock_string: &str) -> Option<LockResponse> {
+    fn try_request(&self, resource: &str, id: HolderId, lock_string: &str) -> Option<LockResponse> {
         let mut tables = self.tables.lock().unwrap();
         let table = tables.entry(resource.to_string()).or_default();
 
@@ -172,7 +190,7 @@ impl LockRegistry {
     }
 
     /// Release one level of whatever lock this session holds.
-    pub fn release(&self, resource: &str, id: u16) -> LockResponse {
+    pub fn release(&self, resource: &str, id: HolderId) -> LockResponse {
         let mut tables = self.tables.lock().unwrap();
         let Some(table) = tables.get_mut(resource) else {
             return LockResponse::Error;
@@ -211,7 +229,7 @@ impl LockRegistry {
     /// Drop every lock this session holds, at every nesting level. Called when
     /// the session ends — otherwise a client that crashes mid-lock would lock
     /// the instrument out for good.
-    pub fn release_all(&self, id: u16) {
+    pub fn release_all(&self, id: HolderId) {
         let mut tables = self.tables.lock().unwrap();
         let mut freed = false;
         tables.retain(|_, table| {
@@ -251,7 +269,7 @@ impl LockRegistry {
     /// buffer, TCP applies the backpressure, and the client blocks until either
     /// the lock frees or its own timeout fires. HiSLIP has no "resource locked"
     /// reply and none is to be invented, so this waits rather than answering.
-    pub async fn wait_for_access(&self, resource: &str, id: u16) {
+    pub async fn wait_for_access(&self, resource: &str, id: HolderId) {
         loop {
             // Subscribe before testing, so a release in between is not missed.
             let released = self.released.notified();
@@ -264,11 +282,52 @@ impl LockRegistry {
 
     /// May this session do I/O right now? True when it holds a lock itself, or
     /// when nobody else does.
-    pub fn has_access(&self, resource: &str, id: u16) -> bool {
+    pub fn has_access(&self, resource: &str, id: HolderId) -> bool {
         let tables = self.tables.lock().unwrap();
         match tables.get(resource) {
             Some(table) => table.grants_access(id),
             None => true,
+        }
+    }
+
+    /// Does this holder currently hold any lock on the resource? Distinct
+    /// from `has_access`, which is also true on a free resource. VXI-11
+    /// needs the distinction twice: RULE B.6.72 makes a re-lock by the
+    /// holder an *error* (VXI-11 locks do not nest, unlike VISA/HiSLIP
+    /// ones), and RULE B.6.80 answers an unlock without a lock with 12.
+    pub fn holds(&self, resource: &str, id: HolderId) -> bool {
+        let tables = self.tables.lock().unwrap();
+        match tables.get(resource) {
+            Some(table) => {
+                matches!(table.exclusive, Some((holder, _)) if holder == id)
+                    || table.shared.contains_key(&id)
+            }
+            None => false,
+        }
+    }
+
+    /// Bounded [`Self::wait_for_access`]: park until this holder may do I/O
+    /// or the timeout runs out, reporting which. VXI-11's waitlock flag
+    /// (RULES B.6.17/B.6.18 and kin) is a wait with a client-chosen bound,
+    /// where HiSLIP's locked-out traffic waits indefinitely.
+    pub async fn wait_for_access_timeout(
+        &self,
+        resource: &str,
+        id: HolderId,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Subscribe before testing, so a release in between is not missed.
+            let released = self.released.notified();
+            if self.has_access(resource, id) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let _ = tokio::time::timeout(deadline - now, released).await;
         }
     }
 }

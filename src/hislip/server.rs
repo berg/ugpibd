@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::errors::{FatalErrorCode, NonFatalErrorCode};
-use super::lock::LockRegistry;
+use super::lock::{self, LockRegistry};
 use super::messages::{
     send_fatal, send_nonfatal, AsyncInitializeResponseControl, AsyncInitializeResponseParameter,
     FeatureBitmap, InitializeParameter, InitializeResponseControl, InitializeResponseParameter,
@@ -322,7 +322,8 @@ impl SessionEntry {
 
     /// May this session do I/O right now, or is somebody else holding a lock?
     fn has_access(&self) -> bool {
-        self.locks.has_access(&self.resource, self.id)
+        self.locks
+            .has_access(&self.resource, lock::hislip_id(self.id))
     }
 
     /// Park until this session may touch the bus. See
@@ -335,7 +336,9 @@ impl SessionEntry {
                 resource = %self.resource,
                 "another client holds the lock; leaving this message unprocessed"
             );
-            self.locks.wait_for_access(&self.resource, self.id).await;
+            self.locks
+                .wait_for_access(&self.resource, lock::hislip_id(self.id))
+                .await;
         }
     }
 
@@ -670,7 +673,7 @@ impl Drop for RegistrationGuard {
         // Locks go first, and synchronously: a client that crashes holding one
         // would otherwise lock the instrument out until the daemon restarts.
         // The lock registry uses a std mutex precisely so this works from Drop.
-        self.locks.release_all(self.id);
+        self.locks.release_all(lock::hislip_id(self.id));
 
         let id = self.id;
         let registry = self.registry.clone();
@@ -1167,7 +1170,12 @@ where
                 let timeout = Duration::from_millis(msg.message_parameter as u64);
                 let answer = entry
                     .locks
-                    .request(&entry.resource, entry.id, &lock_string, timeout)
+                    .request(
+                        &entry.resource,
+                        lock::hislip_id(entry.id),
+                        &lock_string,
+                        timeout,
+                    )
                     .await;
                 debug!(
                     session = entry.id,
@@ -1209,7 +1217,9 @@ where
                 let answer = match lock_answer {
                     Some(answer) => answer,
                     None => {
-                        let answer = entry.locks.release(&entry.resource, entry.id);
+                        let answer = entry
+                            .locks
+                            .release(&entry.resource, lock::hislip_id(entry.id));
                         debug!(session = entry.id, ?answer, "lock release");
                         answer
                     }
