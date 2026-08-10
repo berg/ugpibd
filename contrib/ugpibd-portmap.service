@@ -1,0 +1,31 @@
+[Unit]
+Description=ugpibd portmapper (RFC 1833, advertises the VXI-11 core channel)
+Documentation=man:ugpibd-portmap(1)
+Documentation=https://github.com/berg/ugpibd
+Requires=ugpibd-portmap.socket
+After=ugpibd-portmap.socket
+
+[Service]
+Type=exec
+EnvironmentFile=-/etc/default/ugpibd
+ExecStart=/usr/bin/ugpibd-portmap $UGPIBD_PORTMAP_OPTS
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+
+# Answers RPC lookups and touches nothing else: unlike ugpibd.service this
+# can take the full sandbox, devices included.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+CapabilityBoundingSet=

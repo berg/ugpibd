@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+configure) ;;
+abort-upgrade | abort-remove | abort-deconfigure) ;;
+*)
+    echo "postinst called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+# Register the units without enabling them: listening on port 111 is opt-in
+# via `systemctl enable --now ugpibd-portmap.socket`.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
+    if command -v deb-systemd-helper >/dev/null 2>&1; then
+        for unit in ugpibd-portmap.socket ugpibd-portmap.service; do
+            deb-systemd-helper unmask "$unit" >/dev/null || true
+            deb-systemd-helper update-state "$unit" >/dev/null || true
+        done
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        if systemctl --quiet is-active ugpibd-portmap.service 2>/dev/null; then
+            deb-systemd-invoke try-restart ugpibd-portmap.service >/dev/null || true
+        fi
+    fi
+fi
+
+exit 0

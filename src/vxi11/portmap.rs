@@ -85,6 +85,130 @@ pub fn decode_dump_reply(data: &[u8]) -> Result<Vec<Mapping>, XdrError> {
     Ok(mappings)
 }
 
+/// One bound portmap responder: the same fixed mapping table served over
+/// TCP (record-marked) and UDP (bare datagrams — ONC-RPC over UDP has no
+/// record marking).
+///
+/// This exists for VISA stacks that hardwire portmap discovery (NI,
+/// Keysight) and for `rpcinfo -p`. pyvisa-py needs none of it: the
+/// resource string carries the port. The table is fixed at startup —
+/// PMAPPROC_SET/UNSET answer FALSE, the same refusal rpcbind gives
+/// non-local callers, because a daemon that lets network peers rebind its
+/// programs is an open relay. PMAPPROC_CALLIT is answered with silence:
+/// RFC 1833 §3.2 sends no reply when the target program is unreachable,
+/// and CALLIT forwards over UDP only, where nothing here is registered.
+pub async fn run(
+    tcp: tokio::net::TcpListener,
+    udp: tokio::net::UdpSocket,
+    mappings: Vec<Mapping>,
+) -> std::io::Result<()> {
+    use super::rpc;
+    use std::sync::Arc;
+    use tracing::{debug, info, warn};
+
+    let mappings = Arc::new(mappings);
+    info!(
+        "portmap listening on {} (tcp) / {} (udp), {} registrations",
+        tcp.local_addr()?,
+        udp.local_addr()?,
+        mappings.len()
+    );
+
+    /// Dispatch one call. `None` means "send nothing" (CALLIT failure).
+    fn dispatch(record: &[u8], mappings: &[Mapping]) -> Option<Vec<u8>> {
+        let (header, args) = match rpc::decode_call(record) {
+            Ok(ok) => ok,
+            Err(rpc::CallError::RpcVersion { xid, .. }) => {
+                return Some(rpc::reply_rpc_mismatch(xid));
+            }
+            Err(e) => {
+                debug!("portmap: {e}");
+                return None;
+            }
+        };
+        let xid = header.xid;
+        if header.prog != PMAP_PROG {
+            return Some(rpc::reply_prog_unavail(xid));
+        }
+        if header.vers != PMAP_VERS {
+            return Some(rpc::reply_prog_mismatch(xid, PMAP_VERS, PMAP_VERS));
+        }
+        match header.proc {
+            PMAPPROC_NULL => Some(rpc::reply_success(xid, &[])),
+            PMAPPROC_GETPORT => {
+                let mut c = Cursor::new(args);
+                let Ok(wanted) = Mapping::decode(&mut c) else {
+                    return Some(rpc::reply_garbage_args(xid));
+                };
+                // RFC 1833 §3.2: port 0 means "not registered". The caller's
+                // port field is ignored on lookup.
+                let port = mappings
+                    .iter()
+                    .find(|m| {
+                        m.prog == wanted.prog && m.vers == wanted.vers && m.prot == wanted.prot
+                    })
+                    .map_or(0, |m| m.port);
+                Some(rpc::reply_success(xid, &encode_getport_reply(port)))
+            }
+            PMAPPROC_DUMP => Some(rpc::reply_success(xid, &encode_dump_reply(mappings))),
+            PMAPPROC_SET | PMAPPROC_UNSET => {
+                // bool FALSE: the table is fixed (see above).
+                let mut out = Vec::with_capacity(4);
+                xdr::put_bool(&mut out, false);
+                Some(rpc::reply_success(xid, &out))
+            }
+            PMAPPROC_CALLIT => None,
+            _ => Some(rpc::reply_proc_unavail(xid)),
+        }
+    }
+
+    let udp_mappings = mappings.clone();
+    let udp_task = async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (len, peer) = match udp.recv_from(&mut buf).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    warn!("portmap udp receive failed: {e}");
+                    continue;
+                }
+            };
+            if let Some(reply) = dispatch(&buf[..len], &udp_mappings) {
+                let _ = udp.send_to(&reply, peer).await;
+            }
+        }
+    };
+
+    let tcp_task = async move {
+        loop {
+            let Ok((stream, _peer)) = tcp.accept().await else {
+                continue;
+            };
+            let mappings = mappings.clone();
+            tokio::spawn(async move {
+                let mut stream = tokio::io::BufStream::new(stream);
+                loop {
+                    let record = match rpc::read_record(&mut stream, 4096).await {
+                        Ok(Some(r)) => r,
+                        _ => return,
+                    };
+                    match dispatch(&record, &mappings) {
+                        Some(reply) => {
+                            if rpc::write_record(&mut stream, &reply).await.is_err() {
+                                return;
+                            }
+                        }
+                        None => return,
+                    }
+                }
+            });
+        }
+    };
+
+    tokio::join!(udp_task, tcp_task);
+    unreachable!("both portmap loops run forever");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

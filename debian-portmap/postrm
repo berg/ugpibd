@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+if [ "$1" = "purge" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+    for unit in ugpibd-portmap.socket ugpibd-portmap.service; do
+        deb-systemd-helper purge "$unit" >/dev/null || true
+        deb-systemd-helper unmask "$unit" >/dev/null || true
+    done
+fi
+
+exit 0

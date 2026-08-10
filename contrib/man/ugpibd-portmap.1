@@ -1,0 +1,51 @@
+.TH UGPIBD-PORTMAP 1 "August 2026" "ugpibd" "User Commands"
+.SH NAME
+ugpibd\-portmap \- portmapper advertising ugpibd's VXI-11 core channel
+.SH SYNOPSIS
+.B ugpibd\-portmap
+[\fB\-\-bind\fR \fIADDR\fR]
+[\fB\-\-port\fR \fIPORT\fR]
+[\fB\-\-core\-port\fR \fIPORT\fR]
+.SH DESCRIPTION
+A fixed-table ONC-RPC portmapper (RFC 1833) answering
+.BR GETPORT ,
+.BR DUMP ,
+and
+.B NULL
+for ugpibd's VXI-11 core channel, over both TCP and UDP.
+It exists for VISA stacks that discover VXI-11 instruments via the
+portmapper (NI, Keysight) and for
+.BR rpcinfo (8).
+pyvisa-py does not need it: its resource strings carry the port
+(\fBTCPIP::host,9010::gpib0,23::INSTR\fR).
+.PP
+.B SET
+and
+.B UNSET
+are refused (the table is fixed at startup), and
+.B CALLIT
+is answered with silence per RFC 1833 \(sc3.2, as no UDP programs are
+registered.
+.PP
+Under systemd, enable
+.B ugpibd\-portmap.socket
+instead of running this directly: systemd binds port 111 and passes the
+sockets in, so the service itself runs unprivileged and sandboxed.
+.SH OPTIONS
+.TP
+.BR \-\-bind " " \fIADDR\fR
+Bind address (default 127.0.0.1). Must match where clients reach the
+daemon: GETPORT answers with a port only, the host being the one asked.
+.TP
+.BR \-\-port " " \fIPORT\fR
+Portmap port (default 111, which needs privileges to bind directly).
+.TP
+.BR \-\-core\-port " " \fIPORT\fR
+The port advertised for the VXI-11 core channel; must match the daemon's
+\fB\-\-vxi11\-port\fR (default 9010).
+.TP
+.BR \-v ", " \-\-verbose
+Increase log verbosity (repeatable).
+.SH SEE ALSO
+.BR ugpibd (1),
+.BR rpcinfo (8)
