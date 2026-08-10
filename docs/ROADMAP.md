@@ -112,16 +112,11 @@ The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
 
-## 8. VXI-11.2 interface-link gaps (two remain, both scheduled)
+## 8. VXI-11.2 interface-link items awaiting the phase-9 bench sweep
 
-**Now:** the interface link is complete — docmd set, unaddressed data path,
-bus-wide clear/trigger, Bus Address set — except for two items with named
-dispositions in docs/VXI11-PLAN.md ("Roadmap discipline"):
-
-- **ATN Control on the 82357** answers 8: no hardware-verified raw-ATN
-  sequence for the TMS9914 yet. Closes during the phase-9 hardware sweep
-  with that adapter attached, using the vendored kernel driver's aux codes.
-- **Pass Control** answers 8 by architectural decision — the daemon is the
-  sole controller, and releasing CIC would strand every front-end. Pending
-  Bryan's sign-off in phase 9, this moves to docs/VXI11.md as a documented
-  deviation and off this list.
+**Now:** ATN Control on the 82357 is implemented (a transcription of the
+kernel driver's take-control path, AUX_TCA/AUX_GTS) but not yet verified on
+that adapter — it needs the 82357 attached, which the phase-9 hardware
+sweep includes. Until then treat it as unproven. Pass Control remains a
+refusal by architectural decision (docs/VXI11.md, "Deviations"); with
+Bryan's sign-off during phase 9 review, this entry closes entirely.
