@@ -412,7 +412,31 @@ fn handle_meta(rt: &Runtime, client: &mut dyn Transport, rest: &str) -> Result<(
             Ok(())
         }
         "help" => {
-            eprintln!("meta-commands: ++read ++clr ++trg ++ren <0|1> ++status ++help");
+            eprintln!(
+                "\
+Lines are sent to the instrument. A line the quote-aware hint calls a query
+(a `?` outside string literals) also reads and prints the reply; anything
+else is a plain write. `++` lines are meta-commands handled locally:
+
+  ++read             explicit addressed read: ask the instrument to talk and
+                     print what it says. The flow for instruments that only
+                     produce output once addressed (screen dumps, plots).
+                     vxi11/prologix only -- HiSLIP has no read request.
+  ++clr    (++cls)   Selected Device Clear: reset the instrument's message
+                     exchange (input/output buffers), not its settings.
+  ++trg              GPIB group trigger (GET) to this instrument.
+  ++ren <0|1|on|off> drive Remote Enable: 1 puts the instrument in remote
+                     (front panel locked out of settings), 0 returns local.
+                     On prologix, only ++ren 0 (++loc) -- REN is asserted by
+                     the front-end itself.
+  ++status (++stb, ++spoll)
+                     serial poll: read and print the status byte (decimal).
+                     0x40/64 = requesting service, plus instrument-specific
+                     bits (16 = MAV \"message available\" on 488.2 boxes).
+  ++help             this text.
+
+Ctrl-D ends the session. History lives in ~/.scpi_history."
+            );
             Ok(())
         }
         other => anyhow::bail!("unknown meta-command ++{other} (try ++help)"),
