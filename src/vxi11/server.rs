@@ -13,11 +13,12 @@
 //
 // Locking rides the daemon-wide registry (exclusive, per-link, non-nesting
 // — RULE B.6.72 — and coherent with HiSLIP viLocks on the same
-// instrument), and the abort channel is real: DEVICE_ASYNC on its own
-// port, terminating in-flight operations at their nearest safe point. Not
-// yet here, refused honestly rather than stubbed: the interrupt channel
-// and device_docmd (both error 8), each a later phase of
-// docs/VXI11-PLAN.md.
+// instrument); the abort channel is real (DEVICE_ASYNC on its own port,
+// terminating in-flight operations at their nearest safe point); and the
+// interrupt channel calls the client back over TCP with the registered
+// handle when an enabled link's instrument pulls SRQ. Not yet here,
+// refused honestly rather than stubbed: device_docmd (error 8), the
+// VXI-11.2 interface-device phase of docs/VXI11-PLAN.md.
 
 use std::collections::HashMap;
 use std::io;
@@ -136,6 +137,11 @@ struct Link {
     /// notice `aborted` between poll slices instead — a slice, once started,
     /// is never torn down mid-flight.
     abort_notify: Notify,
+    /// `Some(handle)` while this link wants device_intr_srq calls; the bytes
+    /// go back exactly as registered (RULE B.6.111). Per-link state,
+    /// deliberately independent of the interrupt channel's existence
+    /// (OBSERVATION B.6.21).
+    srq_handle: Mutex<Option<Vec<u8>>>,
 }
 
 impl Link {
@@ -294,6 +300,46 @@ fn abort_dispatch(shared: &Shared, header: rpc::CallHeader, args: &[u8]) -> Vec<
     rpc::reply_success(xid, &encode_device_error(error.as_u32()))
 }
 
+/// Per-core-connection state beyond the socket itself.
+struct ConnState {
+    /// Links created on this connection, destroyed with it: the channel
+    /// closing is how a crashed client's links are recovered (§B.2).
+    /// Shared with the SRQ forwarder, which needs to know which links are
+    /// this connection's when fanning a service request out.
+    owned: Arc<Mutex<Vec<i32>>>,
+    /// The interrupt channel, at most one per connection (RULE B.6.89).
+    intr: Option<IntrChannel>,
+    /// The address the client called from; the interrupt channel connects
+    /// back to the address the client *names*, but a client naming a
+    /// different host than it called from is worth a log line before this
+    /// daemon opens a TCP connection to it.
+    peer: std::net::IpAddr,
+}
+
+/// A live interrupt channel: a sender task owning the TCP connection to the
+/// client's DEVICE_INTR server, fed handles through `tx`, plus the SRQ
+/// forwarder watching the bus. Both die with the channel — but the
+/// forwarder is asked, never aborted: `JoinHandle::abort` cancels at any
+/// await point, and the forwarder's serial polls hold the bus. A poll
+/// killed between Serial Poll Enable and its closing SPD/UNT strands the
+/// whole bus in serial-poll state, where every later write times out —
+/// observed on hardware, from exactly this drop. The shutdown permit is
+/// consumed only at the loop top, between bus operations.
+struct IntrChannel {
+    shutdown: Arc<Notify>,
+    sender: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for IntrChannel {
+    fn drop(&mut self) {
+        // The forwarder exits at its next loop top; its tx drops with it,
+        // which ends the sender's channel. The abort is belt-and-braces for
+        // a sender blocked in socket I/O, which holds no bus state.
+        self.shutdown.notify_one();
+        self.sender.abort();
+    }
+}
+
 async fn serve_connection<F>(
     stream: tokio::net::TcpStream,
     shared: Arc<Shared>,
@@ -302,10 +348,13 @@ async fn serve_connection<F>(
 where
     F: Fn(u8) -> Arc<Instrument> + Send + Sync + 'static,
 {
+    let peer = stream.peer_addr()?.ip();
     let mut stream = BufStream::new(stream);
-    // Links created on this connection, destroyed with it: the channel
-    // closing is how a crashed client's links are recovered (§B.2).
-    let mut owned: Vec<i32> = Vec::new();
+    let mut conn = ConnState {
+        owned: Arc::new(Mutex::new(Vec::new())),
+        intr: None,
+        peer,
+    };
     let connection_result = loop {
         // The record cap is deliberately above maxRecvSize plus envelope:
         // RULE B.6.16 answers an over-limit device_write with error 5, which
@@ -319,7 +368,7 @@ where
         };
         let reply = match rpc::decode_call(&record) {
             Ok((header, args)) => {
-                dispatch(&shared, instrument_for.as_ref(), &mut owned, header, args)
+                dispatch(&shared, instrument_for.as_ref(), &mut conn, header, args)
                     .await
                     .unwrap_or_else(rpc::reply_garbage_args)
             }
@@ -338,8 +387,10 @@ where
         rpc::write_record(&mut stream, &reply).await?;
     };
     // RULE B.6.77: locks are tied to the core connection — a broken
-    // connection releases everything its links held, then the links go too.
+    // connection releases everything its links held, then the links go too,
+    // and the interrupt channel with them (dropped with `conn`).
     let removed: Vec<Arc<Link>> = {
+        let owned = conn.owned.lock().unwrap();
         let mut links = shared.links.lock().unwrap();
         owned
             .iter()
@@ -356,9 +407,9 @@ where
 /// GARBAGE_ARGS per RFC 5531, since the procedure was reachable but its
 /// parameters were not.
 async fn dispatch<F>(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     instrument_for: &F,
-    owned: &mut Vec<i32>,
+    conn: &mut ConnState,
     header: rpc::CallHeader,
     args: &[u8],
 ) -> Result<Vec<u8>, u32>
@@ -380,7 +431,7 @@ where
     let results = match header.proc {
         CREATE_LINK => {
             let parms = CreateLinkParms::decode(args).map_err(garbage)?;
-            create_link(shared, instrument_for, owned, parms)
+            create_link(shared, instrument_for, conn, parms)
                 .await
                 .encode()
         }
@@ -421,7 +472,7 @@ where
             // RULE B.6.9.2: its lock goes with it. RULE B.6.12: abort does
             // not touch this (no OpWindow).
             let error = if let Some(link) = removed {
-                owned.retain(|&l| l != lid);
+                conn.owned.lock().unwrap().retain(|&l| l != lid);
                 shared.config.locks.release_all(link.holder());
                 ErrorCode::NoError
             } else {
@@ -451,10 +502,39 @@ where
             };
             encode_device_error(error.as_u32())
         }
-        DEVICE_ENABLE_SRQ | CREATE_INTR_CHAN | DESTROY_INTR_CHAN => {
-            // Honest refusals for the interrupt-channel phase. The argument
-            // is not even decoded: the answer does not depend on it.
-            encode_device_error(ErrorCode::OperationNotSupported.as_u32())
+        DEVICE_ENABLE_SRQ => {
+            // RULE B.6.95: no lock gate. RULE B.6.106: not abortable.
+            let parms = DeviceEnableSrqParms::decode(args).map_err(garbage)?;
+            let error = match link_for(shared, parms.lid) {
+                Some(link) => {
+                    // OBSERVATION B.6.21: this state belongs to the link and
+                    // ignores whether an interrupt channel currently exists.
+                    *link.srq_handle.lock().unwrap() = parms.enable.then_some(parms.handle);
+                    ErrorCode::NoError
+                }
+                // RULE B.6.94.
+                None => ErrorCode::InvalidLinkIdentifier,
+            };
+            encode_device_error(error.as_u32())
+        }
+        CREATE_INTR_CHAN => {
+            let parms = DeviceRemoteFunc::decode(args).map_err(garbage)?;
+            encode_device_error(
+                create_intr_chan(shared, instrument_for, conn, parms)
+                    .await
+                    .as_u32(),
+            )
+        }
+        DESTROY_INTR_CHAN => {
+            // RULE B.6.91/B.6.92: close it, or report there is none (6).
+            let error = match conn.intr.take() {
+                Some(channel) => {
+                    drop(channel);
+                    ErrorCode::NoError
+                }
+                None => ErrorCode::ChannelNotEstablished,
+            };
+            encode_device_error(error.as_u32())
         }
         DEVICE_DOCMD => {
             // Refused per-phase like the above, but with docmd's own
@@ -473,7 +553,7 @@ where
 async fn create_link<F>(
     shared: &Shared,
     instrument_for: &F,
-    owned: &mut Vec<i32>,
+    conn: &ConnState,
     parms: CreateLinkParms,
 ) -> CreateLinkResp
 where
@@ -508,9 +588,10 @@ where
                 in_flight: AtomicBool::new(false),
                 aborted: AtomicBool::new(false),
                 abort_notify: Notify::new(),
+                srq_handle: Mutex::new(None),
             }),
         );
-        owned.push(lid);
+        conn.owned.lock().unwrap().push(lid);
         lid
     };
     // RULES B.6.3.1 and B.6.7: with lockDevice set, the lock is acquired —
@@ -534,7 +615,7 @@ where
         if !granted.is_success() {
             let mut links = shared.links.lock().unwrap();
             links.links.remove(&lid);
-            owned.retain(|&l| l != lid);
+            conn.owned.lock().unwrap().retain(|&l| l != lid);
             return refuse(ErrorCode::DeviceLockedByAnotherLink);
         }
     }
@@ -589,6 +670,177 @@ async fn device_lock(shared: &Shared, parms: DeviceLockParms) -> ErrorCode {
         // RULE B.6.75.
         ErrorCode::DeviceLockedByAnotherLink
     }
+}
+
+/// RQS in a serial-poll status byte: the device is the one requesting
+/// service on the wired-OR SRQ line.
+const STB_RQS: u8 = 0x40;
+
+async fn create_intr_chan<F>(
+    shared: &Arc<Shared>,
+    instrument_for: &F,
+    conn: &mut ConnState,
+    parms: DeviceRemoteFunc,
+) -> ErrorCode
+where
+    F: Fn(u8) -> Arc<Instrument>,
+{
+    // RULES B.6.85-B.6.88, all error 8: unknown family, UDP (permitted to
+    // be unsupported, and it is — SRQ delivery that can vanish or reorder
+    // is not worth its latency win here), wrong program, wrong version.
+    if parms.prog_family != DEVICE_TCP {
+        return ErrorCode::OperationNotSupported;
+    }
+    if parms.prog_num != DEVICE_INTR_PROG || parms.prog_vers != DEVICE_INTR_VERS {
+        return ErrorCode::OperationNotSupported;
+    }
+    // RULE B.6.89: one channel per connection.
+    if conn.intr.is_some() {
+        return ErrorCode::ChannelAlreadyEstablished;
+    }
+    let host = std::net::Ipv4Addr::from(parms.host_addr);
+    if std::net::IpAddr::from(host) != conn.peer {
+        // Legal (the spec only observes that clients "normally" name
+        // themselves) but unusual enough to leave a trace: this daemon is
+        // about to open a TCP connection to a third party on request.
+        info!(
+            "vxi11 interrupt channel requested to {host}:{} by client at {}",
+            parms.host_port, conn.peer
+        );
+    }
+    let stream = match tokio::net::TcpStream::connect((host, parms.host_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            // RULE B.6.83.
+            debug!(
+                "vxi11 interrupt channel to {host}:{} refused: {e}",
+                parms.host_port
+            );
+            return ErrorCode::ChannelNotEstablished;
+        }
+    };
+    let _ = stream.set_nodelay(true);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let sender = tokio::spawn(async move {
+        let mut stream = BufStream::new(stream);
+        let mut xid: u32 = 0;
+        while let Some(handle) = rx.recv().await {
+            xid = xid.wrapping_add(1);
+            let call = rpc::encode_call(
+                xid,
+                DEVICE_INTR_PROG,
+                DEVICE_INTR_VERS,
+                DEVICE_INTR_SRQ,
+                &DeviceSrqParms { handle }.encode(),
+            );
+            if rpc::write_record(&mut stream, &call).await.is_err() {
+                return;
+            }
+            // device_intr_srq is void, but ONC-RPC still answers it and the
+            // reply must not rot in the socket. A peer that treats it as
+            // one-way and answers nothing just costs this short wait.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(1000),
+                rpc::read_record(&mut stream, 4096),
+            )
+            .await;
+        }
+    });
+
+    // The forwarder: watch the SRQ line, and when it rises, serial-poll the
+    // instruments this connection's enabled links point at. RQS set means
+    // that instrument asked for service: every enabled link on it gets a
+    // device_intr_srq with its registered handle. The poll consumes RQS at
+    // the instrument, so one bus event becomes one notification — the same
+    // single-consumer caveat the HiSLIP front-end documents applies across
+    // front-ends too: whichever forwarder polls first takes the byte.
+    let subscriber = instrument_for(shared.config.default_pad);
+    let owned = conn.owned.clone();
+    let shutdown = Arc::new(Notify::new());
+    {
+        let shared = shared.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            debug!("vxi11 srq forwarder starting");
+            // The broadcast carries edges; the line is a level. An SRQ
+            // already asserted when this channel comes up — raised before
+            // the client enabled interrupts, or orphaned at daemon startup —
+            // would otherwise wait forever for an edge nobody will send.
+            let starts_asserted = subscriber.srq_asserted().await.unwrap_or(false);
+            let Some(mut srq) = subscriber.subscribe_srq().await else {
+                // The adapter cannot report SRQ; without a signal to watch
+                // there will never be anything to forward. The channel
+                // stays up and stays silent, which RULE B.6.90 permits.
+                return;
+            };
+            let mut initial_pass = starts_asserted;
+            loop {
+                use tokio::sync::broadcast::error::RecvError;
+                if initial_pass {
+                    initial_pass = false;
+                } else {
+                    tokio::select! {
+                        _ = shutdown.notified() => {
+                            debug!("vxi11 srq forwarder stopping");
+                            return;
+                        }
+                        received = srq.recv() => match received {
+                            // Lagged counts: SRQ is a level, a missed
+                            // notification and a delivered one mean the same.
+                            Ok(()) | Err(RecvError::Lagged(_)) => {}
+                            Err(RecvError::Closed) => return,
+                        }
+                    }
+                }
+                debug!("vxi11 srq forwarder: line asserted");
+                let targets: Vec<Arc<Link>> = {
+                    let owned = owned.lock().unwrap();
+                    let table = shared.links.lock().unwrap();
+                    owned
+                        .iter()
+                        .filter_map(|lid| table.links.get(lid).cloned())
+                        .filter(|l| l.srq_handle.lock().unwrap().is_some())
+                        .collect()
+                };
+                // One poll per instrument, not per link.
+                let mut polled: HashMap<String, bool> = HashMap::new();
+                for link in targets {
+                    let resource = link.resource();
+                    let requesting = match polled.get(&resource) {
+                        Some(&r) => r,
+                        None => {
+                            let r = match link.instrument.serial_poll().await {
+                                Ok(stb) => stb & STB_RQS != 0,
+                                Err(e) => {
+                                    debug!("vxi11 srq poll failed: {e:#}");
+                                    false
+                                }
+                            };
+                            polled.insert(resource.clone(), r);
+                            r
+                        }
+                    };
+                    debug!(
+                        "vxi11 srq forwarder: link {} on {resource} requesting={requesting}",
+                        link.lid
+                    );
+                    if requesting {
+                        let handle = link.srq_handle.lock().unwrap().clone();
+                        if let Some(handle) = handle {
+                            let _ = tx.send(handle);
+                        }
+                    }
+                }
+            }
+        })
+    };
+    conn.intr = Some(IntrChannel { shutdown, sender });
+    debug!(
+        "vxi11 interrupt channel established to {host}:{}",
+        parms.host_port
+    );
+    ErrorCode::NoError
 }
 
 /// The lock gate every device I/O operation passes (RULES B.6.17/B.6.18 for

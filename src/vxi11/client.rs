@@ -224,6 +224,106 @@ impl Vxi11Client {
     }
 }
 
+impl Vxi11Client {
+    pub async fn device_enable_srq(
+        &mut self,
+        lid: i32,
+        enable: bool,
+        handle: &[u8],
+    ) -> Result<u32> {
+        let mut args = Vec::new();
+        DeviceEnableSrqParms {
+            lid,
+            enable,
+            handle: handle.to_vec(),
+        }
+        .encode(&mut args);
+        let results = self.core(DEVICE_ENABLE_SRQ, &args).await?;
+        Ok(decode_device_error(&results)?)
+    }
+
+    pub async fn create_intr_chan(
+        &mut self,
+        host_addr: std::net::Ipv4Addr,
+        host_port: u16,
+        prog_num: u32,
+        prog_vers: u32,
+        prog_family: u32,
+    ) -> Result<u32> {
+        let mut args = Vec::new();
+        DeviceRemoteFunc {
+            host_addr: u32::from(host_addr),
+            host_port,
+            prog_num,
+            prog_vers,
+            prog_family,
+        }
+        .encode(&mut args);
+        let results = self.core(CREATE_INTR_CHAN, &args).await?;
+        Ok(decode_device_error(&results)?)
+    }
+
+    pub async fn destroy_intr_chan(&mut self) -> Result<u32> {
+        let results = self.core(DESTROY_INTR_CHAN, &[]).await?;
+        Ok(decode_device_error(&results)?)
+    }
+}
+
+/// A DEVICE_INTR server: what a VXI-11 *client* runs so the instrument side
+/// can call back with service requests. Serves the CLI's SRQ wait and the
+/// test suite; accepts one connection at a time, answers each
+/// device_intr_srq with the void reply the RPC layer owes, and hands the
+/// received handles to the caller.
+pub struct IntrServer {
+    listener: tokio::net::TcpListener,
+}
+
+impl IntrServer {
+    pub async fn bind() -> Result<Self> {
+        Ok(Self {
+            listener: tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+        })
+    }
+
+    pub fn port(&self) -> Result<u16> {
+        Ok(self.listener.local_addr()?.port())
+    }
+
+    /// Serve connections forever, pushing each received handle into `tx`.
+    pub async fn run(self, tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
+        loop {
+            let Ok((stream, _)) = self.listener.accept().await else {
+                return;
+            };
+            let mut stream = BufStream::new(stream);
+            loop {
+                let record = match rpc::read_record(&mut stream, 4096).await {
+                    Ok(Some(r)) => r,
+                    _ => break,
+                };
+                let Ok((header, args)) = rpc::decode_call(&record) else {
+                    break;
+                };
+                if header.prog != DEVICE_INTR_PROG || header.proc != DEVICE_INTR_SRQ {
+                    let _ =
+                        rpc::write_record(&mut stream, &rpc::reply_prog_unavail(header.xid)).await;
+                    continue;
+                }
+                if let Ok(parms) = DeviceSrqParms::decode(args) {
+                    let _ = tx.send(parms.handle);
+                }
+                // void reply: SUCCESS with no results.
+                if rpc::write_record(&mut stream, &rpc::reply_success(header.xid, &[]))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// One-shot device_abort over its own connection to the abort channel —
 /// which is the point: it must get through while the core channel is busy.
 pub async fn device_abort(host: &str, abort_port: u16, lid: i32) -> Result<u32> {
