@@ -112,50 +112,16 @@ The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
 
-## 7. VXI-11 device_write timeout replies can lose the race to the client
+## 8. VXI-11.2 interface-link gaps (two remain, both scheduled)
 
-**Now:** `device_read` enforces its io_timeout server-side, polling the bus
-in short slices, so its reply always beats the client's own RPC deadline
-(pyvisa-py grants io_timeout + 1 s). `device_write` hands the timeout to the
-adapter whole, and the NI code table rounds up — a 1500 ms write timeout
-waits 3 s on the bus, by which point pyvisa-py has declared the connection
-dead (`VI_ERROR_IO` instead of `VI_ERROR_TMO`, and the session desyncs).
+**Now:** the interface link is complete — docmd set, unaddressed data path,
+bus-wide clear/trigger, Bus Address set — except for two items with named
+dispositions in docs/VXI11-PLAN.md ("Roadmap discipline"):
 
-**Why:** a write, unlike a read, cannot be sliced: bytes already handshaken
-cannot be re-sent, so a per-slice timeout would fail slow-but-legitimate
-listeners mid-transfer.
-
-**Watch out:** only bites when a write actually times out — a stalled or
-absent listener — with an io_timeout whose adapter round-up exceeds the
-client's grace (roughly: not a power-of-table value above 500 ms).
-
-**Finishing it:** either chunk writes at the vxi11 layer (EOI only on the
-final chunk, per-chunk deadline = remaining budget, accepting that a chunk
-boundary mid-stall reports early), or teach backends to bound the whole
-transaction in software while using the next-larger hardware code.
-
-## 8. VXI-11.2 interface-link gaps
-
-**Now:** the `gpib0` interface link supports the docmd set — send command,
-bus status, ATN control (NI only), REN control, IFC — plus bus-wide clear
-(DCL) and trigger-all (GET). Four things are refused with error 8 rather
-than implemented: unaddressed `device_write`/`device_read` on the interface
-link (RULES B.4.2/B.4.4 — no backend exposes an unaddressed data path),
-Pass Control (RULE B.5.9 — the daemon's architecture assumes it is the only
-controller; releasing CIC would strand every front-end), Bus Address *set*
-(RULE B.5.10 — no backend supports re-addressing the controller at
-runtime), and ATN control on the 82357 (no hardware-verified raw-ATN
-sequence for that adapter yet).
-
-**Why:** each needs new backend capability that cannot be verified without
-the corresponding bench setup; a refusal the client sees beats an
-unverified register poke.
-
-**Watch out:** clients that drive legacy instruments through interface
-links with custom addressing sequences (RECOMMENDATION B.1.1's use case)
-will hit the write/read refusals first.
-
-**Finishing it:** an unaddressed send/receive pair on `GpibBackend`
-(both chips have the primitive; the NI listen-only path is most of the
-receive side), a verified TMS9914 take-control sequence for the 82357, and
-a runtime re-address that re-runs the address-register part of init.
+- **ATN Control on the 82357** answers 8: no hardware-verified raw-ATN
+  sequence for the TMS9914 yet. Closes during the phase-9 hardware sweep
+  with that adapter attached, using the vendored kernel driver's aux codes.
+- **Pass Control** answers 8 by architectural decision — the daemon is the
+  sole controller, and releasing CIC would strand every front-end. Pending
+  Bryan's sign-off in phase 9, this moves to docs/VXI11.md as a documented
+  deviation and off this list.

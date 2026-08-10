@@ -2,7 +2,7 @@
 // Copyright (C) 2026 ugpibd contributors
 
 use super::protocol::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub trait Transport {
     fn write_bulk(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
@@ -330,6 +330,11 @@ impl<T: Transport> GpibController<T> {
             let addr_cmd = [GPIB_UNL, listen_address(0), talk_address(pad)];
             self.send_command_bytes(&addr_cmd).await?;
         }
+        self.read_data_body(max_len).await
+    }
+
+    /// The data half of a read: no addressing, transfer already set up.
+    pub async fn read_data_body(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
         let gts = [RegisterPairlet {
             address: TMS_AUXCR,
             value: AUX_GTS,
@@ -798,6 +803,32 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.transport.subscribe_srq()
     }
+    async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
+        if self.listen_only {
+            anyhow::bail!("cannot write while in listen-only mode (++lon 0 to leave)");
+        }
+        self.send_data_bytes(data, send_eoi).await
+    }
+
+    async fn read_unaddressed(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.read_data_body(max_len).await
+    }
+
+    async fn set_controller_pad(&mut self, pad: u8) -> Result<()> {
+        if pad > 30 {
+            anyhow::bail!("controller address {pad} is out of range (0-30)");
+        }
+        // The address-register slice of init.
+        self.write_registers(&[RegisterPairlet {
+            address: TMS_ADR,
+            value: pad & ADDRESS_MASK,
+        }])
+        .await
+        .context("82357 set controller address")?;
+        self.my_pad = pad;
+        Ok(())
+    }
+
     async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {
         // The same proven command-byte path the addressed operations use;
         // the firmware raises ATN for command packets itself.

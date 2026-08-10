@@ -191,4 +191,21 @@ impl Held<'_> {
     pub fn controller_pad(&self) -> u8 {
         self.ctrl.controller_pad()
     }
+
+    /// Re-address the controller (VXI-11.2 Bus Address).
+    pub async fn set_controller_pad(&mut self, pad: u8) -> Result<()> {
+        self.ctrl.set_controller_pad(pad).await
+    }
+
+    /// Send data with no addressing sequence (IEEE 488.2 16.2.3): the
+    /// caller has established addressing itself, via raw bus commands.
+    pub async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
+        self.ctrl.send_data_unaddressed(data, send_eoi).await
+    }
+
+    /// Receive data with no addressing sequence (IEEE 488.2 16.2.6), capped
+    /// at [`MAX_READ`] like the addressed read.
+    pub async fn read_unaddressed(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.ctrl.read_unaddressed(max_len.min(MAX_READ)).await
+    }
 }

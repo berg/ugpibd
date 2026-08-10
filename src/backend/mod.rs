@@ -287,6 +287,20 @@ pub trait GpibBackend: Send + Sync {
     /// Bus Status selector 8.
     fn controller_pad(&self) -> u8;
 
+    /// Re-address the controller at runtime (VXI-11.2 Bus Address, docmd
+    /// 0x02000A): the address-register slice of init, nothing else.
+    async fn set_controller_pad(&mut self, pad: u8) -> Result<()>;
+
+    /// Send data bytes with no addressing sequence: IEEE 488.2 16.2.3 SEND
+    /// DATA BYTES, for interface links whose client has done its own
+    /// addressing via docmd Send Command. The chip must already be in a
+    /// state where it may talk; that is the caller's contract.
+    async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()>;
+
+    /// Receive data bytes with no addressing sequence: IEEE 488.2 16.2.6
+    /// RECEIVE RESPONSE MESSAGE, the read half of the same contract.
+    async fn read_unaddressed(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)>;
+
     /// Configure the end-of-string terminator used when reading.
     fn set_eos(&mut self, eos_char: u8, enabled: bool);
 

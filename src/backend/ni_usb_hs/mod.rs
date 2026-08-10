@@ -159,6 +159,49 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
 
     /// Take control (assert ATN), send command bytes, then optionally return to
     /// standby. Command bytes are capped at 16 per transfer by the hardware.
+    /// The data half of a write: no addressing, chip already talker.
+    async fn write_data_body(&self, data: &[u8], send_eoi: bool) -> Result<()> {
+        let tc = timeout_code(self.timeout_ms);
+        // Split anything past the adapter's 16-bit length field, asserting EOI
+        // only on the final chunk so the message still terminates once.
+        let mut remaining = data;
+        loop {
+            let n = remaining.len().min(MAX_TRANSFER_LEN);
+            let (chunk, rest) = remaining.split_at(n);
+            let last = rest.is_empty();
+            let resp = self
+                .transact(&encode_data_write(chunk, send_eoi && last, tc), OP_RESP_LEN)
+                .await?;
+            let written = parse_write_response(&resp, chunk.len()).context("ni data write")?;
+            if written != chunk.len() {
+                anyhow::bail!(
+                    "ni data write: instrument accepted only {written} of {} bytes",
+                    chunk.len()
+                );
+            }
+            if last {
+                return Ok(());
+            }
+            remaining = rest;
+        }
+    }
+
+    /// The data half of a read: no addressing, chip already listener (or in
+    /// a mode where the transfer is driven by another controller).
+    async fn read_data_body(&self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        let max_len = max_len.min(MAX_TRANSFER_LEN);
+        let req = encode_data_read(
+            max_len,
+            self.eos_mode(),
+            self.eos_char,
+            timeout_code(self.timeout_ms),
+        );
+        // Data comes back in 15/30-byte framed blocks plus two status blocks.
+        let resp_cap = (max_len / 30 + 1) * 0x20 + 0x20;
+        let resp = self.transact(&req, resp_cap).await?;
+        parse_data_read_response(&resp, max_len).context("ni data read")
+    }
+
     async fn send_command(&self, cmd: &[u8], standby_after: bool) -> Result<()> {
         self.send_command_bounded(cmd, standby_after, self.timeout_ms)
             .await
@@ -326,30 +369,7 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // Address controller as talker (pad 0), instrument as listener.
         let cmd = [GPIB_UNL, talk_address(self.my_pad), listen_address(pad)];
         self.send_command(&cmd, true).await?;
-
-        let tc = timeout_code(self.timeout_ms);
-        // Split anything past the adapter's 16-bit length field, asserting EOI
-        // only on the final chunk so the message still terminates once.
-        let mut remaining = data;
-        loop {
-            let n = remaining.len().min(MAX_TRANSFER_LEN);
-            let (chunk, rest) = remaining.split_at(n);
-            let last = rest.is_empty();
-            let resp = self
-                .transact(&encode_data_write(chunk, send_eoi && last, tc), OP_RESP_LEN)
-                .await?;
-            let written = parse_write_response(&resp, chunk.len()).context("ni data write")?;
-            if written != chunk.len() {
-                anyhow::bail!(
-                    "ni data write: instrument accepted only {written} of {} bytes",
-                    chunk.len()
-                );
-            }
-            if last {
-                return Ok(());
-            }
-            remaining = rest;
-        }
+        self.write_data_body(data, send_eoi).await
     }
 
     async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
@@ -360,15 +380,7 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if self.device_address.is_some() {
             // We are not the controller. Sending command bytes is not ours to
             // do; just take whatever the controller addresses us to receive.
-            let req = encode_data_read(
-                max_len,
-                self.eos_mode(),
-                self.eos_char,
-                timeout_code(self.timeout_ms),
-            );
-            let resp_cap = (max_len / 30 + 1) * 0x20 + 0x20;
-            let resp = self.transact(&req, resp_cap).await?;
-            return parse_data_read_response(&resp, max_len).context("ni device read");
+            return self.read_data_body(max_len).await;
         }
         // Address ourselves as sole listener in listen-only, naming no talker:
         // a talk-only source has no address (31 is the untalk code) and is
@@ -383,16 +395,7 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
             &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)]
         };
         self.send_command(cmd, true).await?;
-        let req = encode_data_read(
-            max_len,
-            self.eos_mode(),
-            self.eos_char,
-            timeout_code(self.timeout_ms),
-        );
-        // Data comes back in 15/30-byte framed blocks plus two status blocks.
-        let resp_cap = (max_len / 30 + 1) * 0x20 + 0x20;
-        let resp = self.transact(&req, resp_cap).await?;
-        parse_data_read_response(&resp, max_len).context("ni data read")
+        self.read_data_body(max_len).await
     }
 
     async fn device_clear(&mut self, pad: u8) -> Result<()> {
@@ -461,6 +464,30 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
             debug!("ni: re-arming the srq monitor failed: {e:#}");
         }
         Ok(data.first().copied().unwrap_or(0))
+    }
+
+    async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
+        if self.listen_only {
+            anyhow::bail!("cannot write while in listen-only mode (++lon 0 to leave)");
+        }
+        self.write_data_body(data, send_eoi).await
+    }
+
+    async fn read_unaddressed(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.read_data_body(max_len).await
+    }
+
+    async fn set_controller_pad(&mut self, pad: u8) -> Result<()> {
+        if pad > 30 {
+            anyhow::bail!("controller address {pad} is out of range (0-30)");
+        }
+        // The address-register slice of init; runtime ADR writes are already
+        // proven by the device-mode path.
+        self.register_write(&[NiRegister::new(SUBDEV_TNT4882, REG_ADR, pad & 0x1f)])
+            .await
+            .context("ni set controller address")?;
+        self.my_pad = pad;
+        Ok(())
     }
 
     async fn send_bus_command(&mut self, cmds: &[u8]) -> Result<()> {

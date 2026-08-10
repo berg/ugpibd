@@ -1066,18 +1066,25 @@ async fn device_docmd(shared: &Shared, parms: DeviceDocmdParms) -> DeviceDocmdRe
             }
             fail(ErrorCode::OperationNotSupported)
         }
-        // Bus Address (RULE B.5.10): GET is not defined — only SET, which
-        // would re-address the controller at runtime. No backend supports
-        // that re-initialization yet; out-of-range is 5 first, then an
-        // honest 8 (ROADMAP 8).
+        // Bus Address (RULE B.5.10): re-address the controller. Out of
+        // range is 5; the new address echoes back and Bus Status selector 8
+        // reports it from then on.
         0x02000A => {
             if !sizes_ok(&parms, 4..=4, 4) {
                 return fail(ErrorCode::ParameterError);
             }
-            if uint_in(&parms) > 30 {
+            let pad = uint_in(&parms);
+            if pad > 30 {
                 return fail(ErrorCode::ParameterError);
             }
-            fail(ErrorCode::OperationNotSupported)
+            let mut bus = link.instrument.hold().await;
+            match bus.set_controller_pad(pad as u8).await {
+                Ok(()) => echo(&parms),
+                Err(e) => {
+                    debug!("docmd bus-address set failed: {e:#}");
+                    fail(ErrorCode::IoError)
+                }
+            }
         }
         // IFC Control (RULE B.5.11): datasize is unconstrained ("X"),
         // data_in must be empty, data_out returns empty.
@@ -1155,14 +1162,6 @@ async fn device_write(shared: &Shared, parms: DeviceWriteParms) -> DeviceWriteRe
             size: 0,
         };
     };
-    if link.is_interface() {
-        // RULE B.4.2 wants an unaddressed SEND DATA BYTES here; no backend
-        // exposes one yet. Refused, not faked — ROADMAP entry 8.
-        return DeviceWriteResp {
-            error: ErrorCode::OperationNotSupported.as_u32(),
-            size: 0,
-        };
-    }
     if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
         return DeviceWriteResp {
             error: e.as_u32(),
@@ -1171,46 +1170,104 @@ async fn device_write(shared: &Shared, parms: DeviceWriteParms) -> DeviceWriteRe
     }
     let window = OpWindow::open(&link);
     let send_eoi = parms.flags & OP_FLAG_END != 0;
+    // Interface links write with no addressing sequence: IEEE 488.2 16.2.3
+    // SEND DATA BYTES (VXI-11.2 RULE B.4.2) — the client has done its own
+    // addressing with docmd Send Command.
+    let unaddressed = link.is_interface();
+
+    // The io_timeout is a budget over the whole transfer (RULE B.6.19),
+    // enforced here in chunks. A write chunk, unlike a read slice, must be
+    // given a real chance to complete — a slow listener legitimately stalls
+    // mid-handshake — so each chunk's adapter timeout is the *whole
+    // remaining budget*, floored to an exact adapter timeout step so the
+    // hardware never waits longer than the client allowed. (The NI table
+    // rounds up otherwise: 1500 ms becomes a 3 s wait, and the reply loses
+    // the race against the client's own io_timeout + grace deadline.)
+    // Aborts land between chunks; the transferred count always goes back
+    // (RULES B.6.20/B.6.21).
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(u64::from(effective_timeout(
+            &shared.config,
+            parms.io_timeout_ms,
+        )));
+    const WRITE_CHUNK: usize = 4096;
     let mut bus = link.instrument.hold().await;
-    bus.set_timeout(effective_timeout(&shared.config, parms.io_timeout_ms));
-    let written = bus.write(&parms.data, send_eoi).await;
-    bus.set_timeout(shared.config.default_io_timeout_ms);
-    drop(bus);
-    // RULE B.6.20/B.6.21: an abort during execution terminates the call with
-    // 23, still reporting the bytes transferred. A write is one indivisible
-    // bus transaction here, so "during" resolves at its end — the abort
-    // cannot tear the transfer down mid-handshake, only claim the verdict.
-    if window.take_abort() {
-        return DeviceWriteResp {
-            error: ErrorCode::Abort.as_u32(),
-            size: match &written {
-                Ok(()) => parms.data.len() as u32,
-                Err(_) => 0,
-            },
+    let mut written: usize = 0;
+    let mut outcome = ErrorCode::NoError;
+    let total = parms.data.len();
+    // A zero-length write still runs once: OBSERVATION B.6.6 allows it (no
+    // device action), and the END flag on an empty message is legal.
+    loop {
+        if window.take_abort() {
+            outcome = ErrorCode::Abort;
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            outcome = ErrorCode::IoTimeout;
+            break;
+        }
+        bus.set_timeout(adapter_floor_ms(remaining.as_millis() as u64));
+        let end = (written + WRITE_CHUNK).min(total);
+        let chunk = &parms.data[written..end];
+        let last = end == total;
+        let sent = if unaddressed {
+            bus.send_data_unaddressed(chunk, send_eoi && last).await
+        } else if written == 0 {
+            bus.write(chunk, send_eoi && last).await
+        } else {
+            // Addressing happened with the first chunk and is sticky; the
+            // rest of the message must not re-address (a listener would see
+            // UNL mid-message).
+            bus.send_data_unaddressed(chunk, send_eoi && last).await
         };
-    }
-    match written {
-        Ok(()) => DeviceWriteResp {
-            error: ErrorCode::NoError.as_u32(),
-            size: parms.data.len() as u32,
-        },
-        Err(e) => {
-            debug!("vxi11 device_write failed: {e:#}");
-            // The backend reports failure as one error chain; a timeout is
-            // distinguished by its message. Brittle in principle, but the
-            // alternative is reporting every timeout as a device I/O error,
-            // which RULE B.6.19 forbids.
-            let timeout = format!("{e:#}").to_ascii_lowercase().contains("timeout");
-            DeviceWriteResp {
-                error: if timeout {
-                    ErrorCode::IoTimeout.as_u32()
+        match sent {
+            Ok(()) => {
+                written = end;
+                if last {
+                    break;
+                }
+            }
+            Err(e) => {
+                debug!("vxi11 device_write failed at byte {written}: {e:#}");
+                // The backend reports failure as one error chain; a timeout
+                // is distinguished by its message. Brittle in principle, but
+                // the alternative is reporting every timeout as a device I/O
+                // error, which RULE B.6.19 forbids.
+                let timeout = format!("{e:#}").to_ascii_lowercase().contains("timeout");
+                outcome = if timeout {
+                    ErrorCode::IoTimeout
                 } else {
-                    ErrorCode::IoError.as_u32()
-                },
-                size: 0,
+                    ErrorCode::IoError
+                };
+                break;
             }
         }
     }
+    bus.set_timeout(shared.config.default_io_timeout_ms);
+    drop(bus);
+    if outcome == ErrorCode::NoError && window.take_abort() {
+        outcome = ErrorCode::Abort;
+    }
+    DeviceWriteResp {
+        error: outcome.as_u32(),
+        size: written as u32,
+    }
+}
+
+/// The largest exact adapter-timeout step at or below `remaining_ms`. The
+/// steps are the NI code table's 1-3-10 decade boundaries; the 82357 honors
+/// milliseconds directly, where flooring costs one re-loop at most.
+fn adapter_floor_ms(remaining_ms: u64) -> u32 {
+    const STEPS: [u32; 12] = [
+        300_000, 100_000, 30_000, 10_000, 3_000, 1_000, 300, 100, 30, 10, 3, 1,
+    ];
+    for step in STEPS {
+        if u64::from(step) <= remaining_ms {
+            return step;
+        }
+    }
+    1
 }
 
 async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp {
@@ -1222,11 +1279,6 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
     let Some(link) = link_for(shared, parms.lid) else {
         return fail(ErrorCode::InvalidLinkIdentifier);
     };
-    if link.is_interface() {
-        // RULE B.4.4's unaddressed RECEIVE has no backend primitive either;
-        // ROADMAP entry 8.
-        return fail(ErrorCode::OperationNotSupported);
-    }
     // RULE B.6.23.1.b: requestSize zero terminates immediately with REQCNT —
     // zero bytes were requested and zero delivered.
     if parms.request_size == 0 {
@@ -1291,7 +1343,14 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
         let slice = (remaining.as_millis() as u32).clamp(1, SLICE_MS);
         bus.set_timeout(slice);
         let attempt_started = tokio::time::Instant::now();
-        match bus.read(clamped - data.len()).await {
+        let attempt = if link.is_interface() {
+            // RULE B.4.4: RECEIVE RESPONSE MESSAGE, no addressing — the
+            // client established the talker itself.
+            bus.read_unaddressed(clamped - data.len()).await
+        } else {
+            bus.read(clamped - data.len()).await
+        };
+        match attempt {
             Ok((chunk, end)) => {
                 // An empty attempt that returned well inside its slice — an
                 // adapter fast-failing, or a test double answering from
