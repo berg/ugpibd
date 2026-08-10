@@ -837,9 +837,18 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
         self.send_command_bytes(cmds).await
     }
 
-    // set_atn deliberately keeps the refusing default: this adapter has no
-    // *verified* raw-ATN sequence yet (AUX_TCA is untested on hardware), and
-    // an unverified register poke is worse than an honest error 8.
+    async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        // Transcribed from the kernel driver's take-control path
+        // (agilent_82357a_take_control_internal): one AUXCR write, AUX_TCA
+        // to take control asynchronously, AUX_GTS for standby.
+        let value = if assert { AUX_TCA } else { AUX_GTS };
+        self.write_registers(&[RegisterPairlet {
+            address: TMS_AUXCR,
+            value,
+        }])
+        .await
+        .context("82357 ATN control")
+    }
 
     fn controller_pad(&self) -> u8 {
         self.my_pad

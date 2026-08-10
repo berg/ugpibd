@@ -314,6 +314,21 @@ pub trait GpibBackend: Send + Sync {
     /// Set the per-operation GPIB timeout in milliseconds.
     fn set_timeout(&mut self, timeout_ms: u32);
 
+    /// How finely a front-end may slice a long read deadline on this
+    /// adapter, if it must slice at all.
+    ///
+    /// `Some(ms)`: the adapter's timeout hardware is a coarse code table
+    /// that rounds up, so a deadline is best enforced by polling in slices
+    /// of about this size (the NI table's 300 ms step fits 250). `None`:
+    /// the adapter honors milliseconds exactly — hand it the whole
+    /// remaining budget in one read. This also matters because a backend's
+    /// timeout path may be heavyweight (the 82357 aborts the transfer and
+    /// pulses IFC); slicing such an adapter turns every quiet moment into
+    /// a bus reset.
+    fn read_slice_ms(&self) -> Option<u32> {
+        None
+    }
+
     /// Stable identifier for this adapter kind (e.g. `"agilent-82357b"`).
     fn name(&self) -> &'static str;
 

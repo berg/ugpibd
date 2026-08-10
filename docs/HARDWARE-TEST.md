@@ -352,3 +352,49 @@ the instrument has parsed them. Reading the status byte immediately after a
 write can therefore observe the state from *before* that write. Poll until the
 expected bit appears rather than asserting on a single read — a real script
 would poll anyway.
+
+## VXI-11 front-end
+
+Automated first:
+
+```bash
+contrib/hardware_exercise.py --pad <PAD>              # HiSLIP baseline
+contrib/multidev_srq.py --a <PAD> --b <PAD> --transport vxi11
+cargo run --release --example vxi11_interface_probe   # interface link + docmd
+```
+
+The probe example covers the interface device end to end: live bus-status
+selectors, Send Command, bus-wide DCL, the docmd-on-device-link refusal,
+the legacy-addressing data transfer (manual addressing then unaddressed
+write/read), and Bus Address set/restore confirmed via selector 8.
+
+Then the CLI, one pass per transport:
+
+```bash
+printf '*IDN?\n++status\n' | ugpibd-scpi --transport hislip  --addr <PAD>
+printf '*IDN?\n++status\n' | ugpibd-scpi --transport vxi11   --addr <PAD>
+printf '*IDN?\n++status\n' | ugpibd-scpi --transport prologix --addr <PAD>
+```
+
+(The prologix pass needs the daemon started with `--enable-prologix`.)
+
+The acceptance test for the whole front-end is a talks-when-addressed
+instrument — one whose output exists only once it is addressed, invisible
+to HiSLIP's read-after-write heuristic. With an HP 8594E (or any 859x) at
+`<PAD>`:
+
+```bash
+visashot.py -I -s "TCPIP::127.0.0.1,9010::gpib0,<PAD>::INSTR" -o out.png -g
+```
+
+Stock visashot, stock pyvisa-py: the PRINT screen dump must arrive via
+explicit `device_read`s. Over HiSLIP this same command times out by design;
+that difference is the reason the VXI-11 front-end exists.
+
+SRQ over VXI-11 needs the pyvisa-py fork (stock has no VXI-11
+`enable_event`); `multidev_srq.py` above covers isolation with two
+instruments, which a single-device bus is structurally unable to test.
+
+The portmapper rides on top: with `ugpibd-portmap` enabled,
+`rpcinfo -p <host>` lists program 395183 against the core port, and the
+resource strings above work with the `,9010` removed.

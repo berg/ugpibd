@@ -259,6 +259,12 @@ impl GpibBackend for MockBackend {
         self.observed.lock().unwrap().timeouts.push(timeout_ms);
     }
 
+    fn read_slice_ms(&self) -> Option<u32> {
+        // Model a coarse-timeout adapter (the NI): the slicing behavior is
+        // what the timeout conformance tests pin.
+        Some(250)
+    }
+
     fn name(&self) -> &'static str {
         "mock"
     }

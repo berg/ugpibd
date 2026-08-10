@@ -97,6 +97,19 @@ async fn main() -> anyhow::Result<()> {
         String::from_utf8_lossy(&idn.data).trim()
     );
 
+    // ATN control: assert, verify via nothing observable but the error
+    // path (a refusing backend answers 8 here), release to standby, then
+    // prove the bus still transacts.
+    let resp = client
+        .device_docmd(intf.lid, 0x020002, true, 2, &1u16.to_be_bytes())
+        .await?;
+    anyhow::ensure!(resp.error == 0, "ATN assert: error {}", resp.error);
+    let resp = client
+        .device_docmd(intf.lid, 0x020002, true, 2, &0u16.to_be_bytes())
+        .await?;
+    anyhow::ensure!(resp.error == 0, "ATN release: error {}", resp.error);
+    println!("ATN control asserted and released");
+
     // Bus Address set: move the controller to 21, confirm via selector 8,
     // move it back.
     let resp = client

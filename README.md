@@ -1,10 +1,15 @@
 # ugpibd
 
 Userspace Rust daemon for USB-to-GPIB adapters that otherwise need an
-out-of-tree kernel driver. It exposes the bus over **HiSLIP** (IVI-6.1) on port
-4880, so pyvisa and NI-VISA reach it with an ordinary `TCPIP::...::INSTR`
-resource string — with locking, clear, trigger, REN, and SRQ. A
-Prologix-compatible port is available for older scripts.
+out-of-tree kernel driver. It exposes the bus over **HiSLIP** (IVI-6.1, port
+4880) and **VXI-11** (port 9010) so pyvisa and NI-VISA reach it with an
+ordinary `TCPIP::...::INSTR` resource string — with locking, clear, trigger,
+REN, SRQ, per-call timeouts and abort. VXI-11's client-driven `device_read`
+also covers instruments HiSLIP structurally cannot: ones that only produce
+output once addressed to talk (859x screen dumps, plotter transfers — see
+`docs/VXI11.md`). A Prologix-compatible port is available for older scripts,
+and the optional `ugpibd-portmap` package provides port-111 discovery for
+NI/Keysight VISA, cooperating with system rpcbind where present.
 
 ## Supported adapters
 
