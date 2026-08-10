@@ -7,12 +7,10 @@ version that has no entry here.
 
 ## v0.7.0 — 2026-08-10
 
-A full VXI-11 front-end beside HiSLIP — and with it, the class of
-instrument no HiSLIP bridge can serve: ones that only produce output once
-addressed to talk. An 859x screen dump or a plotter transfer now works
-with stock pyvisa-py and unmodified tools (`visashot -s
-"TCPIP::host,9010::gpib0,18::INSTR"`), because VXI-11's `device_read` puts
-the client's read on the wire instead of leaving the daemon to guess.
+A full VXI-11 front-end beside HiSLIP. VXI-11 is the highest-fidelity
+transport for mapping GPIB devices onto the network: every bus operation a
+VISA client can ask for — including the client-driven read — is an explicit
+message on the wire.
 
 ### VXI-11 (port 9010, on by default)
 
@@ -21,9 +19,8 @@ on real instruments:
 
 - per-call `io_timeout`s, enforced daemon-side so replies always beat the
   client's own deadline regardless of adapter timeout granularity
-- locking that is shared with HiSLIP — a `viLock` over either protocol
-  excludes I/O over the other — with VXI-11's own per-link, non-nesting
-  semantics
+- locking shared with HiSLIP — a `viLock` over either protocol excludes
+  I/O over the other — with VXI-11's own per-link, non-nesting semantics
 - a real abort channel: `device_abort` interrupts an in-flight call at the
   nearest safe point, never mid-bus-transaction
 - SRQ events delivered over the interrupt channel, per-instrument (a link
@@ -32,23 +29,23 @@ on real instruments:
   set — raw command bytes, live bus status, ATN/REN control, bus-wide
   clear, unaddressed data transfer for legacy addressing sequences
 
-Resource strings and conformance notes, including the two documented
-deviations, are in `docs/VXI11.md`.
+Resource strings (`TCPIP::host,9010::gpib0,15::INSTR`) and conformance
+notes, including the two documented deviations, are in `docs/VXI11.md`.
 
-### Discovery for NI and Keysight VISA
+### Discovery for NI and Keysight VISA (Linux)
 
 The optional `ugpibd-portmap` package answers portmapper lookups so
 `TCPIP::host::gpib0,15::INSTR` works with no port in the string. One
 command (`systemctl enable --now ugpibd-portmap`), and it picks its own
 mode: register with system rpcbind where one runs (Debian and Raspberry
-Pi OS default), serve port 111 itself where none does.
+Pi OS default), serve port 111 itself where none does. On macOS the
+`ugpibd-portmap` binary is built but not packaged as a service.
 
 ### The CLI speaks all three front-ends
 
 `ugpibd-scpi --transport hislip|vxi11|prologix`, plus a new `++read`
-meta-command — the explicit addressed read, for the same
-talks-when-addressed instruments — and a `++help` that actually explains
-things.
+meta-command (an explicit addressed read) and a `++help` that actually
+explains things.
 
 ### Fixed
 

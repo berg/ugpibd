@@ -102,7 +102,7 @@ work over HiSLIP. A bare `gpib0` link addresses the interface itself
 lines).
 
 For clients that discover VXI-11 through the portmapper instead of a port
-in the resource string (NI and Keysight VISA):
+in the resource string (NI and Keysight VISA) — Linux only, systemd:
 
 ```bash
 sudo apt install ugpibd-portmap
@@ -182,7 +182,7 @@ Two things worth knowing before you debug a silent capture:
 when nothing arrives: it distinguishes an instrument that is silent from one
 that is talking to somebody else. See [docs/CAPTURE.md](docs/CAPTURE.md).
 
-## Running as a service
+## Running as a service (Linux)
 
 The packaged `ugpibd.service` is deliberately not started or enabled on
 install — grabbing a USB device and opening a TCP port is not something a
