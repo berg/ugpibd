@@ -425,10 +425,12 @@ else is a plain write. `++` lines are meta-commands handled locally:
   ++clr    (++cls)   Selected Device Clear: reset the instrument's message
                      exchange (input/output buffers), not its settings.
   ++trg              GPIB group trigger (GET) to this instrument.
-  ++ren <0|1|on|off> drive Remote Enable: 1 puts the instrument in remote
-                     (front panel locked out of settings), 0 returns local.
-                     On prologix, only ++ren 0 (++loc) -- REN is asserted by
-                     the front-end itself.
+  ++ren <0|1|on|off> remote/local. On vxi11: per-instrument (addressed
+                     remote / go-to-local), touching nothing else on the
+                     bus. On hislip: the bus-wide REN line -- ++ren 0 drops
+                     every instrument to local, other clients included. On
+                     prologix, only ++ren 0 (an addressed go-to-local);
+                     the front-end owns REN and keeps it asserted.
   ++status (++stb, ++spoll)
                      serial poll: read and print the status byte (decimal).
                      0x40/64 = requesting service, plus instrument-specific
