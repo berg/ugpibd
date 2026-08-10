@@ -107,6 +107,12 @@ pub struct NiUsbTransport {
     pid: u16,
     timeout_ms: u32,
     srq: tokio::sync::broadcast::Sender<()>,
+    /// Set by the interrupt reader when a report consumes the one-shot SRQ
+    /// arming, cleared by whichever bulk transaction re-arms next. Without
+    /// this, a report that nothing services — a stale SRQ at startup, or a
+    /// front-end whose data path never serial-polls (VXI-11) — leaves the
+    /// monitor dead: the first report would be the only one ever delivered.
+    srq_needs_rearm: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Aborted on drop, which is what stops the adapter reporting to nobody.
     _reader_task: tokio::task::JoinHandle<()>,
 }
@@ -150,7 +156,12 @@ impl NiUsbTransport {
             .endpoint::<Interrupt, In>(eps.interrupt_in)
             .with_context(|| format!("open interrupt endpoint {:#04x}", eps.interrupt_in))?;
         let reader_srq = srq.clone();
-        let reader_task = tokio::spawn(interrupt_reader(irq_ep, reader_srq));
+        let srq_needs_rearm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_task = tokio::spawn(interrupt_reader(
+            irq_ep,
+            reader_srq,
+            srq_needs_rearm.clone(),
+        ));
 
         Ok(Self {
             interface,
@@ -159,6 +170,7 @@ impl NiUsbTransport {
             pid,
             timeout_ms,
             srq,
+            srq_needs_rearm,
             _reader_task: reader_task,
         })
     }
@@ -322,6 +334,7 @@ async fn drain_bulk_in_locked(io: &mut BulkIo) {
 async fn interrupt_reader(
     mut endpoint: Endpoint<Interrupt, In>,
     srq: tokio::sync::broadcast::Sender<()>,
+    needs_rearm: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let buf_len = {
         let mps = endpoint.max_packet_size().max(1);
@@ -342,6 +355,11 @@ async fn interrupt_reader(
                     "ni interrupt report"
                 );
                 if asserted {
+                    // The report consumed the one-shot arming. Re-arming is
+                    // not this task's to do — it is a control transfer that
+                    // must serialise against bulk traffic — so flag it for
+                    // the next transaction that holds the I/O lock.
+                    needs_rearm.store(true, std::sync::atomic::Ordering::Release);
                     // No subscribers is normal; a send error is not a problem.
                     let _ = srq.send(());
                 }
@@ -472,6 +490,23 @@ impl NiTransport for NiUsbTransport {
         let timeout = self.bulk_timeout();
         let mut io = self.io.lock().await;
 
+        // A pending SRQ report consumed the interrupt arming; this is the
+        // next moment the control transfer is safe (the I/O lock is held and
+        // no bulk pair is split). Re-arm before the transaction so a service
+        // request raised by *this* traffic is reported.
+        if self
+            .srq_needs_rearm
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Err(e) =
+                vendor_control_in(&self.device, NI_USB_WAIT_REQUEST, 0x300, IBSTA_SRQI, 8).await
+            {
+                debug!("ni: lazy srq re-arm failed: {e:#}");
+            } else {
+                debug!("ni: srq monitor re-armed after a consumed report");
+            }
+        }
+
         if io.abandoned {
             debug!("ni: draining after an abandoned transaction");
             drain_bulk_in_locked(&mut io).await;
@@ -495,6 +530,9 @@ impl NiTransport for NiUsbTransport {
     async fn rearm_srq(&self, mask: u16) -> Result<()> {
         let _io = self.io.lock().await;
         vendor_control_in(&self.device, NI_USB_WAIT_REQUEST, 0x300, mask, 8).await?;
+        // An explicit re-arm satisfies a pending lazy one.
+        self.srq_needs_rearm
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

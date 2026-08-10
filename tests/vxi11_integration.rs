@@ -34,22 +34,55 @@ struct Observed {
 /// a bus timeout does (no data, no END).
 struct MockBackend {
     reads: VecDeque<(Vec<u8>, bool)>,
-    stb: u8,
+    /// Shared so a test can flip RQS on and raise SRQ mid-run.
+    stb: Arc<std::sync::atomic::AtomicU8>,
     eos: (u8, bool),
+    srq: tokio::sync::broadcast::Sender<()>,
     observed: Arc<Mutex<Observed>>,
+}
+
+/// A test's handle on the mock instrument's asynchronous side.
+#[derive(Clone)]
+struct MockInstrument {
+    stb: Arc<std::sync::atomic::AtomicU8>,
+    srq: tokio::sync::broadcast::Sender<()>,
+}
+
+impl MockInstrument {
+    /// Set the status byte and pull the SRQ line.
+    fn raise_srq(&self, stb: u8) {
+        self.stb.store(stb, std::sync::atomic::Ordering::Release);
+        let _ = self.srq.send(());
+    }
 }
 
 impl MockBackend {
     fn new(reads: Vec<(Vec<u8>, bool)>, stb: u8) -> (Self, Arc<Mutex<Observed>>) {
+        let (backend, observed, _) = Self::with_srq(reads, stb);
+        (backend, observed)
+    }
+
+    fn with_srq(
+        reads: Vec<(Vec<u8>, bool)>,
+        stb: u8,
+    ) -> (Self, Arc<Mutex<Observed>>, MockInstrument) {
         let observed = Arc::new(Mutex::new(Observed::default()));
+        let stb = Arc::new(std::sync::atomic::AtomicU8::new(stb));
+        let (srq, _) = tokio::sync::broadcast::channel(4);
+        let instrument = MockInstrument {
+            stb: stb.clone(),
+            srq: srq.clone(),
+        };
         (
             Self {
                 reads: reads.into(),
                 stb,
                 eos: (b'\n', false),
+                srq,
                 observed: observed.clone(),
             },
             observed,
+            instrument,
         )
     }
 }
@@ -111,7 +144,12 @@ impl GpibBackend for MockBackend {
     }
 
     async fn serial_poll(&mut self, _pad: u8) -> Result<u8> {
-        Ok(self.stb)
+        // Reading the status byte clears RQS at a real instrument.
+        Ok(self.stb.swap(0, std::sync::atomic::Ordering::AcqRel))
+    }
+
+    fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.srq.subscribe())
     }
 
     fn set_eos(&mut self, eos_char: u8, enabled: bool) {
@@ -471,37 +509,40 @@ async fn generic_operations_reach_the_addressed_device() -> Result<()> {
     Ok(())
 }
 
-/// Phase boundaries are honest refusals: enable_srq and the interrupt
-/// channel answer 8 (their phase has not landed), docmd answers 8 in its
-/// own response shape.
+/// The one remaining phase boundary is device_docmd, refused honestly in
+/// its own response shape (error 8) until the VXI-11.2 interface-device
+/// phase lands.
 #[tokio::test]
 async fn unimplemented_procedures_refuse_honestly() -> Result<()> {
     let (backend, _) = MockBackend::new(vec![], 0);
     let mut client = start_default(backend).await?;
     let link = client.create_link("gpib0,18").await?;
 
-    let mut srq_args = Vec::new();
-    ugpibd::vxi11::messages::DeviceEnableSrqParms {
+    let mut docmd_args = Vec::new();
+    ugpibd::vxi11::messages::DeviceDocmdParms {
         lid: link.lid,
-        enable: true,
-        handle: vec![1, 2, 3],
+        flags: 0,
+        io_timeout_ms: 0,
+        lock_timeout_ms: 0,
+        cmd: 0x020001,
+        network_order: true,
+        datasize: 2,
+        data_in: vec![],
     }
-    .encode(&mut srq_args);
+    .encode(&mut docmd_args);
     let reply = client
         .call(
             vxi11::DEVICE_CORE_PROG,
             vxi11::DEVICE_CORE_VERS,
-            vxi11::DEVICE_ENABLE_SRQ,
-            &srq_args,
+            vxi11::DEVICE_DOCMD,
+            &docmd_args,
         )
         .await?;
     let Reply::Success(results) = reply else {
-        panic!("enable_srq refusal should be a VXI-11 error, not an RPC one");
+        panic!("docmd refusal should be a VXI-11 error, not an RPC one");
     };
-    assert_eq!(
-        ugpibd::vxi11::messages::decode_device_error(&results)?,
-        ErrorCode::OperationNotSupported.as_u32()
-    );
+    let resp = ugpibd::vxi11::messages::DeviceDocmdResp::decode(&results)?;
+    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
     Ok(())
 }
 
@@ -808,5 +849,165 @@ async fn abort_interrupts_a_lock_wait() -> Result<()> {
         ErrorCode::NoError.as_u32()
     );
     assert_eq!(waiter.await??, ErrorCode::Abort.as_u32());
+    Ok(())
+}
+
+/// The full interrupt loop (§B.3, RULES B.6.93/B.6.110/B.6.111): enable
+/// with a handle, establish the channel, raise SRQ — the registered bytes
+/// come back over the client's DEVICE_INTR server. Disable stops delivery.
+#[tokio::test]
+async fn srq_delivers_the_registered_handle() -> Result<()> {
+    let (backend, _, mock) = MockBackend::with_srq(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let link = client.create_link("gpib0,18").await?;
+
+    let intr = ugpibd::vxi11::client::IntrServer::bind().await?;
+    let intr_port = intr.port()?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(intr.run(tx));
+
+    ok(client.device_enable_srq(link.lid, true, b"srq").await?);
+    ok(client
+        .create_intr_chan(
+            std::net::Ipv4Addr::LOCALHOST,
+            intr_port,
+            vxi11::DEVICE_INTR_PROG,
+            vxi11::DEVICE_INTR_VERS,
+            vxi11::DEVICE_TCP,
+        )
+        .await?);
+
+    mock.raise_srq(0x40);
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("SRQ never delivered")
+        .expect("intr server closed");
+    assert_eq!(handle, b"srq", "handle echoed byte-for-byte (RULE B.6.111)");
+
+    // Disabled: the next SRQ delivers nothing.
+    ok(client.device_enable_srq(link.lid, false, b"").await?);
+    mock.raise_srq(0x40);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .is_err(),
+        "disabled link must not be notified"
+    );
+    Ok(())
+}
+
+/// RULES B.6.85-B.6.88: bad family, UDP, wrong program, wrong version all
+/// answer 8. RULE B.6.83: an unreachable interrupt server answers 6.
+/// RULE B.6.89: a second channel answers 29.
+#[tokio::test]
+async fn create_intr_chan_validates_per_spec() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let _link = client.create_link("gpib0,18").await?;
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let (prog, vers) = (vxi11::DEVICE_INTR_PROG, vxi11::DEVICE_INTR_VERS);
+
+    let e8 = ErrorCode::OperationNotSupported.as_u32();
+    for (port, num, v, family) in [
+        (1, prog, vers, 7),                 // unknown family
+        (1, prog, vers, vxi11::DEVICE_UDP), // UDP: permitted refusal
+        (1, 12345, vers, vxi11::DEVICE_TCP),
+        (1, prog, 2, vxi11::DEVICE_TCP),
+    ] {
+        assert_eq!(
+            client
+                .create_intr_chan(localhost, port, num, v, family)
+                .await?,
+            e8
+        );
+    }
+
+    // Nothing listens on this port: channel not established.
+    let refused = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let dead_port = refused.local_addr()?.port();
+    drop(refused);
+    assert_eq!(
+        client
+            .create_intr_chan(localhost, dead_port, prog, vers, vxi11::DEVICE_TCP)
+            .await?,
+        ErrorCode::ChannelNotEstablished.as_u32()
+    );
+
+    let intr = ugpibd::vxi11::client::IntrServer::bind().await?;
+    let intr_port = intr.port()?;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(intr.run(tx));
+    ok(client
+        .create_intr_chan(localhost, intr_port, prog, vers, vxi11::DEVICE_TCP)
+        .await?);
+    assert_eq!(
+        client
+            .create_intr_chan(localhost, intr_port, prog, vers, vxi11::DEVICE_TCP)
+            .await?,
+        ErrorCode::ChannelAlreadyEstablished.as_u32()
+    );
+    Ok(())
+}
+
+/// RULES B.6.91/B.6.92 and OBSERVATION B.6.21: destroy answers 6 with no
+/// channel, closes an open one, and the per-link enable state survives the
+/// channel's death — a new channel resumes delivery without re-enabling.
+#[tokio::test]
+async fn destroy_intr_chan_and_enable_state_lifecycle() -> Result<()> {
+    let (backend, _, mock) = MockBackend::with_srq(vec![], 0);
+    let mut client = start_default(backend).await?;
+    let link = client.create_link("gpib0,18").await?;
+    let localhost = std::net::Ipv4Addr::LOCALHOST;
+    let (prog, vers) = (vxi11::DEVICE_INTR_PROG, vxi11::DEVICE_INTR_VERS);
+
+    assert_eq!(
+        client.destroy_intr_chan().await?,
+        ErrorCode::ChannelNotEstablished.as_u32()
+    );
+
+    // Enable BEFORE any channel exists (RULE B.6.90 allows it), then bring
+    // a channel up: delivery works.
+    ok(client.device_enable_srq(link.lid, true, b"h1").await?);
+    let intr = ugpibd::vxi11::client::IntrServer::bind().await?;
+    let intr_port = intr.port()?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(intr.run(tx));
+    ok(client
+        .create_intr_chan(localhost, intr_port, prog, vers, vxi11::DEVICE_TCP)
+        .await?);
+    mock.raise_srq(0x40);
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("SRQ not delivered")
+        .unwrap();
+    assert_eq!(handle, b"h1");
+
+    // Destroy, recreate — the enable state was never touched.
+    ok(client.destroy_intr_chan().await?);
+    let intr2 = ugpibd::vxi11::client::IntrServer::bind().await?;
+    let intr2_port = intr2.port()?;
+    let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(intr2.run(tx2));
+    ok(client
+        .create_intr_chan(localhost, intr2_port, prog, vers, vxi11::DEVICE_TCP)
+        .await?);
+    mock.raise_srq(0x40);
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+        .await
+        .expect("SRQ not delivered after channel recreation")
+        .unwrap();
+    assert_eq!(handle, b"h1");
+    Ok(())
+}
+
+/// RULE B.6.94: enable_srq with an unknown lid answers 4.
+#[tokio::test]
+async fn enable_srq_unknown_lid_is_error_4() -> Result<()> {
+    let (backend, _) = MockBackend::new(vec![], 0);
+    let mut client = start_default(backend).await?;
+    assert_eq!(
+        client.device_enable_srq(99, true, b"x").await?,
+        ErrorCode::InvalidLinkIdentifier.as_u32()
+    );
     Ok(())
 }

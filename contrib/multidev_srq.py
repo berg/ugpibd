@@ -48,8 +48,16 @@ def report(name: str, ok: bool, detail: str) -> None:
     results.append((name, ok, detail))
 
 
+TRANSPORTS = {
+    "hislip": "TCPIP::127.0.0.1::hislip{pad}::INSTR",
+    "vxi11": "TCPIP::127.0.0.1,9010::gpib0,{pad}::INSTR",
+}
+transport = "hislip"
+
+
 def open_pad(pad: int, timeout: int = 15000):
-    inst = rm.open_resource(f"TCPIP::127.0.0.1::hislip{pad}::INSTR", open_timeout=timeout)
+    resource = TRANSPORTS[transport].format(pad=pad)
+    inst = rm.open_resource(resource, open_timeout=timeout)
     inst.timeout = timeout
     return inst
 
@@ -115,7 +123,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--a", type=int, required=True, help="PAD of device A")
     ap.add_argument("--b", type=int, required=True, help="PAD of device B")
+    ap.add_argument(
+        "--transport",
+        choices=sorted(TRANSPORTS),
+        default="hislip",
+        help="front-end to exercise (default: hislip)",
+    )
     args = ap.parse_args()
+    global transport
+    transport = args.transport
 
     a, b = open_pad(args.a), open_pad(args.b)
     try:
