@@ -112,11 +112,13 @@ The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
 
-## 8. VXI-11.2 interface-link items awaiting the phase-9 bench sweep
+## 8. 82357 ATN control is implemented but unverified
 
-**Now:** ATN Control on the 82357 is implemented (a transcription of the
-kernel driver's take-control path, AUX_TCA/AUX_GTS) but not yet verified on
-that adapter — it needs the 82357 attached, which the phase-9 hardware
-sweep includes. Until then treat it as unproven. Pass Control remains a
-refusal by architectural decision (docs/VXI11.md, "Deviations"); with
-Bryan's sign-off during phase 9 review, this entry closes entirely.
+**Now:** ATN Control on the 82357 is a transcription of the kernel
+driver's take-control path (AUX_TCA/AUX_GTS) that has not yet run on that
+adapter. Until the phase-9 bench sweep verifies it with the 82357
+attached, treat it as unproven.
+
+(Pass Control is not tracked here: refusing it is a signed-off
+architectural decision, documented in docs/VXI11.md under "Deviations" —
+the daemon is the bus's sole controller.)
