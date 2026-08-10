@@ -14,9 +14,11 @@
 // rev 1.0) RPCL definitions, cross-checked against pyvisa-py's
 // `protocols/vxi11.py`, which is the interop target's own transcription.
 
+pub mod client;
 pub mod messages;
 pub mod portmap;
 pub mod rpc;
+pub mod server;
 pub mod xdr;
 
 /// Core channel: the RPC program the client calls us on (TCP).
@@ -72,6 +74,10 @@ pub enum ErrorCode {
     NoLockHeldByThisLink = 12,
     IoTimeout = 15,
     IoError = 17,
+    /// In the spec's error tables (B.4) though absent from some client
+    /// transcriptions: refuses addresses that parse but cannot exist here
+    /// (PAD > 30, secondary addressing).
+    InvalidAddress = 21,
     Abort = 23,
     ChannelAlreadyEstablished = 29,
 }

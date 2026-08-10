@@ -28,6 +28,14 @@ struct Args {
     #[arg(long, default_value_t = hislip::STANDARD_PORT)]
     hislip_port: u16,
 
+    /// TCP port for the VXI-11 core channel (set to 0 to disable). VXI-11
+    /// has no fixed port; clients that cannot be told one (NI/Keysight VISA
+    /// hardwire portmapper discovery) need the portmapper, which is separate
+    /// and off by default. pyvisa-py carries the port in the resource
+    /// string: TCPIP::<host>,<port>::gpib0,<pad>::INSTR
+    #[arg(long, default_value_t = ugpibd::vxi11::server::DEFAULT_PORT)]
+    vxi11_port: u16,
+
     /// Bind address
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
@@ -214,6 +222,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    let vxi11_listener = if args.vxi11_port != 0 {
+        let l = TcpListener::bind(format!("{}:{}", args.bind, args.vxi11_port)).await?;
+        info!("vxi11 listening on {}:{}", args.bind, args.vxi11_port);
+        Some(l)
+    } else {
+        None
+    };
+
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -267,6 +283,29 @@ async fn main() -> Result<()> {
         }
     };
 
+    let vxi11_ctrl = ctrl.clone();
+    let vxi11_fut = async move {
+        match vxi11_listener {
+            Some(listener) => {
+                let config = ugpibd::vxi11::server::Config {
+                    default_io_timeout_ms: args.timeout_ms,
+                    default_pad,
+                    ..Default::default()
+                };
+                let instrument_for = move |pad: u8| {
+                    Arc::new(ugpibd::frontend::instrument::Instrument::new(
+                        vxi11_ctrl.clone(),
+                        pad,
+                    ))
+                };
+                ugpibd::vxi11::server::run(listener, config, instrument_for)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+            None => std::future::pending::<Result<()>>().await,
+        }
+    };
+
     // Watch the USB port the adapter is on. Waiting for a transfer to fail
     // would never fire while the daemon is idle, leaving it running against
     // hardware that is no longer there and answering clients with errors it
@@ -278,6 +317,7 @@ async fn main() -> Result<()> {
         result = prologix_fut => result,
         result = hislip_fut => result,
         result = capture_fut => result,
+        result = vxi11_fut => result,
         _ = removal => {
             info!("adapter at USB port {adapter_port} was unplugged, shutting down");
             adapter_gone = true;

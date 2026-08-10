@@ -796,6 +796,10 @@ impl<T: Transport + Send + Sync + 'static> crate::backend::GpibBackend for GpibC
         self.eos_char = eos_char;
         self.eos_enabled = enabled;
     }
+
+    fn eos(&self) -> (u8, bool) {
+        (self.eos_char, self.eos_enabled)
+    }
     fn set_timeout(&mut self, timeout_ms: u32) {
         self.timeout_ms = timeout_ms;
     }
