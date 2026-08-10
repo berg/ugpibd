@@ -111,11 +111,3 @@ Two causes, both fixed:
 The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
-
-## 8. 82357B regression pass outstanding
-
-**Now:** ATN control is verified on the 82357A (assert, release, bus alive
-after — the same TMS9914 AUXCR path the B uses), along with the full
-VXI-11 sweep on that adapter. The 82357B still deserves its own pass for
-the paths that differ per model (the double-upload firmware quirk); this
-entry closes on that run.
