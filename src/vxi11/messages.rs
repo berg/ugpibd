@@ -151,8 +151,9 @@ pub struct DeviceReadParms {
     pub io_timeout_ms: u32,
     pub lock_timeout_ms: u32,
     pub flags: u32,
-    /// Meaningful only when `flags` has OP_FLAG_TERMCHRSET; an `int` on the
-    /// wire of which the low byte is the character.
+    /// Meaningful only when `flags` has OP_FLAG_TERMCHRSET. The RPCL spells
+    /// it `char`, but XDR has no sub-word integer: it rides as a full word,
+    /// low byte the character (pyvisa-py packs it as an int, identically).
     pub term_char: i32,
 }
 
@@ -348,7 +349,12 @@ impl DeviceRemoteFunc {
 }
 
 /// Device_SrqParms — the one argument of device_intr_srq, echoing the
-/// handle device_enable_srq registered, byte for byte.
+/// handle device_enable_srq registered, byte for byte (RULE B.6.111).
+///
+/// The RPCL leaves this handle unbounded (`opaque handle<>`, §C.2) where the
+/// enable side says `handle<40>` — but B.6.111 makes the sent bytes a copy
+/// of the registered ones, so the 40-byte cap in `decode` can only refuse
+/// traffic a conforming server would never emit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceSrqParms {
     pub handle: Vec<u8>,
@@ -559,7 +565,10 @@ mod tests {
         };
         assert_eq!(DeviceReadResp::decode(&resp.encode(), 1024).unwrap(), resp);
 
-        let resp = DeviceReadStbResp { error: 0, stb: 0x50 };
+        let resp = DeviceReadStbResp {
+            error: 0,
+            stb: 0x50,
+        };
         assert_eq!(DeviceReadStbResp::decode(&resp.encode()).unwrap(), resp);
 
         let resp = DeviceDocmdResp {

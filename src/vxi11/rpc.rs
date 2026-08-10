@@ -216,7 +216,10 @@ pub enum ReplyError {
     /// A mismatched xid is an error rather than a skip: this client runs one
     /// call at a time per connection, so an unexpected xid is not an
     /// out-of-order answer to somebody else, it is a peer that lost framing.
-    WrongXid { got: u32, expected: u32 },
+    WrongXid {
+        got: u32,
+        expected: u32,
+    },
     /// A CALL (or garbage discriminant) where a reply belongs.
     NotAReply(u32),
 }

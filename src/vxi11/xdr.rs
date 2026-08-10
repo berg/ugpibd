@@ -27,7 +27,10 @@ impl fmt::Display for XdrError {
         match self {
             Self::Truncated => write!(f, "XDR data truncated"),
             Self::TooLong { len, max } => {
-                write!(f, "XDR variable-length item of {len} bytes exceeds limit {max}")
+                write!(
+                    f,
+                    "XDR variable-length item of {len} bytes exceeds limit {max}"
+                )
             }
             Self::BadBool(v) => write!(f, "XDR bool encoded as {v}, must be 0 or 1"),
         }
