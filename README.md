@@ -4,12 +4,12 @@ Userspace Rust daemon for USB-to-GPIB adapters that otherwise need an
 out-of-tree kernel driver. It exposes the bus over **HiSLIP** (IVI-6.1, port
 4880) and **VXI-11** (port 9010) so pyvisa and NI-VISA reach it with an
 ordinary `TCPIP::...::INSTR` resource string — with locking, clear, trigger,
-REN, SRQ, per-call timeouts and abort. VXI-11's client-driven `device_read`
-also covers instruments HiSLIP structurally cannot: ones that only produce
-output once addressed to talk (859x screen dumps, plotter transfers — see
-`docs/VXI11.md`). A Prologix-compatible port is available for older scripts,
-and the optional `ugpibd-portmap` package provides port-111 discovery for
-NI/Keysight VISA, cooperating with system rpcbind where present.
+REN, SRQ, per-call timeouts and abort. VXI-11 is the highest-fidelity
+transport for mapping GPIB devices onto the network: every bus operation,
+including the client-driven read, is an explicit message on the wire. A
+Prologix-compatible port is available for older scripts, and the optional
+`ugpibd-portmap` package provides port-111 discovery for NI/Keysight VISA,
+cooperating with system rpcbind where present.
 
 ## Supported adapters
 
@@ -93,13 +93,11 @@ requests, and the rest of each protocol's semantics are in
 ## VXI-11
 
 The second VISA front-end, on port 9010 (`--vxi11-port`). Same instruments,
-same locking (a lock taken over either protocol excludes the other), plus
-what only its wire protocol can offer: a client-driven `device_read`, so
-instruments that produce output only once addressed to talk — 859x screen
-dumps, plotter transfers, pre-488.2 gear generally — work here and cannot
-work over HiSLIP. A bare `gpib0` link addresses the interface itself
-(bus-wide clear, raw command bytes, bus status from the live control
-lines).
+same locking (a lock taken over either protocol excludes the other), with
+the full protocol surface: client-driven reads, per-call timeouts, abort,
+SRQ events, and — via a bare `gpib0` link — the interface itself (bus-wide
+clear, raw command bytes, bus status from the live control lines,
+unaddressed data transfer).
 
 For clients that discover VXI-11 through the portmapper instead of a port
 in the resource string (NI and Keysight VISA) — Linux only, systemd:
@@ -131,7 +129,7 @@ address is fixed for the session.
 
 | Command | Action |
 |---------|--------|
-| `++read` | explicit addressed read (vxi11/prologix) — for instruments that only talk when addressed |
+| `++read` | explicit addressed read (vxi11/prologix) |
 | `++clr` | Selected Device Clear |
 | `++trg` | GPIB trigger (GET) |
 | `++ren <0\|1>` | remote / local — semantics differ per transport, see `++help` |
