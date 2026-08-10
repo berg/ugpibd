@@ -5,6 +5,59 @@ as its release notes, so it is written for someone deciding whether to upgrade
 rather than for someone reading the diff — `scripts/release` refuses to tag a
 version that has no entry here.
 
+## v0.7.0 — 2026-08-10
+
+A full VXI-11 front-end beside HiSLIP — and with it, the class of
+instrument no HiSLIP bridge can serve: ones that only produce output once
+addressed to talk. An 859x screen dump or a plotter transfer now works
+with stock pyvisa-py and unmodified tools (`visashot -s
+"TCPIP::host,9010::gpib0,18::INSTR"`), because VXI-11's `device_read` puts
+the client's read on the wire instead of leaving the daemon to guess.
+
+### VXI-11 (port 9010, on by default)
+
+Everything the spec defines, tested against it and against four adapters
+on real instruments:
+
+- per-call `io_timeout`s, enforced daemon-side so replies always beat the
+  client's own deadline regardless of adapter timeout granularity
+- locking that is shared with HiSLIP — a `viLock` over either protocol
+  excludes I/O over the other — with VXI-11's own per-link, non-nesting
+  semantics
+- a real abort channel: `device_abort` interrupts an in-flight call at the
+  nearest safe point, never mid-bus-transaction
+- SRQ events delivered over the interrupt channel, per-instrument (a link
+  is only woken for its own instrument's request)
+- the VXI-11.2 interface device: a bare `gpib0` link with the full docmd
+  set — raw command bytes, live bus status, ATN/REN control, bus-wide
+  clear, unaddressed data transfer for legacy addressing sequences
+
+Resource strings and conformance notes, including the two documented
+deviations, are in `docs/VXI11.md`.
+
+### Discovery for NI and Keysight VISA
+
+The optional `ugpibd-portmap` package answers portmapper lookups so
+`TCPIP::host::gpib0,15::INSTR` works with no port in the string. One
+command (`systemctl enable --now ugpibd-portmap`), and it picks its own
+mode: register with system rpcbind where one runs (Debian and Raspberry
+Pi OS default), serve port 111 itself where none does.
+
+### The CLI speaks all three front-ends
+
+`ugpibd-scpi --transport hislip|vxi11|prologix`, plus a new `++read`
+meta-command — the explicit addressed read, for the same
+talks-when-addressed instruments — and a `++help` that actually explains
+things.
+
+### Fixed
+
+- The 82357 backends no longer have the bus reset out from under a slow
+  query: the read path now respects each adapter's timeout granularity
+  instead of polling the 82357's heavyweight timeout path.
+- CI publishes plain binary tarballs (linux amd64/arm64, macOS arm64)
+  alongside the debs.
+
 ## v0.6.0 — 2026-08-06
 
 Instruments that plot or print to GPIB can now be captured, on every adapter.
