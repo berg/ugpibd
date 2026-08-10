@@ -12,6 +12,4 @@ if [ "$1" = "purge" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
     done
 fi
 
-#DEBHELPER#
-
 exit 0

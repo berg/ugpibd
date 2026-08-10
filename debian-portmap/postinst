@@ -27,6 +27,4 @@ if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
     fi
 fi
 
-#DEBHELPER#
-
 exit 0

@@ -98,6 +98,9 @@ maintainer-scripts = "debian/"
 
 [package.metadata.deb.variants.portmap]
 name = "ugpibd-portmap"
+# The base package's conf-file is not shipped here; without this override the
+# variant inherits it and lintian errors on the phantom conffile.
+conf-files = []
 depends = "$auto, init-system-helpers (>= 1.54)"
 recommends = "ugpibd"
 extended-description = """\
