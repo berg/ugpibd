@@ -71,6 +71,49 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("docmd on device link correctly refused (8)");
 
+    // The RECOMMENDATION B.1.1 sequence: address by hand with docmd Send
+    // Command, then move data over the interface link with no addressing.
+    let lad = 0x20 | (pad & 0x1f);
+    let tad = 0x40 | (pad & 0x1f);
+    let resp = client
+        .device_docmd(intf.lid, 0x020000, true, 1, &[0x3F, lad, 0x40])
+        .await?;
+    anyhow::ensure!(resp.error == 0, "manual listen addressing: {}", resp.error);
+    let resp = client
+        .device_write(
+            intf.lid, b"*IDN?
+", true, 0,
+        )
+        .await?;
+    anyhow::ensure!(resp.error == 0, "interface write: error {}", resp.error);
+    let resp = client
+        .device_docmd(intf.lid, 0x020000, true, 1, &[0x3F, tad, 0x20])
+        .await?;
+    anyhow::ensure!(resp.error == 0, "manual talk addressing: {}", resp.error);
+    let idn = client.device_read(intf.lid, 256, 5000, None).await?;
+    anyhow::ensure!(idn.error == 0, "interface read: error {}", idn.error);
+    println!(
+        "legacy-addressed transfer over the interface link: {}",
+        String::from_utf8_lossy(&idn.data).trim()
+    );
+
+    // Bus Address set: move the controller to 21, confirm via selector 8,
+    // move it back.
+    let resp = client
+        .device_docmd(intf.lid, 0x02000A, true, 4, &21u32.to_be_bytes())
+        .await?;
+    anyhow::ensure!(resp.error == 0, "bus address set: error {}", resp.error);
+    let resp = client
+        .device_docmd(intf.lid, 0x020001, true, 2, &8u16.to_be_bytes())
+        .await?;
+    let now_at = u16::from_be_bytes([resp.data_out[0], resp.data_out[1]]);
+    anyhow::ensure!(now_at == 21, "selector 8 reports {now_at}, expected 21");
+    let resp = client
+        .device_docmd(intf.lid, 0x02000A, true, 4, &0u32.to_be_bytes())
+        .await?;
+    anyhow::ensure!(resp.error == 0, "bus address restore: error {}", resp.error);
+    println!("bus address set 0 -> 21 -> 0 confirmed via selector 8");
+
     client.device_write(dev.lid, b"*IDN?\n", true, 0).await?;
     let idn = client.device_read(dev.lid, 256, 5000, None).await?;
     anyhow::ensure!(idn.error == 0, "post-DCL query: error {}", idn.error);

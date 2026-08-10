@@ -30,6 +30,10 @@ struct Observed {
     eos_at_read: Vec<(u8, bool)>,
     /// Raw bus-command bytes (DCL, GET, docmd Send Command).
     bus_commands: Vec<Vec<u8>>,
+    /// SEND DATA BYTES payloads (no addressing).
+    unaddressed_writes: Vec<(Vec<u8>, bool)>,
+    /// RECEIVE RESPONSE MESSAGE attempts (no addressing).
+    unaddressed_reads: usize,
     /// ATN line transitions requested.
     atn: Vec<bool>,
 }
@@ -38,6 +42,11 @@ struct Observed {
 /// a bus timeout does (no data, no END).
 struct MockBackend {
     reads: VecDeque<(Vec<u8>, bool)>,
+    /// Writes (addressed or not) that should fail, by 0-based sequence
+    /// number, with this message.
+    write_failures: std::collections::HashMap<usize, &'static str>,
+    writes_seen: usize,
+    controller_pad: Arc<std::sync::atomic::AtomicU8>,
     /// Shared so a test can flip RQS on and raise SRQ mid-run.
     stb: Arc<std::sync::atomic::AtomicU8>,
     eos: (u8, bool),
@@ -92,6 +101,9 @@ impl MockBackend {
         (
             Self {
                 reads: reads.into(),
+                write_failures: std::collections::HashMap::new(),
+                writes_seen: 0,
+                controller_pad: Arc::new(std::sync::atomic::AtomicU8::new(21)),
                 stb,
                 eos: (b'\n', false),
                 srq,
@@ -111,11 +123,43 @@ impl GpibBackend for MockBackend {
     }
 
     async fn write(&mut self, pad: u8, data: &[u8], send_eoi: bool) -> Result<()> {
+        let n = self.writes_seen;
+        self.writes_seen += 1;
+        if let Some(msg) = self.write_failures.get(&n) {
+            anyhow::bail!("{msg}");
+        }
         self.observed
             .lock()
             .unwrap()
             .writes
             .push((pad, data.to_vec(), send_eoi));
+        Ok(())
+    }
+
+    async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
+        let n = self.writes_seen;
+        self.writes_seen += 1;
+        if let Some(msg) = self.write_failures.get(&n) {
+            anyhow::bail!("{msg}");
+        }
+        self.observed
+            .lock()
+            .unwrap()
+            .unaddressed_writes
+            .push((data.to_vec(), send_eoi));
+        Ok(())
+    }
+
+    async fn read_unaddressed(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        self.observed.lock().unwrap().unaddressed_reads += 1;
+        let (mut data, end) = self.reads.pop_front().unwrap_or_default();
+        data.truncate(max_len);
+        Ok((data, end))
+    }
+
+    async fn set_controller_pad(&mut self, pad: u8) -> Result<()> {
+        self.controller_pad
+            .store(pad, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -188,7 +232,8 @@ impl GpibBackend for MockBackend {
     }
 
     fn controller_pad(&self) -> u8 {
-        21
+        self.controller_pad
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn bus_lines(&mut self) -> Result<ugpibd::backend::BusLines> {
@@ -1180,10 +1225,6 @@ async fn docmd_line_controls_and_refusals() -> Result<()> {
         ErrorCode::ParameterError.as_u32(),
         "31 is illegal first"
     );
-    let resp = client
-        .device_docmd(intf.lid, 0x02000A, true, 4, &12u32.to_be_bytes())
-        .await?;
-    assert_eq!(resp.error, ErrorCode::OperationNotSupported.as_u32());
     Ok(())
 }
 
@@ -1227,11 +1268,6 @@ async fn interface_link_operations() -> Result<()> {
     assert_eq!(client.device_remote(intf.lid).await?, e8);
     assert_eq!(client.device_local(intf.lid).await?, e8);
     assert_eq!(client.device_readstb(intf.lid, 0).await?.error, e8);
-    assert_eq!(
-        client.device_write(intf.lid, b"x", true, 0).await?.error,
-        e8
-    );
-    assert_eq!(client.device_read(intf.lid, 10, 0, None).await?.error, e8);
     Ok(())
 }
 

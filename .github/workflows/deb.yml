@@ -39,7 +39,7 @@ jobs:
         include: ${{ fromJSON(inputs.targets) }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -51,7 +51,7 @@ jobs:
       # is built against glibc 2.39 and cannot run on the 22.04 runner we use to
       # get a *low* glibc floor for our own package. Building it from source is
       # slower, so the result is cached on a pinned version.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: cargo-deb-cache
         with:
           path: ~/.cargo/bin/cargo-deb
@@ -88,6 +88,12 @@ jobs:
           echo "DEB=$(realpath "${DEB}")" >> "$GITHUB_ENV"
           echo "PORTMAP_DEB=$(realpath "${PORTMAP_DEB}")" >> "$GITHUB_ENV"
           ls -l "${DEB}" "${PORTMAP_DEB}"
+
+          # Plain binaries too: not everything that wants to test a build is
+          # a Debian system.
+          TAR="ugpibd-${DEB_VERSION}-linux-${{ matrix.arch }}.tar.gz"
+          tar -C target/release -czf "${TAR}" ugpibd ugpibd-scpi ugpibd-portmap
+          echo "BIN_TAR=$(realpath "${TAR}")" >> "$GITHUB_ENV"
 
       - name: Lint package
         run: |
@@ -197,18 +203,23 @@ jobs:
           sudo apt-get purge -y ugpibd-portmap
           test ! -e /usr/bin/ugpibd-portmap
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: ugpibd-deb-${{ matrix.arch }}
           path: |
             ${{ env.DEB }}
             ${{ env.PORTMAP_DEB }}
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ugpibd-bin-linux-${{ matrix.arch }}
+          path: ${{ env.BIN_TAR }}
+
   blacklist:
     name: blacklist (all)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Build package
         run: |
@@ -234,7 +245,35 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: ugpibd-deb-blacklist
           path: ./*_all.deb
+
+  macos-binaries:
+    name: macos binaries (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and package
+        run: |
+          BASE=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${{ inputs.snapshot }}" = "true" ]; then
+            FULL_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+            VERSION="${BASE}~ci${{ github.run_number }}+g${FULL_SHA:0:8}"
+          else
+            VERSION="${BASE}"
+          fi
+          cargo build --release
+          ./target/release/ugpibd --help >/dev/null
+          ./target/release/ugpibd-scpi --help >/dev/null
+          ./target/release/ugpibd-portmap --help >/dev/null
+          TAR="ugpibd-${VERSION}-macos-arm64.tar.gz"
+          tar -C target/release -czf "${TAR}" ugpibd ugpibd-scpi ugpibd-portmap
+          echo "BIN_TAR=$(realpath "${TAR}")" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ugpibd-bin-macos-arm64
+          path: ${{ env.BIN_TAR }}
