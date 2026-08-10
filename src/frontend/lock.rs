@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ugpibd contributors
 //
-// HiSLIP locking (IVI-6.1 AsyncLock / AsyncLockInfo).
+// Instrument locking (VISA viLock semantics; HiSLIP AsyncLock / AsyncLockInfo
+// is the first protocol mapped onto it).
 //
-// A lock is held by a *session*, not by a connection: it is requested on the
-// async channel and enforced on the sync channel, and it goes away when the
-// session does. Locks are scoped per resource — a client that locks the DMM at
-// GPIB 23 must not lock out a client talking to the counter at GPIB 3 — so the
-// registry is a map keyed by whatever `Device::resource_key` returns.
+// This lives in `frontend` rather than in a protocol module because the thing
+// a lock protects is the *instrument*, which every front-end shares: a lock
+// taken over one protocol must exclude I/O arriving over another, or it is not
+// a lock. The registry is therefore one per daemon, not one per server.
+//
+// A lock is held by a *session*, not by a connection: in HiSLIP it is
+// requested on the async channel and enforced on the sync channel, and it goes
+// away when the session does. Locks are scoped per resource — a client that
+// locks the DMM at GPIB 23 must not lock out a client talking to the counter
+// at GPIB 3 — so the registry is a map keyed by the instrument's resource key
+// (`gpib<PAD>`).
 //
 // Semantics follow VISA, which is what callers actually experience:
 //
@@ -82,8 +89,8 @@ impl LockTable {
     }
 }
 
-/// Server-wide lock state, one table per resource.
-#[derive(Default)]
+/// Daemon-wide lock state, one table per resource.
+#[derive(Debug, Default)]
 pub struct LockRegistry {
     /// Std mutex, not tokio's: every operation is a few map lookups and never
     /// awaits, and a session's locks must be releasable from `Drop`, which is

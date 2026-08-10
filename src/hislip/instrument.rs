@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 ugpibd contributors
 //
-// Bridge from the HiSLIP `Device` abstraction to our `GpibController`.
-
-use std::sync::Arc;
+// Bridge from the HiSLIP `Device` abstraction to a shared-bus instrument.
+//
+// The read-after-write *policy* lives here and not in
+// `frontend::instrument`, because it is HiSLIP's problem: HiSLIP has no read
+// request — the server pushes replies — so this front-end alone must decide
+// at write time whether to drain the instrument. Front-ends whose protocol
+// carries the client's read request (VXI-11, Prologix) call the split
+// primitives directly and never guess.
 
 use anyhow::{bail, Result};
-use tokio::sync::Mutex;
 
 use tracing::debug;
 
 use super::server::{Device, Execution, STB_MAV, STB_RQS};
-use crate::backend::GpibBackend;
+use crate::frontend::instrument::Instrument;
 
 /// Did a service request arrive on this subscription? A lagged channel counts:
 /// SRQ is a level rather than a tally, so a missed notification and a delivered
@@ -24,21 +28,16 @@ fn srq_fired(srq: &mut Option<tokio::sync::broadcast::Receiver<()>>) -> bool {
     )
 }
 
-/// A GPIB instrument addressable at `pad` on the shared bus.
+/// A GPIB instrument addressable on the shared bus, presented to the HiSLIP
+/// server.
 pub struct GpibInstrument {
-    ctrl: Arc<Mutex<dyn GpibBackend>>,
-    pad: u8,
-    /// Upper bound on a single bulk read. Matches the Prologix server's
-    /// default so behavior is consistent across front-ends.
-    max_read: usize,
+    instr: Instrument,
 }
 
 impl GpibInstrument {
-    pub fn new(ctrl: Arc<Mutex<dyn GpibBackend>>, pad: u8) -> Self {
+    pub fn new(ctrl: crate::backend::SharedBackend, pad: u8) -> Self {
         Self {
-            ctrl,
-            pad,
-            max_read: 65536,
+            instr: Instrument::new(ctrl, pad),
         }
     }
 }
@@ -62,12 +61,12 @@ impl Device for GpibInstrument {
     /// and to the several NRf spellings of the same number. The SRQ line is the
     /// instrument's own answer, so that is what we watch.
     async fn execute(&self, cmd: &[u8], expect_response: bool) -> Result<Execution> {
-        let mut ctrl = self.ctrl.lock().await;
+        let mut bus = self.instr.hold().await;
         // Subscribe before touching the bus, so a request raised anywhere from
         // here on is in the queue by the time we look.
-        let mut srq = ctrl.subscribe_srq();
+        let mut srq = bus.subscribe_srq();
 
-        ctrl.write(self.pad, cmd, true).await?;
+        bus.write(cmd, true).await?;
 
         // Poll before draining, not after. If the instrument is already asking
         // for service this is the one moment its own status byte can still be
@@ -83,7 +82,7 @@ impl Device for GpibInstrument {
             // exchange. If this poll catches RQS it must also be surfaced:
             // reading the status byte cleared it, and dropping it here would
             // eat a service request.
-            match ctrl.serial_poll(self.pad).await {
+            match bus.serial_poll().await {
                 Ok(stb) => {
                     if stb & STB_RQS != 0 {
                         service_request = Some(stb);
@@ -104,8 +103,8 @@ impl Device for GpibInstrument {
                     });
                 }
             }
-        } else if ctrl.srq_asserted().await.unwrap_or(false) {
-            match ctrl.serial_poll(self.pad).await {
+        } else if bus.srq_asserted().await.unwrap_or(false) {
+            match bus.serial_poll().await {
                 Ok(stb) if stb & STB_RQS != 0 => service_request = Some(stb),
                 // SRQ is a wired-OR: somebody else on the bus is holding it.
                 Ok(_) => {}
@@ -113,7 +112,7 @@ impl Device for GpibInstrument {
             }
         }
 
-        let (data, end) = ctrl.read(self.pad, self.max_read).await?;
+        let (data, end) = bus.read().await?;
         // Nothing back *and* no END is not an empty answer: the instrument was
         // addressed to talk and had nothing to say, which is what a query it
         // does not implement looks like from here (an HP 34401A asked `*LRN?`
@@ -132,7 +131,7 @@ impl Device for GpibInstrument {
         // instrument's, since it only pulled the line because its own service
         // request mask said to.
         if service_request.is_none() && !data.is_empty() && srq_fired(&mut srq) {
-            match ctrl.srq_asserted().await {
+            match bus.srq_asserted().await {
                 // Still asserted, so it outlived our read and was not about
                 // the output we took. Leave it: the session's SRQ forwarder
                 // will poll it and report the real byte.
@@ -152,56 +151,42 @@ impl Device for GpibInstrument {
     }
 
     async fn trigger(&self) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.trigger(self.pad).await
+        self.instr.trigger().await
     }
 
     async fn clear(&self) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.device_clear(self.pad).await
+        self.instr.device_clear().await
     }
 
     async fn set_remote(&self, remote: bool) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.ren(remote).await
+        self.instr.ren(remote).await
     }
 
     async fn go_to_remote(&self) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.go_to_remote(self.pad).await
+        self.instr.go_to_remote().await
     }
 
     async fn go_to_local(&self) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.go_to_local(self.pad).await
+        self.instr.go_to_local().await
     }
 
     async fn local_lockout(&self) -> Result<()> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.local_lockout().await
+        self.instr.local_lockout().await
     }
 
     async fn get_status(&self) -> Result<u8> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.serial_poll(self.pad).await
+        self.instr.serial_poll().await
     }
 
     async fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
-        let ctrl = self.ctrl.lock().await;
-        ctrl.subscribe_srq()
+        self.instr.subscribe_srq().await
     }
 
     async fn srq_asserted(&self) -> Result<bool> {
-        let mut ctrl = self.ctrl.lock().await;
-        ctrl.srq_asserted().await
+        self.instr.srq_asserted().await
     }
 
-    /// The instrument, not the session, is what a lock protects: two clients
-    /// that resolve to the same primary address contend, and two that resolve
-    /// to different ones do not. Sub-address spellings that mean the same PAD
-    /// (`hislip23`, `gpib0,23`, and `hislip0` when 23 is the default) all land
-    /// on the same key, because the PAD is resolved before we get here.
     fn resource_key(&self) -> String {
-        format!("gpib{}", self.pad)
+        self.instr.resource_key()
     }
 }
