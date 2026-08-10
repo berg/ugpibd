@@ -74,30 +74,48 @@ It binds `127.0.0.1` and serves HiSLIP (4880) and VXI-11 (9010). Use
 `--bind 0.0.0.0` for remote access, `--enable-prologix` for the Prologix
 port, and `RUST_LOG=ugpibd=debug` for protocol tracing.
 
-## PyVISA
+## Connecting with VISA
 
 ```python
 import pyvisa
 rm = pyvisa.ResourceManager("@py")
-inst = rm.open_resource("TCPIP::localhost::hislip15::INSTR")        # HiSLIP
-inst = rm.open_resource("TCPIP::localhost,9010::gpib0,15::INSTR")   # VXI-11
+inst = rm.open_resource("TCPIP::localhost,9010::gpib0,15::INSTR")
 print(inst.query("*IDN?"))
 ```
 
-In both forms, `15` is the GPIB primary address. The HiSLIP sub-address may
-be written `hislip<N>`, `gpib<N>`, or bare `<N>`; `hislip0` means the
-daemon's `--default-address`, as does VXI-11's `inst0`. Locking, service
-requests, and the rest of each protocol's semantics are in
-[docs/HISLIP.md](docs/HISLIP.md) and [docs/VXI11.md](docs/VXI11.md).
+Resource-string syntax, where `15` is the instrument's GPIB primary
+address:
 
-## VXI-11
+| Transport | Resource string |
+|-----------|-----------------|
+| **VXI-11 (recommended)** | `TCPIP::<host>,9010::gpib0,15::INSTR` |
+| VXI-11, daemon's default PAD | `TCPIP::<host>,9010::inst0::INSTR` |
+| VXI-11, the interface itself | `TCPIP::<host>,9010::gpib0::INSTR` |
+| HiSLIP | `TCPIP::<host>::hislip15::INSTR` |
 
-The second VISA front-end, on port 9010 (`--vxi11-port`). Same instruments,
-same locking (a lock taken over either protocol excludes the other), with
-the full protocol surface: client-driven reads, per-call timeouts, abort,
-SRQ events, and — via a bare `gpib0` link — the interface itself (bus-wide
-clear, raw command bytes, bus status from the live control lines,
-unaddressed data transfer).
+VXI-11 is the recommended transport: it is the highest-fidelity mapping of
+GPIB onto the network, with every bus operation — including the
+client-driven read — an explicit message on the wire. Prefer the explicit
+`,9010` port form even though it matches the daemon's default: the string
+then works with no portmapper involved, on any port the daemon is
+configured for (`--vxi11-port`). Omitting the port
+(`TCPIP::<host>::gpib0,15::INSTR`) makes the client look the port up via
+the portmapper — see the `ugpibd-portmap` note below — and is the form NI
+and Keysight VISA produce on their own.
+
+The HiSLIP sub-address may be written `hislip<N>`, `gpib<N>`, or bare
+`<N>`; `hislip0` means the daemon's `--default-address`, as does VXI-11's
+`inst0`. Locking, service requests, and the rest of each protocol's
+semantics: [docs/VXI11.md](docs/VXI11.md) and
+[docs/HISLIP.md](docs/HISLIP.md).
+
+## VXI-11 details
+
+Same instruments and same locking as HiSLIP (a lock taken over either
+protocol excludes the other), with the full protocol surface: client-driven
+reads, per-call timeouts, abort, SRQ events, and — via a bare `gpib0` link —
+the interface itself (bus-wide clear, raw command bytes, bus status from
+the live control lines, unaddressed data transfer).
 
 For clients that discover VXI-11 through the portmapper instead of a port
 in the resource string (NI and Keysight VISA) — Linux only, systemd:
