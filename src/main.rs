@@ -232,6 +232,7 @@ async fn main() -> Result<()> {
     let prologix_ctrl = ctrl.clone();
     let hislip_ctrl = ctrl.clone();
     let default_pad = args.default_address;
+    let locks = Arc::new(ugpibd::frontend::lock::LockRegistry::new());
 
     let prologix_fut = async move {
         match prologix_listener {
@@ -250,7 +251,15 @@ async fn main() -> Result<()> {
                     );
                     Some(dev)
                 };
-                hislip::server::run(listener, hislip::server::Config::default(), device_for)
+                // One lock registry for the daemon, not per front-end: a
+                // viLock excludes I/O on the instrument no matter which
+                // protocol carries it. Today only HiSLIP enforces locks; the
+                // VXI-11 front-end will share this same registry.
+                let config = hislip::server::Config {
+                    locks: locks.clone(),
+                    ..Default::default()
+                };
+                hislip::server::run(listener, config, device_for)
                     .await
                     .map_err(anyhow::Error::from)
             }

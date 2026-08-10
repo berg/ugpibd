@@ -2,6 +2,7 @@
 // Copyright (C) 2026 ugpibd contributors
 pub mod backend;
 pub mod capture;
+pub mod frontend;
 pub mod hislip;
 pub mod prologix;
 pub mod server;

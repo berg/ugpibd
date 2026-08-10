@@ -176,6 +176,12 @@ pub struct Config {
     pub vendor_id: u16,
     pub max_message_size: u64,
     pub max_sessions: usize,
+    /// The lock registry this server enforces. Passed in rather than created
+    /// here because locks protect the *instrument*: a daemon serving several
+    /// front-ends hands the same registry to each, so a lock taken over one
+    /// protocol excludes I/O arriving over another. The default is a fresh
+    /// registry, which is right for a daemon (or test) with one front-end.
+    pub locks: Arc<LockRegistry>,
 }
 
 impl Default for Config {
@@ -184,6 +190,7 @@ impl Default for Config {
             vendor_id: 0xBEEF,
             max_message_size: 1024 * 1024,
             max_sessions: 16,
+            locks: Arc::new(LockRegistry::new()),
         }
     }
 }
@@ -197,7 +204,7 @@ where
 {
     info!("HiSLIP listening on {}", listener.local_addr()?);
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
-    let locks = Arc::new(LockRegistry::new());
+    let locks = config.locks.clone();
     let device_for = Arc::new(device_for);
 
     loop {

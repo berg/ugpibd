@@ -10,10 +10,14 @@
 pub mod client;
 pub mod errors;
 pub mod instrument;
-pub mod lock;
 pub mod messages;
 pub mod protocol;
 pub mod server;
+
+// The lock registry moved to `frontend` so every front-end can share one
+// table; re-exported here because HiSLIP is where VISA's lock semantics were
+// first mapped and existing callers know it by this path.
+pub use crate::frontend::lock;
 
 /// IANA-assigned HiSLIP port.
 pub const STANDARD_PORT: u16 = 4880;
