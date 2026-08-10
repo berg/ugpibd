@@ -32,6 +32,12 @@ impl Vxi11Client {
         })
     }
 
+    /// The server's address, so a caller can open sibling connections (the
+    /// abort channel, or a second core connection) to the same daemon.
+    pub fn server_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.stream.get_ref().peer_addr()
+    }
+
     /// One raw call: encode, send, await the matching reply. Exposed so
     /// tests can speak wrong programs and versions on purpose.
     pub async fn call(&mut self, prog: u32, vers: u32, proc: u32, args: &[u8]) -> Result<Reply> {
@@ -151,6 +157,85 @@ impl Vxi11Client {
         xdr::put_i32(&mut args, lid);
         let results = self.core(DESTROY_LINK, &args).await?;
         Ok(decode_device_error(&results)?)
+    }
+
+    /// create_link with lockDevice set (RULE B.6.3.1).
+    pub async fn create_link_locked(
+        &mut self,
+        device: &str,
+        lock_timeout_ms: u32,
+    ) -> Result<CreateLinkResp> {
+        let parms = CreateLinkParms {
+            client_id: std::process::id() as i32,
+            lock_device: true,
+            lock_timeout_ms,
+            device: device.as_bytes().to_vec(),
+        };
+        let mut args = Vec::new();
+        parms.encode(&mut args);
+        let results = self.core(CREATE_LINK, &args).await?;
+        Ok(CreateLinkResp::decode(&results)?)
+    }
+
+    pub async fn device_lock(
+        &mut self,
+        lid: i32,
+        waitlock: bool,
+        lock_timeout_ms: u32,
+    ) -> Result<u32> {
+        let mut args = Vec::new();
+        DeviceLockParms {
+            lid,
+            flags: if waitlock { OP_FLAG_WAITLOCK } else { 0 },
+            lock_timeout_ms,
+        }
+        .encode(&mut args);
+        let results = self.core(DEVICE_LOCK, &args).await?;
+        Ok(decode_device_error(&results)?)
+    }
+
+    pub async fn device_unlock(&mut self, lid: i32) -> Result<u32> {
+        let mut args = Vec::new();
+        xdr::put_i32(&mut args, lid);
+        let results = self.core(DEVICE_UNLOCK, &args).await?;
+        Ok(decode_device_error(&results)?)
+    }
+
+    /// Like device_write but carrying waitlock and a lock timeout, for
+    /// exercising the I/O lock gate.
+    pub async fn device_write_flags(
+        &mut self,
+        lid: i32,
+        data: &[u8],
+        flags: u32,
+        lock_timeout_ms: u32,
+    ) -> Result<DeviceWriteResp> {
+        let parms = DeviceWriteParms {
+            lid,
+            io_timeout_ms: 0,
+            lock_timeout_ms,
+            flags,
+            data: data.to_vec(),
+        };
+        let mut args = Vec::new();
+        parms.encode(&mut args);
+        let results = self.core(DEVICE_WRITE, &args).await?;
+        Ok(DeviceWriteResp::decode(&results)?)
+    }
+}
+
+/// One-shot device_abort over its own connection to the abort channel —
+/// which is the point: it must get through while the core channel is busy.
+pub async fn device_abort(host: &str, abort_port: u16, lid: i32) -> Result<u32> {
+    let mut client = Vxi11Client::connect(host, abort_port).await?;
+    let mut args = Vec::new();
+    xdr::put_i32(&mut args, lid);
+    match client
+        .call(DEVICE_ASYNC_PROG, DEVICE_ASYNC_VERS, DEVICE_ABORT, &args)
+        .await?
+    {
+        Reply::Success(results) => Ok(decode_device_error(&results)?),
+        other => anyhow::bail!("abort call failed at the RPC layer: {other:?}"),
     }
 }
 

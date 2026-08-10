@@ -11,21 +11,26 @@
 // to the bus for that operation and the daemon default restored after, so a
 // slow screen dump and a fast query stop sharing one global number.
 //
-// Not yet here, refused honestly rather than stubbed: locking (device_lock
-// answers 8, operation not supported; create_link with lockDevice set is
-// likewise refused — granting a lock nothing enforces would be a plausible
-// lie), the interrupt channel (8), device_docmd (8), and the abort channel
-// (abortPort is reported as 0, where a conforming client's connect fails
-// loudly). Each lands in its own phase of docs/VXI11-PLAN.md.
+// Locking rides the daemon-wide registry (exclusive, per-link, non-nesting
+// — RULE B.6.72 — and coherent with HiSLIP viLocks on the same
+// instrument), and the abort channel is real: DEVICE_ASYNC on its own
+// port, terminating in-flight operations at their nearest safe point. Not
+// yet here, refused honestly rather than stubbed: the interrupt channel
+// and device_docmd (both error 8), each a later phase of
+// docs/VXI11-PLAN.md.
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::BufStream;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
+
+use crate::frontend::lock::{self, LockRegistry};
 
 use super::messages::*;
 use super::rpc;
@@ -52,6 +57,12 @@ pub struct Config {
     /// The PAD `inst0` and bare `gpib0` resolve to — the daemon's
     /// `--default-address`, same convention as the HiSLIP sub-addresses.
     pub default_pad: u8,
+    /// The lock registry this server enforces — the same one every other
+    /// front-end consults, passed in by the daemon (see hislip's Config for
+    /// the reasoning). VXI-11 locks are exclusive, per-link, non-nesting
+    /// (RULE B.6.72); the identities are namespaced so a HiSLIP session and
+    /// a VXI-11 link can never collide.
+    pub locks: Arc<LockRegistry>,
 }
 
 impl Default for Config {
@@ -61,6 +72,7 @@ impl Default for Config {
             max_links: 64,
             default_io_timeout_ms: 3000,
             default_pad: 0,
+            locks: Arc::new(LockRegistry::new()),
         }
     }
 }
@@ -111,7 +123,55 @@ pub fn parse_device_name(name: &str, default_pad: u8) -> Result<u8, ErrorCode> {
 }
 
 struct Link {
+    lid: i32,
     instrument: Arc<Instrument>,
+    /// An abortable operation is running on this link right now. device_abort
+    /// only terminates an *in-progress* call (OBSERVATION B.6.24); one that
+    /// lands between calls is a no-op, not a poison pill for the next.
+    in_flight: AtomicBool,
+    /// Set by device_abort while `in_flight`; consumed (or discarded) when
+    /// the operation it targeted finishes.
+    aborted: AtomicBool,
+    /// Wakes waits that hold no bus transaction (the lock wait). Bus reads
+    /// notice `aborted` between poll slices instead — a slice, once started,
+    /// is never torn down mid-flight.
+    abort_notify: Notify,
+}
+
+impl Link {
+    fn holder(&self) -> lock::HolderId {
+        lock::vxi11_id(self.lid)
+    }
+
+    fn resource(&self) -> String {
+        self.instrument.resource_key()
+    }
+}
+
+/// Marks the link's abortable operation window. Dropping it closes the
+/// window and discards any abort that was not consumed — the call it
+/// targeted is over, and RULE B.6.24 does not let it outlive that call.
+struct OpWindow<'a>(&'a Link);
+
+impl<'a> OpWindow<'a> {
+    fn open(link: &'a Link) -> Self {
+        link.in_flight.store(true, Ordering::Release);
+        Self(link)
+    }
+
+    /// Did an abort land during this window? Consuming it here (rather than
+    /// on drop) lets the operation shape its reply — RULE B.6.21/B.6.30 want
+    /// the transferred byte count and partial data reported even on abort.
+    fn take_abort(&self) -> bool {
+        self.0.aborted.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for OpWindow<'_> {
+    fn drop(&mut self) {
+        self.0.aborted.store(false, Ordering::Release);
+        self.0.in_flight.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -125,19 +185,32 @@ struct Shared {
     config: Config,
     links: Mutex<LinkTable>,
     next_lid: AtomicI32,
+    /// Where the abort listener answers, reported in every Create_LinkResp.
+    abort_port: u16,
 }
 
 /// Server entry point. `instrument_for` maps a parsed PAD to the instrument
-/// handle serving it.
+/// handle serving it. The abort channel (DEVICE_ASYNC) is bound alongside on
+/// an ephemeral port of the same address; clients learn it from create_link.
 pub async fn run<F>(listener: TcpListener, config: Config, instrument_for: F) -> io::Result<()>
 where
     F: Fn(u8) -> Arc<Instrument> + Send + Sync + 'static,
 {
-    info!("VXI-11 core listening on {}", listener.local_addr()?);
+    let core_addr = listener.local_addr()?;
+    let abort_listener = TcpListener::bind((core_addr.ip(), 0)).await?;
+    let abort_port = abort_listener.local_addr()?.port();
+    info!("VXI-11 core listening on {core_addr}, abort channel on port {abort_port}");
     let shared = Arc::new(Shared {
         config,
         links: Mutex::new(LinkTable::default()),
         next_lid: AtomicI32::new(1),
+        abort_port,
+    });
+    let abort_shared = shared.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_abort_channel(abort_listener, abort_shared).await {
+            warn!("vxi11 abort channel died: {e:#}");
+        }
     });
     let instrument_for = Arc::new(instrument_for);
     loop {
@@ -155,6 +228,72 @@ where
     }
 }
 
+/// The abort channel: DEVICE_ASYNC, one procedure. Kept apart from the core
+/// dispatch on purpose — it must answer while a core call is blocked on the
+/// bus, which is the whole reason it exists (§B.6.16).
+async fn run_abort_channel(listener: TcpListener, shared: Arc<Shared>) -> io::Result<()> {
+    loop {
+        let (stream, addr) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            let mut stream = BufStream::new(stream);
+            loop {
+                let record = match rpc::read_record(&mut stream, 4096).await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => break,
+                    Err(e) => {
+                        debug!("vxi11 abort connection error: {e} addr={addr}");
+                        break;
+                    }
+                };
+                let reply = match rpc::decode_call(&record) {
+                    Ok((header, args)) => abort_dispatch(&shared, header, args),
+                    Err(rpc::CallError::RpcVersion { xid, .. }) => rpc::reply_rpc_mismatch(xid),
+                    Err(e) => {
+                        debug!("vxi11 abort channel: {e}");
+                        break;
+                    }
+                };
+                if rpc::write_record(&mut stream, &reply).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn abort_dispatch(shared: &Shared, header: rpc::CallHeader, args: &[u8]) -> Vec<u8> {
+    let xid = header.xid;
+    if header.prog != DEVICE_ASYNC_PROG {
+        return rpc::reply_prog_unavail(xid);
+    }
+    if header.vers != DEVICE_ASYNC_VERS {
+        return rpc::reply_prog_mismatch(xid, DEVICE_ASYNC_VERS, DEVICE_ASYNC_VERS);
+    }
+    if header.proc != DEVICE_ABORT {
+        return rpc::reply_proc_unavail(xid);
+    }
+    let Ok(lid) = xdr::Cursor::new(args).i32() else {
+        return rpc::reply_garbage_args(xid);
+    };
+    let error = match link_for(shared, lid) {
+        // RULE B.6.106/OBSERVATION B.6.24: terminate the in-progress call if
+        // there is one; success either way means "delivered", nothing more
+        // (OBSERVATION B.6.25). RULE B.6.109: no lock check here.
+        Some(link) => {
+            if link.in_flight.load(Ordering::Acquire) {
+                link.aborted.store(true, Ordering::Release);
+                link.abort_notify.notify_one();
+                debug!("vxi11 abort delivered to link {lid}");
+            }
+            ErrorCode::NoError
+        }
+        None => ErrorCode::InvalidLinkIdentifier,
+    };
+    rpc::reply_success(xid, &encode_device_error(error.as_u32()))
+}
+
 async fn serve_connection<F>(
     stream: tokio::net::TcpStream,
     shared: Arc<Shared>,
@@ -167,7 +306,7 @@ where
     // Links created on this connection, destroyed with it: the channel
     // closing is how a crashed client's links are recovered (§B.2).
     let mut owned: Vec<i32> = Vec::new();
-    let result = loop {
+    let connection_result = loop {
         // The record cap is deliberately above maxRecvSize plus envelope:
         // RULE B.6.16 answers an over-limit device_write with error 5, which
         // requires *reading* the offending record first. Twice the limit is
@@ -198,11 +337,19 @@ where
         };
         rpc::write_record(&mut stream, &reply).await?;
     };
-    let mut links = shared.links.lock().unwrap();
-    for lid in owned {
-        links.links.remove(&lid);
+    // RULE B.6.77: locks are tied to the core connection — a broken
+    // connection releases everything its links held, then the links go too.
+    let removed: Vec<Arc<Link>> = {
+        let mut links = shared.links.lock().unwrap();
+        owned
+            .iter()
+            .filter_map(|lid| links.links.remove(lid))
+            .collect()
+    };
+    for link in removed {
+        shared.config.locks.release_all(link.holder());
     }
-    result
+    connection_result
 }
 
 /// Dispatch one call. `Err(xid)` means the arguments did not decode —
@@ -233,7 +380,9 @@ where
     let results = match header.proc {
         CREATE_LINK => {
             let parms = CreateLinkParms::decode(args).map_err(garbage)?;
-            create_link(shared, instrument_for, owned, parms).encode()
+            create_link(shared, instrument_for, owned, parms)
+                .await
+                .encode()
         }
         DEVICE_WRITE => {
             match DeviceWriteParms::decode(args, shared.config.max_recv_size) {
@@ -263,26 +412,49 @@ where
         }
         DESTROY_LINK => {
             let lid = xdr::Cursor::new(args).i32().map_err(garbage)?;
-            let mut links = shared.links.lock().unwrap();
+            let removed = {
+                let mut links = shared.links.lock().unwrap();
+                links.links.remove(&lid)
+            };
             // RULE B.6.10: an unknown lid is 4. RULE B.6.11: destroying a
             // link touches no device state, so there is no bus traffic here.
-            let error = if links.links.remove(&lid).is_some() {
+            // RULE B.6.9.2: its lock goes with it. RULE B.6.12: abort does
+            // not touch this (no OpWindow).
+            let error = if let Some(link) = removed {
                 owned.retain(|&l| l != lid);
+                shared.config.locks.release_all(link.holder());
                 ErrorCode::NoError
             } else {
                 ErrorCode::InvalidLinkIdentifier
             };
             encode_device_error(error.as_u32())
         }
-        DEVICE_LOCK | DEVICE_ENABLE_SRQ | CREATE_INTR_CHAN | DESTROY_INTR_CHAN => {
-            // Honest refusals for later phases (locking, SRQ). The argument
-            // is not even decoded: the answer does not depend on it.
-            encode_device_error(ErrorCode::OperationNotSupported.as_u32())
+        DEVICE_LOCK => {
+            let parms = DeviceLockParms::decode(args).map_err(garbage)?;
+            encode_device_error(device_lock(shared, parms).await.as_u32())
         }
         DEVICE_UNLOCK => {
-            // No locks exist yet, so no link holds one: 12 is the truthful
-            // answer the spec defines, not a stub.
-            encode_device_error(ErrorCode::NoLockHeldByThisLink.as_u32())
+            // RULE B.6.81: not abortable (no OpWindow).
+            let lid = xdr::Cursor::new(args).i32().map_err(garbage)?;
+            let error = match link_for(shared, lid) {
+                Some(link) => {
+                    let locks = &shared.config.locks;
+                    if locks.holds(&link.resource(), link.holder()) {
+                        locks.release(&link.resource(), link.holder());
+                        ErrorCode::NoError
+                    } else {
+                        // RULE B.6.80.
+                        ErrorCode::NoLockHeldByThisLink
+                    }
+                }
+                None => ErrorCode::InvalidLinkIdentifier,
+            };
+            encode_device_error(error.as_u32())
+        }
+        DEVICE_ENABLE_SRQ | CREATE_INTR_CHAN | DESTROY_INTR_CHAN => {
+            // Honest refusals for the interrupt-channel phase. The argument
+            // is not even decoded: the answer does not depend on it.
+            encode_device_error(ErrorCode::OperationNotSupported.as_u32())
         }
         DEVICE_DOCMD => {
             // Refused per-phase like the above, but with docmd's own
@@ -298,7 +470,7 @@ where
     Ok(rpc::reply_success(xid, &results))
 }
 
-fn create_link<F>(
+async fn create_link<F>(
     shared: &Shared,
     instrument_for: &F,
     owned: &mut Vec<i32>,
@@ -313,12 +485,7 @@ where
         abort_port: 0,
         max_recv_size: 0,
     };
-    if parms.lock_device {
-        // Phase 4 brings locking; granting a lock nothing enforces would be
-        // worse than refusing one.
-        return refuse(ErrorCode::OperationNotSupported);
-    }
-    let name = String::from_utf8_lossy(&parms.device);
+    let name = String::from_utf8_lossy(&parms.device).into_owned();
     let pad = match parse_device_name(&name, shared.config.default_pad) {
         Ok(pad) => pad,
         Err(e) => {
@@ -327,21 +494,132 @@ where
         }
     };
     let instrument = instrument_for(pad);
-    let mut links = shared.links.lock().unwrap();
-    if links.links.len() >= shared.config.max_links {
-        return refuse(ErrorCode::OutOfResources);
+    let lid = {
+        let mut links = shared.links.lock().unwrap();
+        if links.links.len() >= shared.config.max_links {
+            return refuse(ErrorCode::OutOfResources);
+        }
+        let lid = shared.next_lid.fetch_add(1, Ordering::Relaxed);
+        links.links.insert(
+            lid,
+            Arc::new(Link {
+                lid,
+                instrument,
+                in_flight: AtomicBool::new(false),
+                aborted: AtomicBool::new(false),
+                abort_notify: Notify::new(),
+            }),
+        );
+        owned.push(lid);
+        lid
+    };
+    // RULES B.6.3.1 and B.6.7: with lockDevice set, the lock is acquired —
+    // waiting up to lock_timeout — or no link comes into being. The link is
+    // inserted first because the lock needs its identity, and unwound on
+    // failure; the window where it exists unlocked is invisible to the
+    // client, which has no lid yet. OBSERVATION B.6.2: not abortable, there
+    // is nothing to name in a device_abort.
+    if parms.lock_device {
+        let link = link_for(shared, lid).expect("just inserted");
+        let granted = shared
+            .config
+            .locks
+            .request(
+                &link.resource(),
+                link.holder(),
+                "",
+                Duration::from_millis(u64::from(parms.lock_timeout_ms)),
+            )
+            .await;
+        if !granted.is_success() {
+            let mut links = shared.links.lock().unwrap();
+            links.links.remove(&lid);
+            owned.retain(|&l| l != lid);
+            return refuse(ErrorCode::DeviceLockedByAnotherLink);
+        }
     }
-    let lid = shared.next_lid.fetch_add(1, Ordering::Relaxed);
-    links.links.insert(lid, Arc::new(Link { instrument }));
-    owned.push(lid);
     debug!("vxi11 link {lid} created for {name:?}");
     CreateLinkResp {
         error: ErrorCode::NoError.as_u32(),
         lid,
-        // Phase 4 starts the abort listener; a conforming client that tries
-        // to abort meanwhile fails to connect, loudly.
-        abort_port: 0,
+        abort_port: shared.abort_port,
         max_recv_size: shared.config.max_recv_size,
+    }
+}
+
+async fn device_lock(shared: &Shared, parms: DeviceLockParms) -> ErrorCode {
+    // RULE B.6.73: unknown lid answers 4 before any lock work.
+    let Some(link) = link_for(shared, parms.lid) else {
+        return ErrorCode::InvalidLinkIdentifier;
+    };
+    let locks = &shared.config.locks;
+    let (resource, holder) = (link.resource(), link.holder());
+    // RULE B.6.72: VXI-11 locks do not nest — a re-lock by the holder is
+    // the same error a stranger gets.
+    if locks.holds(&resource, holder) {
+        return ErrorCode::DeviceLockedByAnotherLink;
+    }
+    // RULE B.6.74: without waitlock, one immediate attempt.
+    let timeout = if parms.flags & OP_FLAG_WAITLOCK != 0 {
+        Duration::from_millis(u64::from(parms.lock_timeout_ms))
+    } else {
+        Duration::ZERO
+    };
+    // RULE B.6.76: the wait is abortable. This wait holds no bus
+    // transaction, so it can be interrupted at any moment — the notify path
+    // rather than the between-slices flag check the bus operations use.
+    let window = OpWindow::open(&link);
+    let request = locks.request(&resource, holder, "", timeout);
+    tokio::pin!(request);
+    let granted = loop {
+        tokio::select! {
+            granted = &mut request => break granted,
+            _ = link.abort_notify.notified() => {
+                if window.take_abort() {
+                    return ErrorCode::Abort;
+                }
+                // A stale wakeup (permit left by an abort a previous window
+                // already discarded): keep waiting.
+            }
+        }
+    };
+    if granted.is_success() {
+        ErrorCode::NoError
+    } else {
+        // RULE B.6.75.
+        ErrorCode::DeviceLockedByAnotherLink
+    }
+}
+
+/// The lock gate every device I/O operation passes (RULES B.6.17/B.6.18 for
+/// write, B.6.25/B.6.26 for read, and their generic-op kin): proceed when
+/// the resource is free or ours; otherwise waitlock decides between waiting
+/// out lock_timeout and an immediate 11.
+async fn acquire_access(
+    shared: &Shared,
+    link: &Link,
+    flags: u32,
+    lock_timeout_ms: u32,
+) -> Result<(), ErrorCode> {
+    let locks = &shared.config.locks;
+    let (resource, holder) = (link.resource(), link.holder());
+    if locks.has_access(&resource, holder) {
+        return Ok(());
+    }
+    if flags & OP_FLAG_WAITLOCK == 0 {
+        return Err(ErrorCode::DeviceLockedByAnotherLink);
+    }
+    if locks
+        .wait_for_access_timeout(
+            &resource,
+            holder,
+            Duration::from_millis(u64::from(lock_timeout_ms)),
+        )
+        .await
+    {
+        Ok(())
+    } else {
+        Err(ErrorCode::DeviceLockedByAnotherLink)
     }
 }
 
@@ -364,11 +642,32 @@ async fn device_write(shared: &Shared, parms: DeviceWriteParms) -> DeviceWriteRe
             size: 0,
         };
     };
+    if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
+        return DeviceWriteResp {
+            error: e.as_u32(),
+            size: 0,
+        };
+    }
+    let window = OpWindow::open(&link);
     let send_eoi = parms.flags & OP_FLAG_END != 0;
     let mut bus = link.instrument.hold().await;
     bus.set_timeout(effective_timeout(&shared.config, parms.io_timeout_ms));
     let written = bus.write(&parms.data, send_eoi).await;
     bus.set_timeout(shared.config.default_io_timeout_ms);
+    drop(bus);
+    // RULE B.6.20/B.6.21: an abort during execution terminates the call with
+    // 23, still reporting the bytes transferred. A write is one indivisible
+    // bus transaction here, so "during" resolves at its end — the abort
+    // cannot tear the transfer down mid-handshake, only claim the verdict.
+    if window.take_abort() {
+        return DeviceWriteResp {
+            error: ErrorCode::Abort.as_u32(),
+            size: match &written {
+                Ok(()) => parms.data.len() as u32,
+                Err(_) => 0,
+            },
+        };
+    }
     match written {
         Ok(()) => DeviceWriteResp {
             error: ErrorCode::NoError.as_u32(),
@@ -411,9 +710,13 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
             data: Vec::new(),
         };
     }
+    if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
+        return fail(e);
+    }
     let termchr = (parms.flags & OP_FLAG_TERMCHRSET != 0).then_some(parms.term_char as u8);
     let clamped = (parms.request_size as usize).min(MAX_READ);
 
+    let window = OpWindow::open(&link);
     let mut bus = link.instrument.hold().await;
     // The terminator is per-operation in VXI-11 but persistent bus state to
     // the backend (and to the Prologix front-end's clients): save, set what
@@ -443,15 +746,40 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
         )));
     const SLICE_MS: u32 = 250;
     let mut data: Vec<u8> = Vec::new();
+    enum ReadEnd {
+        Terminated(u32),
+        Deadline,
+        Aborted,
+        Bus(anyhow::Error),
+    }
     let outcome = loop {
+        // RULE B.6.29: abort terminates the read — checked between slices,
+        // never inside one, so the bus transaction underway completes.
+        if window.take_abort() {
+            break ReadEnd::Aborted;
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            break Ok(0); // deadline passed with no termination condition
+            break ReadEnd::Deadline;
         }
         let slice = (remaining.as_millis() as u32).clamp(1, SLICE_MS);
         bus.set_timeout(slice);
+        let attempt_started = tokio::time::Instant::now();
         match bus.read(clamped - data.len()).await {
             Ok((chunk, end)) => {
+                // An empty attempt that returned well inside its slice — an
+                // adapter fast-failing, or a test double answering from
+                // memory — must not turn this loop into a spin: pace it out
+                // to the slice. This is also the loop's only guaranteed
+                // await point, and the abort check above depends on the
+                // executor getting a turn.
+                if chunk.is_empty() {
+                    let spent = attempt_started.elapsed();
+                    let slice_len = std::time::Duration::from_millis(u64::from(slice));
+                    if spent < slice_len {
+                        tokio::time::sleep(slice_len - spent).await;
+                    }
+                }
                 data.extend_from_slice(&chunk);
                 let mut reason = 0;
                 if end {
@@ -469,10 +797,10 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
                     // Terminated per RULE B.6.23 — or condition d, our
                     // buffer filled with reason 0, and the client comes
                     // back for the rest (OBSERVATION B.6.9).
-                    break Ok(reason);
+                    break ReadEnd::Terminated(reason);
                 }
             }
-            Err(e) => break Err(e),
+            Err(e) => break ReadEnd::Bus(e),
         }
     };
     bus.set_eos(saved_eos.0, saved_eos.1);
@@ -480,21 +808,25 @@ async fn device_read(shared: &Shared, parms: DeviceReadParms) -> DeviceReadResp 
     drop(bus);
 
     match outcome {
-        Ok(0) if data.len() < clamped => {
-            // No termination condition before the deadline. RULE B.6.27:
-            // error 15, the partial data included, reason 0.
-            DeviceReadResp {
-                error: ErrorCode::IoTimeout.as_u32(),
-                reason: 0,
-                data,
-            }
-        }
-        Ok(reason) => DeviceReadResp {
+        ReadEnd::Terminated(reason) => DeviceReadResp {
             error: ErrorCode::NoError.as_u32(),
             reason,
             data,
         },
-        Err(e) => {
+        // No termination condition before the deadline. RULE B.6.27:
+        // error 15, the partial data included, reason 0.
+        ReadEnd::Deadline => DeviceReadResp {
+            error: ErrorCode::IoTimeout.as_u32(),
+            reason: 0,
+            data,
+        },
+        // RULE B.6.29/B.6.30: error 23, and the bytes so far still go back.
+        ReadEnd::Aborted => DeviceReadResp {
+            error: ErrorCode::Abort.as_u32(),
+            reason: 0,
+            data,
+        },
+        ReadEnd::Bus(e) => {
             debug!("vxi11 device_read failed: {e:#}");
             fail(ErrorCode::IoError)
         }
@@ -508,10 +840,24 @@ async fn device_readstb(shared: &Shared, parms: DeviceGenericParms) -> DeviceRea
             stb: 0,
         };
     };
+    if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
+        return DeviceReadStbResp {
+            error: e.as_u32(),
+            stb: 0,
+        };
+    }
+    let window = OpWindow::open(&link);
     let mut bus = link.instrument.hold().await;
     bus.set_timeout(effective_timeout(&shared.config, parms.io_timeout_ms));
     let polled = bus.serial_poll().await;
     bus.set_timeout(shared.config.default_io_timeout_ms);
+    drop(bus);
+    if window.take_abort() {
+        return DeviceReadStbResp {
+            error: ErrorCode::Abort.as_u32(),
+            stb: 0,
+        };
+    }
     match polled {
         Ok(stb) => DeviceReadStbResp {
             error: ErrorCode::NoError.as_u32(),
@@ -531,6 +877,10 @@ async fn device_simple(shared: &Shared, proc: u32, parms: DeviceGenericParms) ->
     let Some(link) = link_for(shared, parms.lid) else {
         return ErrorCode::InvalidLinkIdentifier.as_u32();
     };
+    if let Err(e) = acquire_access(shared, &link, parms.flags, parms.lock_timeout_ms).await {
+        return e.as_u32();
+    }
+    let window = OpWindow::open(&link);
     let instr = &link.instrument;
     let outcome = match proc {
         DEVICE_TRIGGER => instr.trigger().await,
@@ -542,6 +892,9 @@ async fn device_simple(shared: &Shared, proc: u32, parms: DeviceGenericParms) ->
         DEVICE_LOCAL => instr.go_to_local().await,
         _ => unreachable!("dispatch sends only the four generic procedures"),
     };
+    if window.take_abort() {
+        return ErrorCode::Abort.as_u32();
+    }
     match outcome {
         Ok(()) => ErrorCode::NoError.as_u32(),
         Err(e) => {
