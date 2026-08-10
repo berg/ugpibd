@@ -18,6 +18,11 @@ reading a response. Non-TTY stdin is supported, so the client can be driven
 from a pipe or a script.
 .SH OPTIONS
 .TP
+.BR \-\-transport " " \fIhislip|vxi11|prologix\fR
+Front-end to speak (default hislip). VXI-11 and Prologix have a
+client-driven read, so \fB++read\fR works there \(em the flow for
+instruments that only produce output once addressed to talk.
+.TP
 .BI \-\-host " HOST"
 Host running
 .BR ugpibd .
