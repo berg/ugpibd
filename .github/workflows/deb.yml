@@ -29,6 +29,11 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_DEB_VERSION: "3.7.0"
 
+# Packaging only reads the checkout; artifacts move between jobs, not to the
+# API. A caller cannot grant more than this.
+permissions:
+  contents: read
+
 jobs:
   package:
     name: ${{ matrix.arch }}
@@ -188,8 +193,13 @@ jobs:
           sleep 2
           rpcinfo -p 127.0.0.1 | grep -q 395183
           # Withdraw on stop: the registration goes with the service.
+          # Not `! rpcinfo ... | grep -q`: errexit skips a negated command, so
+          # that form can never fail the step.
           sudo systemctl stop ugpibd-portmap
-          ! rpcinfo -p 127.0.0.1 | grep -q 395183
+          if rpcinfo -p 127.0.0.1 | grep -q 395183; then
+            echo "::error::portmap registration survived service stop"
+            exit 1
+          fi
 
           # Branch 2: no rpcbind -> serve port 111 ourselves.
           sudo systemctl disable --now rpcbind.socket rpcbind.service 2>/dev/null || true

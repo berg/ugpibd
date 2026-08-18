@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Nothing in CI writes to the repository or the API.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: fmt + clippy

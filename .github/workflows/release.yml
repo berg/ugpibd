@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Default for every job; the release job widens it to contents: write to
+# publish, and update-tap pushes with its own TAP_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -49,7 +54,7 @@ jobs:
           TAG=${GITHUB_REF_NAME}
           ARCHIVE="ugpibd-${TAG}-${{ matrix.target }}.tar.gz"
           tar czf "${ARCHIVE}" -C target/${{ matrix.target }}/release ugpibd ugpibd-scpi
-          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -80,7 +85,7 @@ jobs:
 
       - name: Extract version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v8
         with:
