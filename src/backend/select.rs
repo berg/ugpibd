@@ -153,7 +153,7 @@ pub fn resolve<'a>(
 ) -> Result<&'a DiscoveredAdapter> {
     let by_backend: Vec<&DiscoveredAdapter> = found
         .iter()
-        .filter(|a| backend.map_or(true, |id| a.kind.id() == id))
+        .filter(|a| backend.is_none_or(|id| a.kind.id() == id))
         .collect();
 
     let candidates: Vec<&DiscoveredAdapter> = match selector.port() {
