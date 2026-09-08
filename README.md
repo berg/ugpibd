@@ -54,7 +54,7 @@ sudo install -d /etc/apt/keyrings \
   && sudo apt install -y ugpibd
 ```
 
-**From source** (Rust 1.75+):
+**From source** (Rust 1.85+):
 
 ```bash
 cargo build --release

@@ -2,7 +2,7 @@
 name = "ugpibd"
 version = "0.7.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "GPL-3.0-or-later"
 description = "Userspace daemon for USB-GPIB adapters, with HiSLIP and Prologix TCP front-ends"
 
