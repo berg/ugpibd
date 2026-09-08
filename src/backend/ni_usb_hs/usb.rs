@@ -126,9 +126,10 @@ impl NiUsbTransport {
             .open()
             .wait()
             .context("failed to open NI USB device")?;
-        let interface = device.claim_interface(0).wait().context(
-            "failed to claim NI GPIB interface 0 — is the kernel ni_usb driver loaded? \
-             Blacklist it (see README) to use the userspace driver",
+        // Detach the kernel ni_usb_gpib driver if it got there first, then
+        // claim; see the 82357 transport for why this replaces a blacklist.
+        let interface = device.detach_and_claim_interface(0).wait().context(
+            "failed to claim NI GPIB interface 0 — is another process using the adapter?",
         )?;
         let eps = endpoints_for(pid);
         info!(

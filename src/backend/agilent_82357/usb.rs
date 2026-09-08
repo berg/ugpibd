@@ -369,10 +369,18 @@ pub async fn open_transport(
         .open()
         .wait()
         .context("failed to open USB device")?;
-    let interface = device.claim_interface(0).wait().context(
-        "failed to claim interface 0 — is the kernel driver loaded? \
-         See blacklist instructions in README.md",
-    )?;
+    // Detach the kernel GPIB driver (drivers/gpib, or an out-of-tree
+    // linux-gpib) if it got to the adapter first, then claim. Per interface,
+    // not per module, so adapters ugpibd is not driving stay with the kernel;
+    // this is what replaces the old modprobe blacklist. nusb remembers the
+    // detach and reattaches the kernel driver when the last handle on the
+    // interface is dropped, so a clean daemon exit hands the adapter back;
+    // only a killed daemon leaves it unbound until replug. On macOS nothing
+    // binds these adapters and this is a plain claim.
+    let interface = device
+        .detach_and_claim_interface(0)
+        .wait()
+        .context("failed to claim interface 0 — is another process using the adapter?")?;
 
     let transport = UsbTransport::new(
         device,

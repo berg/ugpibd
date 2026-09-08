@@ -60,7 +60,7 @@ pub fn put_bool(buf: &mut Vec<u8>, v: bool) {
 pub fn put_opaque(buf: &mut Vec<u8>, data: &[u8]) {
     put_u32(buf, data.len() as u32);
     buf.extend_from_slice(data);
-    buf.extend(std::iter::repeat(0u8).take(pad_of(data.len())));
+    buf.extend(std::iter::repeat_n(0u8, pad_of(data.len())));
 }
 
 /// A string is encoded exactly like variable-length opaque (RFC 4506 §4.11).

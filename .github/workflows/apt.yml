@@ -155,9 +155,8 @@ jobs:
               printf "Types: deb\nURIs: file:///repo\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/ugpibd.asc\n" \
                 > /etc/apt/sources.list.d/ugpibd.sources
               apt-get update
-              apt-get install -y ugpibd ugpibd-blacklist-linux-gpib
-              dpkg -l ugpibd ugpibd-blacklist-linux-gpib
-              test -f /etc/modprobe.d/ugpibd-blacklist-linux-gpib.conf
+              apt-get install -y ugpibd
+              dpkg -l ugpibd
               ugpibd --help > /dev/null
               ugpibd --backend list
             '

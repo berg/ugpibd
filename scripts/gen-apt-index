@@ -79,14 +79,6 @@ EOF</code></pre>
     <td><code>ugpibd</code></td>
     <td>The daemon and the <code>ugpibd-scpi</code> client, udev rules, systemd units.</td>
   </tr>
-  <tr>
-    <td><code>ugpibd-blacklist-linux-gpib</code></td>
-    <td>
-      Optional. Blacklists the kernel GPIB drivers, for when they claim the
-      adapter first &mdash; the symptom is
-      <code>failed to claim interface 0</code>.
-    </td>
-  </tr>
 </table>
 
 <h2>Supported distributions</h2>
