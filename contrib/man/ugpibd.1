@@ -139,11 +139,6 @@ Grants the
 group access to supported adapters, and triggers
 .I ugpibd\-hotplug.service
 on attach.
-.TP
-.I /etc/modprobe.d/ugpibd\-blacklist\-linux\-gpib.conf
-Shipped by the optional
-.I ugpibd\-blacklist\-linux\-gpib
-package. Stops the kernel GPIB drivers claiming these adapters.
 .SH STARTING THE DAEMON
 The packaged service does not start on its own. Three options:
 .TP
@@ -166,13 +161,11 @@ gives up if none is found.
 .SH DIAGNOSTICS
 .TP
 .B failed to claim interface 0
-A kernel GPIB driver has claimed the adapter. Install the
-.I ugpibd\-blacklist\-linux\-gpib
-package, or blacklist
-.I agilent_82357a
-and
-.I ni_usb_gpib
-by hand.
+Another process holds the adapter: a second
+.BR ugpibd ,
+or a linux-gpib userspace tool. The kernel GPIB drivers
+.RI ( agilent_82357a ", " ni_usb_gpib )
+are detached from the adapter automatically and do not cause this.
 .SH BUGS
 Report bugs at https://github.com/berg/ugpibd/issues \- never to the linux-gpib
 project or the kernel

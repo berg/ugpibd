@@ -225,41 +225,6 @@ jobs:
           name: ugpibd-bin-linux-${{ matrix.arch }}
           path: ${{ env.BIN_TAR }}
 
-  blacklist:
-    name: blacklist (all)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Build package
-        run: |
-          if [ "${{ inputs.snapshot }}" = "true" ]; then
-            BASE=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-            FULL_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
-            export DEB_VERSION="${BASE}~ci${{ github.run_number }}+g${FULL_SHA:0:8}-1"
-            echo "snapshot version: ${DEB_VERSION}"
-          fi
-          ./scripts/build-blacklist-deb .
-
-      - name: Lint and inspect package
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lintian
-          lintian --fail-on error --tag-display-limit 0 ./*_all.deb
-          dpkg-deb -c ./*_all.deb
-          # Guard against a builder umask leaking into the shipped directory
-          # modes: 0775 on /usr, or 0700 on the staging root, would be applied
-          # to the real directories on install.
-          if dpkg-deb -c ./*_all.deb | grep -vE '^(drwxr-xr-x|-rw-r--r--)'; then
-            echo "unexpected permissions in blacklist package" >&2
-            exit 1
-          fi
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ugpibd-deb-blacklist
-          path: ./*_all.deb
-
   macos-binaries:
     name: macos binaries (arm64)
     runs-on: macos-latest

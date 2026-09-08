@@ -39,8 +39,7 @@ async-trait = "0.1"
 # would otherwise spend their timeouts in real time.
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 
-# Debian packaging. Built with `cargo deb`; see scripts/build-blacklist-deb for
-# the companion ugpibd-blacklist-linux-gpib package.
+# Debian packaging. Built with `cargo deb`.
 #
 # Maintainer is deliberately the GitHub noreply alias, matching the address in
 # the git history. Do not let this fall through to cargo-deb's default, which
@@ -55,7 +54,6 @@ copyright = "2026 ugpibd contributors; embedded firmware (C) Agilent/Keysight"
 section = "electronics"
 priority = "optional"
 depends = "$auto, adduser, udev, init-system-helpers (>= 1.54)"
-suggests = "ugpibd-blacklist-linux-gpib"
 extended-description = """\
 ugpibd drives USB-to-GPIB adapters entirely from userspace over usbfs, with no \
 kernel GPIB driver involved, and exposes the attached instruments over TCP via \
@@ -72,8 +70,8 @@ The packaged service does not start on its own. Set UGPIBD_AUTOSTART=yes in \
 /etc/default/ugpibd to start it when an adapter is plugged in, or run \
 `systemctl enable ugpibd` to start it at boot regardless of hardware.
 .
-If the kernel GPIB drivers claim the adapter first ("failed to claim interface \
-0"), the optional ugpibd-blacklist-linux-gpib package blacklists them."""
+The kernel GPIB drivers (drivers/gpib, or out-of-tree linux-gpib) need no \
+blacklisting: ugpibd detaches them from the adapter it opens."""
 assets = [
     ["target/release/ugpibd", "usr/bin/", "755"],
     ["target/release/ugpibd-scpi", "usr/bin/", "755"],

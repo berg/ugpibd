@@ -245,32 +245,11 @@ name (`1-1.2`), on macOS the IOKit location id (`0x03440000`). It is stable
 across replug into the same port and across firmware reload. One service
 instance drives one adapter, so put `--usb-port` in `UGPIBD_OPTS`.
 
-## If the kernel driver interferes (Linux)
+## Kernel GPIB drivers (Linux)
 
-If you see "failed to claim interface 0", the matching kernel GPIB driver has
-claimed the adapter: `agilent_82357a` for the 82357A/B, `ni_usb_gpib` for the NI
-adapters. These ship in the kernel (`drivers/gpib`, mainline since Linux 6.13)
-and in out-of-tree linux-gpib builds.
-
-On Debian/Ubuntu, install the optional package:
-
-```bash
-sudo apt install ugpibd-blacklist-linux-gpib
-```
-
-Or do it by hand:
-
-```bash
-printf 'blacklist agilent_82357a\nblacklist ni_usb_gpib\n' \
-    | sudo tee /etc/modprobe.d/ugpibd-blacklist-linux-gpib.conf
-sudo modprobe -r agilent_82357a ni_usb_gpib
-```
-
-A deliberate `modprobe` still works either way, so this does not permanently
-lock you out of linux-gpib. Note that blacklisting `ni_usb_gpib` also disables
-the kernel driver for the NI GPIB-USB-B, which ugpibd does **not** support —
-module granularity is coarser than device granularity, so it cannot be
-exempted.
+ugpibd detaches the kernel GPIB driver (`agilent_82357a`, `ni_usb_gpib`) from
+the adapter it opens, so nothing needs blacklisting. The adapter goes back to
+the kernel driver when ugpibd exits.
 
 ## Origin and relationship to linux-gpib
 
