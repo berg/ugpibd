@@ -5,6 +5,79 @@ as its release notes, so it is written for someone deciding whether to upgrade
 rather than for someone reading the diff — `scripts/release` refuses to tag a
 version that has no entry here.
 
+## v0.8.0 — 2026-09-09
+
+Correctness work on the NI backend. A serial poll could wedge the bus until
+the daemon was restarted, reads could lose bytes without reporting it, and on
+some instruments the poll never worked at all. All three are fixed, on both NI
+adapters. Linux packaging loses the blacklist package.
+
+### The bus no longer wedges after a failed serial poll
+
+One `device_readstb` against an instrument that did not answer left the whole
+bus in serial-poll mode with the adapter's timeout still running, and every
+operation after it failed — on new links too — until the daemon was restarted.
+Three things caused it and all three are fixed: the adapter's deadline is now
+floored to a step at or below the daemon's own wait rather than rounded up past
+it, a reply that answers an earlier request is discarded rather than parsed as
+the current one, and a poll restores the bus and re-arms SRQ whether or not the
+status byte arrives.
+
+### The serial poll works
+
+A serial poll is the one read whose byte does not exist until ATN falls, and
+the controller chip is only ready to accept while ATN is asserted. Between
+go-to-standby and the adapter's read op it is not, so an instrument that
+sources its status byte once and gives up lost it there and the poll timed out
+having transferred nothing. The acceptor is now made ready while ATN is still
+asserted and the byte is taken from the chip directly.
+
+This is the difference between polling working and not working at all on some
+instruments: against a Tabor 8026, NI's own driver returns `EABO` where this
+release returns the status byte.
+
+### Reads no longer lose bytes silently
+
+Two separate causes, both of which returned short data with a matching byte
+count and no error: the read request wrote an auxiliary command that discards a
+byte the chip is already holding, and a read re-addressed a bus that was
+already addressed the way it wanted, which destroys a held byte. A read now
+skips redundant addressing, and the SRQ monitor is re-armed only between
+operations rather than wherever the next bulk transfer happens to fall.
+
+### The kernel GPIB driver is detached automatically
+
+Both backends now claim the adapter with a detaching claim, so an in-tree
+`drivers/gpib` or out-of-tree linux-gpib is unbound from that one interface and
+rebound when the daemon exits cleanly. On macOS nothing binds these adapters
+and it degrades to a plain claim.
+
+**Upgrade note:** this makes the `ugpibd-blacklist-linux-gpib` package
+redundant and it has been removed. It was per module, so blacklisting
+`ni_usb_gpib` also took the kernel driver away from the unsupported
+GPIB-USB-B, and it only helped if installed before the adapter was plugged in.
+If you have it installed you can remove it.
+
+### Also
+
+- `--hislip-port 0 --vxi11-port 9010` is no longer refused as "no front end
+  enabled" — it had been, while still serving VXI-11 on 9010
+- an empty serial poll is an error rather than a fabricated status of zero, and
+  a read reports bus faults instead of returning them as an empty read the
+  VXI-11 loop retries until the client's deadline
+- the 82357 sends SPD/UNT on its poll failure path
+- MSRV is now 1.85; nusb 0.2.7
+
+### Known limitation
+
+A read issued well after the query loses its first byte on a Tabor 8026, about
+2.5% of the time on a GPIB-USB-HS+ and 5.6% on a GPIB-USB-HS. This is the
+adapter firmware clearing the chip's holdoffs after ATN falls rather than
+before, so the acceptor is briefly not ready; NI's own driver loses the same
+byte on the same instrument, and an Agilent 82357 is unaffected. The comments
+on `read` and `write` in the NI backend record the mechanism and the
+rearrangements that do not fix it.
+
 ## v0.7.0 — 2026-08-10
 
 A full VXI-11 front-end beside HiSLIP. VXI-11 is the highest-fidelity
