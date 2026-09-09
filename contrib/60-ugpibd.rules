@@ -12,6 +12,13 @@
 #   0957:0518  Agilent 82357B (pre-firmware)   0957:0718  82357B (ready)
 #   3923:709b  NI GPIB-USB-HS                  3923:7618  NI GPIB-USB-HS+
 #   3923:725c  KUSB-488A                       3923:725d  MC-USB-488
+#
+# USBTMC instruments have no id table: they are matched by interface class
+# (fe = application specific, subclass 03 = USBTMC, any protocol), using the
+# ID_USB_INTERFACES string that systemd's 50-udev-default.rules imports for
+# every usb_device before this file runs. Note this gives the ugpibd group
+# 0660 on every USB instrument on the box, which is also what pyvisa-py on the
+# same machine needs; a later rule in /etc/udev/rules.d/ can widen it.
 
 # Device permissions. GROUP is the daemon's own group rather than plugdev, so
 # running ugpibd as a service does not hand it every plugdev device on the box.
@@ -19,6 +26,7 @@
 # is what makes running ugpibd by hand work without sudo.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0007|0107|0518|0718", MODE="0660", GROUP="ugpibd", TAG+="uaccess"
 SUBSYSTEM=="usb", ATTR{idVendor}=="3923", ATTR{idProduct}=="709b|7618|725c|725d", MODE="0660", GROUP="ugpibd", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:fe03??:*", MODE="0660", GROUP="ugpibd", TAG+="uaccess"
 
 # Optional autostart. These pull in ugpibd-hotplug.service, which starts the
 # daemon only if UGPIBD_AUTOSTART=yes is set in /etc/default/ugpibd; otherwise
@@ -30,3 +38,4 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="3923", ATTR{idProduct}=="709b|7618|725c|725d"
 # daemon mid-upload every time.
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0957", ATTR{idProduct}=="0007|0107|0518|0718", TAG+="systemd", ENV{SYSTEMD_WANTS}="ugpibd-hotplug.service"
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="3923", ATTR{idProduct}=="709b|7618|725c|725d", TAG+="systemd", ENV{SYSTEMD_WANTS}="ugpibd-hotplug.service"
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:fe03??:*", TAG+="systemd", ENV{SYSTEMD_WANTS}="ugpibd-hotplug.service"

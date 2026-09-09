@@ -81,6 +81,26 @@ item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
 
+## 6. USBTMC backend: untested, and one instrument per process
+
+**Now:** `--backend usbtmc` drives any USB488 interface through the GPIB
+trait, written against the specification and not yet run on hardware. The
+trait's primary address is ignored: a USB488 interface is one instrument, so
+`gpib0,5` and `gpib0,14` reach the same device. The lock registry keys on the
+address, so two clients using different addresses for the same USBTMC
+instrument do not contend for a lock.
+
+**Why:** the trait was shaped by adapters that address a bus. Threading a
+"no addressing" notion through every front-end for one backend was not worth
+it before the backend had been seen working.
+
+**To finish:** verify on a real instrument (`docs/HARDWARE-TEST.md`, USBTMC
+section); if the pad/lock mismatch bites, give `Instrument::resource_key` a
+backend-supplied form so every address on a single-device backend maps to one
+key. Hotplug autostart also matches USBTMC devices now, so a host with several
+instruments and `UGPIBD_AUTOSTART=yes` needs the one-process-per-device
+service template that does not exist yet.
+
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 
 Removed as an open gap, recorded because the failure mode is invisible and

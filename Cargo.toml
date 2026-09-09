@@ -61,17 +61,17 @@ HiSLIP and VXI-11 servers (either reachable with an ordinary pyvisa resource \
 string; VXI-11 additionally covers instruments that only produce output once \
 addressed to talk) and an optional Prologix-compatible line protocol.
 .
-Supported adapters: Agilent/Keysight 82357B, NI GPIB-USB-HS, and -- so far \
-untested on hardware -- the Agilent 82357A, NI GPIB-USB-HS+, KUSB-488A and \
-MC-USB-488. Firmware for the Agilent adapters is embedded and uploaded \
-automatically.
+Supported adapters: Agilent/Keysight 82357B and 82357A, NI GPIB-USB-HS and \
+HS+, and -- so far untested on hardware -- the KUSB-488A and MC-USB-488. \
+Firmware for the Agilent adapters is embedded and uploaded automatically. \
+Any USBTMC/USB488 instrument can also be served directly (untested).
 .
 The packaged service does not start on its own. Set UGPIBD_AUTOSTART=yes in \
 /etc/default/ugpibd to start it when an adapter is plugged in, or run \
 `systemctl enable ugpibd` to start it at boot regardless of hardware.
 .
-The kernel GPIB drivers (drivers/gpib, or out-of-tree linux-gpib) need no \
-blacklisting: ugpibd detaches them from the adapter it opens."""
+The kernel drivers (drivers/gpib, out-of-tree linux-gpib, or usbtmc) need no \
+blacklisting: ugpibd detaches them from the device it opens."""
 assets = [
     ["target/release/ugpibd", "usr/bin/", "755"],
     ["target/release/ugpibd-scpi", "usr/bin/", "755"],
