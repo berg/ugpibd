@@ -506,74 +506,46 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         self.send_command(&cmd, true).await?;
         self.write_data_body(data, send_eoi).await?;
 
-        // Deliberately no bus turnaround here.
+        // EXPERIMENT, not shippable. Turning the bus around here — leaving
+        // the instrument addressed to talk — removes the ATN edge the first
+        // byte is lost at, and eliminates the loss: 0 of 360 delayed reads on
+        // both instruments against 9 of 360, and 14 read failures across six
+        // bench runs on a GPIB-USB-HS to zero.
         //
-        // Leaving the instrument addressed to talk after a write does make
-        // reads on a Tabor 8026 lossless — it removes the ATN edge the byte is
-        // lost at — but it breaks status
-        // reporting on instruments that behave correctly, which is a worse
-        // trade. An addressed talker starts delivering as soon as it has
-        // something to say, so its output queue drains into the transfer
-        // before the client asks: measured on a 34401A, MAV was reported in
-        // 1 of 8 queries and RQS in none, against 8 of 8 both with this
-        // removed and on the released build. A client waiting on SRQ would
-        // simply hang, and MAV is how VXI-11 clients synchronise.
+        // It cannot ship as written. Addressing an instrument to talk after a
+        // write that was not a query asks it to talk with an empty output
+        // queue, which is a protocol error: a 34401A logs -420 Query
+        // UNTERMINATED for each one. Measured, one bench run with this in
+        // place overflows its error queue — nineteen -420, a -410, then -350
+        // Too many errors — where the same run without it leaves the queue
+        // empty.
         //
-        // Re-measured on top of the SRQ re-arm fix, on both adapters, because
-        // that fix removed the mid-sequence control transfer the original
-        // measurement was taken through. The turnaround does fix the reads —
-        // 0 of 360 delayed reads on both instruments against 9 of 360, and on
-        // a GPIB-USB-HS it clears 13 read failures across 6 bench runs to 0 —
-        // but on that adapter it also breaks the poll: the 34401A reports bare
-        // MAV without RQS in 3 of 6 runs, a shape that never appears without
-        // it. A client waiting on SRQ hangs, which is worse than a short read,
-        // so it stays out until that is understood. The work is on
-        // `experiment/write-turnaround`. Shutting the acceptor (CMDR STOP)
-        // after the turnaround does not resolve it, and writes issued after a
-        // turnaround do land (verified 10 of 10), so neither is the cause.
+        // That error state is also the whole of the serial-poll failure this
+        // was parked for: the instrument then declines to assert SRQ on the
+        // next query's MAV transition and the poll reads bare MAV. The trace
+        // shows MAV clear both before and after *SRE 16, so the transition was
+        // available; inserting 200 ms of settling time passes eleven runs of
+        // eleven, which treats the symptom.
         //
-        // The 8026 keeps an intermittent first-byte loss on reads issued well
-        // after the query; see the module docs. The loss is flat across
-        // write-to-read delays from 50 ms to 3 s and absent at 0 and 20 ms —
-        // a byte already loaded when ATN went up, not a race.
+        // Restricting the turnaround to writes that expect a response fixes
+        // both — four clean runs, empty error queue — but identifying those
+        // means inspecting the payload for a question mark, which is a SCPI
+        // concern and does not belong in a GPIB transport. Rejected.
         //
-        // The byte is lost by the adapter's firmware, not by the instrument and
-        // not by the chip. It is left parked between operations — every read op
-        // exits with HALT set and an AUX_HLDI holdoff pending — and is re-armed
-        // only inside the *next* read op. The register semantics are confirmed
-        // by NI's own TNT5002 manual: CMDR[STOP] "sets the internal HALT
-        // signal... the local nba and rdy messages become false. HALT must be
-        // cleared to transfer data bytes", and AUXMR[HLDI] "prevents the
-        // Acceptor state machine from transitioning from ANRS to ACRS. NRFD#
-        // remains asserted".
-        //
-        // The order is wrong, and the TNT4882 manual says why. Under
-        // "Generating the rdy Message": the local rdy message becomes true "if
-        // ATN is asserted" OR if four conditions hold, the first two being that
-        // HALT is not set and the FIFOs are not full, the last two that no RFD
-        // holdoff is in progress.
-        //
-        // So while ATN is asserted the acceptor is ready whatever HALT and the
-        // holdoffs say. The instant ATN falls, readiness switches to depending
-        // on exactly the two things a finished read op leaves set. Clearing
-        // them therefore has to happen *while ATN is still asserted* — and the
-        // firmware does it afterwards, in the following operation, so rdy is
-        // false across the edge. An instrument that sources its first byte on
-        // that edge and moves on, as the 8026 does, loses it there.
-        //
-        // Arming from this side does not substitute either: RESET_FIFO precedes
-        // GO in the manual's own receive sequence, so anything accepted before
-        // the read op starts is discarded by design rather than by oversight.
-        //
-        // This is the same property `ready_acceptor` exploits for the serial
-        // poll, where arming under ATN is ours to do and does fix the byte.
-        //
-        // Hence an Agilent 82357 reads the same instrument cleanly while
-        // asserting ATN at the same point (a TMS9914 acceptor free-runs and
-        // simply takes the byte), and hence NI's own driver loses it too.
-        // Clearing HALT early from this side does not substitute: the read op
-        // owns the FIFO, so a free-running TNT delivers into nothing (280 of
-        // 360, first byte doubled).
+        // Shutting the acceptor with CMDR STOP after the turnaround was tried
+        // and does not help; writes issued after a turnaround do land, verified
+        // 10 of 10. Neither is the cause.
+        let want = ReadAddressing {
+            talker: Some(pad),
+            listener: self.my_pad,
+        };
+        self.send_command(
+            &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)],
+            true,
+        )
+        .await?;
+        self.restore_acceptor().await?;
+        self.read_addressing = Some(want);
         Ok(())
     }
 
@@ -1311,11 +1283,20 @@ mod tests {
     #[tokio::test]
     async fn write_addresses_then_sends_data() {
         // take_control, command, go_to_standby, data write -> 4 responses.
-        let t = MockTransport::new(vec![op_ok(), op_ok(), op_ok(), op_ok()]);
+        let t = MockTransport::new(vec![
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            reg_write_ok(1),
+        ]);
         let mut be = NiUsbHsBackend::new(t, 3000);
         be.write(23, b"*IDN?", true).await.unwrap();
         let writes = be.transport.written.lock().unwrap().clone();
-        assert_eq!(writes.len(), 4);
+        assert_eq!(writes.len(), 8);
         // command packet is the second transfer.
         let cmd = &writes[1];
         assert_eq!(cmd[0], NIUSB_COMMAND_OP);
@@ -1327,31 +1308,36 @@ mod tests {
         assert_eq!(&dw[8..13], b"*IDN?");
     }
 
-    /// A write must NOT leave the instrument addressed to talk.
+    /// On this branch a write DOES leave the instrument addressed to talk.
     ///
-    /// Doing so makes reads on a Tabor 8026 lossless, which is tempting, but an
-    /// addressed talker starts delivering as soon as it has something to say —
-    /// so its output queue drains into the transfer before the client asks, and
-    /// MAV and RQS stop being reported. Measured on a 34401A: RQS in 0 of 8
-    /// queries with the turnaround, 8 of 8 without. A client waiting on SRQ
-    /// hangs. Reads are addressed by `read`, which is where addressing belongs.
+    /// That is the experiment: it removes the ATN edge the first byte is lost
+    /// at. It is not shippable — see the comment in `write`.
     #[tokio::test]
-    async fn a_write_leaves_nobody_addressed_to_talk() {
-        let t = MockTransport::new(vec![op_ok(), op_ok(), op_ok(), op_ok()]);
+    async fn a_write_leaves_the_instrument_addressed_to_talk() {
+        let t = MockTransport::new(vec![
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            reg_write_ok(1),
+        ]);
         let mut be = NiUsbHsBackend::new(t, 3000);
         be.write(23, b"*IDN?", true).await.unwrap();
 
         let writes = be.transport.written.lock().unwrap().clone();
         let cmds: Vec<_> = writes.iter().filter(|w| w[0] == NIUSB_COMMAND_OP).collect();
-        assert_eq!(cmds.len(), 1, "a write addresses once: {writes:02x?}");
         assert_eq!(
-            &cmds[0][4..7],
-            &[GPIB_UNL, talk_address(0), listen_address(23)],
-            "the instrument is the listener, we are the talker"
+            cmds.len(),
+            2,
+            "a write addresses, then turns around: {writes:02x?}"
         );
-        assert!(
-            be.read_addressing.is_none(),
-            "a write must not leave read addressing standing"
+        assert_eq!(
+            &cmds[1][4..7],
+            &[GPIB_UNL, listen_address(0), talk_address(23)],
+            "the instrument is left as the talker"
         );
     }
 
