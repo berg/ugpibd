@@ -535,23 +535,6 @@ impl NiTransport for NiUsbTransport {
         let timeout = self.bulk_timeout();
         let mut io = self.io.lock().await;
 
-        // A pending SRQ report consumed the interrupt arming; this is the
-        // next moment the control transfer is safe (the I/O lock is held and
-        // no bulk pair is split). Re-arm before the transaction so a service
-        // request raised by *this* traffic is reported.
-        if self
-            .srq_needs_rearm
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            if let Err(e) =
-                vendor_control_in(&self.device, NI_USB_WAIT_REQUEST, 0x300, IBSTA_SRQI, 8).await
-            {
-                debug!("ni: lazy srq re-arm failed: {e:#}");
-            } else {
-                debug!("ni: srq monitor re-armed after a consumed report");
-            }
-        }
-
         if let Some(deadline) = io.abandoned.take() {
             // Wait out whatever the adapter was still doing when the last
             // caller gave up, or its reply arrives after the drain and answers
@@ -592,6 +575,31 @@ impl NiTransport for NiUsbTransport {
         anyhow::bail!(
             "ni bulk pipe is out of step: {MAX_RESYNC} replies in a row answered an earlier request"
         )
+    }
+
+    /// Re-arm the interrupt monitor if a report consumed the arming.
+    ///
+    /// Deliberately NOT done inside `transact`. This is a control transfer, and
+    /// one issued between the operations of an addressed read sequence — after
+    /// go-to-standby, before the read op — costs the first byte of the
+    /// response: measured on a Tabor 8026, 26 of 90 reads short with it there
+    /// against 8 of 90 without. The backend calls this at points where no
+    /// addressed sequence is in flight.
+    async fn rearm_srq_if_pending(&self) {
+        if !self
+            .srq_needs_rearm
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let _io = self.io.lock().await;
+        if let Err(e) =
+            vendor_control_in(&self.device, NI_USB_WAIT_REQUEST, 0x300, IBSTA_SRQI, 8).await
+        {
+            debug!("ni: lazy srq re-arm failed: {e:#}");
+        } else {
+            debug!("ni: srq monitor re-armed after a consumed report");
+        }
     }
 
     fn set_adapter_wait(&self, wait_ms: u32) {

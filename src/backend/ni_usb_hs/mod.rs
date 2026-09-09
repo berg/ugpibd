@@ -86,6 +86,12 @@ pub trait NiTransport: Send + Sync {
         self.bulk_in(resp_len).await
     }
 
+    /// Re-arm the interrupt monitor if a report consumed the arming.
+    ///
+    /// Called by the backend when no addressed sequence is in flight; see the
+    /// transport's implementation for why it must not happen inside one.
+    async fn rearm_srq_if_pending(&self) {}
+
     /// Tell the transport how long the adapter will now spend on a transfer
     /// before giving up, so its own waits outlast it.
     ///
@@ -491,6 +497,10 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if self.device_address.is_some() {
             anyhow::bail!("cannot write while in device mode: we are not the controller");
         }
+        // Same as `read`: a pending re-arm is a control transfer, and this is a
+        // point where nothing is addressed yet. Doing it here as well as in
+        // `read` keeps the monitor alive for a client that only ever writes.
+        self.transport.rearm_srq_if_pending().await;
         // Address controller as talker (pad 0), instrument as listener.
         let cmd = [GPIB_UNL, talk_address(self.my_pad), listen_address(pad)];
         self.send_command(&cmd, true).await?;
@@ -523,6 +533,9 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // the HiSLIP server ask for 64 KiB, one byte past the limit, which would
         // otherwise wrap the encoded count to zero and read nothing at all.
         let max_len = max_len.min(MAX_TRANSFER_LEN);
+        // Before anything is addressed: a pending re-arm is a control transfer,
+        // and one issued mid-sequence costs the first byte of the response.
+        self.transport.rearm_srq_if_pending().await;
         if self.device_address.is_some() {
             // We are not the controller. Sending command bytes is not ours to
             // do; just take whatever the controller addresses us to receive.
