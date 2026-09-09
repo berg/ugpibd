@@ -492,7 +492,15 @@ impl<T: Transport> GpibController<T> {
                 })
             }
             Err(e) => {
+                // Restore the bus before reporting the failure. Recovery
+                // pulses IFC, which unaddresses everyone, but SPD is what
+                // actually takes the bus out of serial-poll mode — without it
+                // an instrument that ignored its poll can leave every later
+                // read on the bus answering with status bytes.
                 self.recover_from_stall().await;
+                if let Err(e) = self.send_command_bytes(&[GPIB_SPD, GPIB_UNT]).await {
+                    tracing::debug!("serial poll: restoring the bus after a failure: {e:#}");
+                }
                 Err(e)
             }
         }
