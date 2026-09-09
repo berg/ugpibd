@@ -156,11 +156,43 @@ async fn main() -> Result<()> {
     }
     println!("loaded {} bytes of firmware, verified", FIRMWARE.len());
 
+    // Do not assume 0xA0. The board may strap A0..A2, and if you defeated the
+    // boot by strapping one of them high, the EEPROM is answering somewhere
+    // else right now. Probe before committing to an address.
+    let mut daddr = None;
+    for cand in [0xA0u8, 0xA2, 0xA4, 0xA6, 0xA8, 0xAA, 0xAC, 0xAE] {
+        cpu_reset(&dev, true).await?;
+        ram_write(&dev, ADDR_DADDR, &[cand]).await?;
+        ram_write(&dev, ADDR_STATUS, &[0x00]).await?;
+        ram_write(&dev, ADDR_HI, &[0x00, 0x00]).await?;
+        cpu_reset(&dev, false).await?;
+        let mut st = 0u8;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            st = ram_read(&dev, ADDR_STATUS, 1).await?[0];
+            if st != 0 {
+                break;
+            }
+        }
+        cpu_reset(&dev, true).await?;
+        if st == 0xAA {
+            let head = ram_read(&dev, ADDR_BUF, 1).await?[0];
+            println!("  {cand:#04x}: answered, first byte {head:#04x}");
+            daddr = Some(cand);
+            break;
+        }
+        println!("  {cand:#04x}: no answer (status {st:#04x})");
+    }
+    let daddr = daddr.context(
+        "no EEPROM answered on any address 0xA0..0xAE — if you are still holding a pin to          defeat the boot, release it now and re-run; the read needs the bus free",
+    )?;
+    println!("using device address {daddr:#04x}");
+
     let mut image = Vec::with_capacity(EEPROM_LEN);
     while image.len() < EEPROM_LEN {
         let base = image.len() as u16;
         cpu_reset(&dev, true).await?;
-        ram_write(&dev, ADDR_DADDR, &[0xA0]).await?;
+        ram_write(&dev, ADDR_DADDR, &[daddr]).await?;
         ram_write(&dev, ADDR_STATUS, &[0x00]).await?;
         ram_write(&dev, ADDR_HI, &[(base >> 8) as u8, (base & 0xff) as u8]).await?;
         cpu_reset(&dev, false).await?;
