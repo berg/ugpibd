@@ -94,6 +94,39 @@ async fn main() -> Result<()> {
                 Err(e) => println!("  vendor {req:#04x} ({what:<13}): {e}"),
             }
         }
+        // Does any request we already issue vary with wValue? A memory read
+        // must; a fixed status reply will not. Only requests this driver
+        // already sends in normal operation are tried here.
+        println!("  -- address sensitivity of known requests --");
+        for req in [0x40u8, 0x41, 0x48, 0x4b] {
+            let mut replies = Vec::new();
+            for v in [0x0000u16, 0x1000, 0x8000] {
+                let r = dev
+                    .control_in(
+                        nusb::transfer::ControlIn {
+                            control_type: nusb::transfer::ControlType::Vendor,
+                            recipient: nusb::transfer::Recipient::Device,
+                            request: req,
+                            value: v,
+                            index: 0,
+                            length: 16,
+                        },
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap_or_default();
+                replies.push(r);
+            }
+            let varies = replies.windows(2).any(|w| w[0] != w[1]);
+            println!(
+                "    {req:#04x}: {}",
+                if varies {
+                    format!("VARIES {:02x?}", replies)
+                } else {
+                    "constant".to_string()
+                }
+            );
+        }
         println!();
     }
     Ok(())
