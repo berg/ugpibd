@@ -20,6 +20,7 @@ use tracing::info;
 pub mod agilent_82357;
 pub mod ni_usb_hs;
 pub mod select;
+pub mod usbtmc;
 
 use select::UsbSelector;
 
@@ -349,6 +350,8 @@ pub enum BackendKind {
     Agilent82357b,
     Agilent82357a,
     NiUsbHs,
+    /// Any USBTMC/USB488 interface, matched by USB class rather than by id.
+    Usbtmc,
 }
 
 impl BackendKind {
@@ -357,6 +360,7 @@ impl BackendKind {
         BackendKind::Agilent82357b,
         BackendKind::Agilent82357a,
         BackendKind::NiUsbHs,
+        BackendKind::Usbtmc,
     ];
 
     /// The 82357-family model descriptor backing an Agilent variant.
@@ -364,7 +368,7 @@ impl BackendKind {
         match self {
             BackendKind::Agilent82357b => &agilent_82357::MODEL_82357B,
             BackendKind::Agilent82357a => &agilent_82357::MODEL_82357A,
-            BackendKind::NiUsbHs => unreachable!("not an Agilent model"),
+            BackendKind::NiUsbHs | BackendKind::Usbtmc => unreachable!("not an Agilent model"),
         }
     }
 
@@ -373,6 +377,7 @@ impl BackendKind {
         match self {
             BackendKind::Agilent82357b | BackendKind::Agilent82357a => self.agilent_model().id,
             BackendKind::NiUsbHs => ni_usb_hs::ID,
+            BackendKind::Usbtmc => usbtmc::ID,
         }
     }
 
@@ -383,15 +388,31 @@ impl BackendKind {
                 self.agilent_model().description
             }
             BackendKind::NiUsbHs => ni_usb_hs::DESCRIPTION,
+            BackendKind::Usbtmc => usbtmc::DESCRIPTION,
         }
     }
 
-    /// (VID, PID) pairs whose presence indicates this adapter.
+    /// (VID, PID) pairs whose presence indicates this adapter. Empty for the
+    /// USBTMC backend, which is matched by interface class instead; see
+    /// [`BackendKind::detect`].
     pub fn usb_ids(self) -> &'static [(u16, u16)] {
         match self {
             BackendKind::Agilent82357b | BackendKind::Agilent82357a => self.agilent_model().usb_ids,
             BackendKind::NiUsbHs => ni_usb_hs::USB_IDS,
+            BackendKind::Usbtmc => &[],
         }
+    }
+
+    /// The backend that drives `dev`, if any. Vendor-specific adapters are
+    /// known by id and take precedence; anything else with a USBTMC
+    /// interface is the USBTMC backend's.
+    pub fn detect(dev: &nusb::DeviceInfo) -> Option<BackendKind> {
+        let ids = (dev.vendor_id(), dev.product_id());
+        BackendKind::ALL
+            .iter()
+            .copied()
+            .find(|k| k.usb_ids().contains(&ids))
+            .or_else(|| usbtmc::usb::usbtmc_interface(dev).map(|_| BackendKind::Usbtmc))
     }
 
     /// Whether `pid` is this adapter's *pre-firmware* product id — the id it
@@ -406,7 +427,7 @@ impl BackendKind {
             BackendKind::Agilent82357b | BackendKind::Agilent82357a => {
                 self.agilent_model().pid_preinit == pid
             }
-            BackendKind::NiUsbHs => false,
+            BackendKind::NiUsbHs | BackendKind::Usbtmc => false,
         }
     }
 
@@ -423,6 +444,7 @@ impl BackendKind {
                 agilent_82357::open(self.agilent_model(), timeout_ms, port).await
             }
             BackendKind::NiUsbHs => ni_usb_hs::open(timeout_ms, port).await,
+            BackendKind::Usbtmc => usbtmc::open(timeout_ms, port).await,
         }
     }
 }
@@ -544,6 +566,17 @@ mod tests {
     fn adapters_without_firmware_upload_are_never_preinit() {
         for (_, pid) in BackendKind::NiUsbHs.usb_ids() {
             assert!(!BackendKind::NiUsbHs.is_preinit_pid(*pid));
+        }
+        assert!(BackendKind::Usbtmc.usb_ids().is_empty());
+        assert!(!BackendKind::Usbtmc.is_preinit_pid(0));
+    }
+
+    #[test]
+    fn every_backend_has_a_distinct_id() {
+        let ids: Vec<&str> = BackendKind::ALL.iter().map(|k| k.id()).collect();
+        for id in &ids {
+            assert_eq!(ids.iter().filter(|i| i == &id).count(), 1, "{id}");
+            assert_eq!(BackendKind::from_id(id).map(|k| k.id()), Some(*id));
         }
     }
 }
