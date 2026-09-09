@@ -135,10 +135,27 @@ async fn main() -> Result<()> {
             d.product_id()
         );
     }
-    let info = devs
+    let info = match devs
         .iter()
         .find(|d| d.vendor_id() == VID_CYPRESS && d.product_id() == PID_FX2_DEFAULT)
-        .context("no FX2 in default mode (04b4:8613) and no NI adapter found")?;
+    {
+        Some(d) => d,
+        None => {
+            // A device whose string descriptors fail still enumerates, and is
+            // still listed here — string reads are not needed to find it. So
+            // print everything rather than just saying no.
+            eprintln!("no 04b4:8613 found. USB devices currently present:");
+            for d in &devs {
+                eprintln!(
+                    "  {:04x}:{:04x}  {}",
+                    d.vendor_id(),
+                    d.product_id(),
+                    d.product_string().unwrap_or("(no product string)")
+                );
+            }
+            bail!("no FX2 in default mode (04b4:8613)");
+        }
+    };
     println!(
         "found {:04x}:{:04x} — FX2 in default mode",
         info.vendor_id(),
