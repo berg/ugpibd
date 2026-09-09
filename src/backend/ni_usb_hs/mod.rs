@@ -86,6 +86,23 @@ pub trait NiTransport: Send + Sync {
         self.bulk_in(resp_len).await
     }
 
+    /// Re-arm the interrupt monitor if a report consumed the arming.
+    ///
+    /// Called by the backend when no addressed sequence is in flight; see the
+    /// transport's implementation for why it must not happen inside one.
+    async fn rearm_srq_if_pending(&self) {}
+
+    /// Tell the transport how long the adapter will now spend on a transfer
+    /// before giving up, so its own waits outlast it.
+    ///
+    /// The two deadlines must not disagree. The daemon giving up first leaves
+    /// the adapter still running a transfer whose reply nothing is waiting for,
+    /// and that reply is then read as the answer to the next request. The
+    /// backend floors the GPIB timeout to an exact adapter step and passes the
+    /// result here; the default is a no-op, for transports whose waits are not
+    /// derived from it.
+    fn set_adapter_wait(&self, _wait_ms: u32) {}
+
     /// Receiver for service-request notifications, when the transport reads the
     /// adapter's interrupt endpoint. `None` means it cannot observe SRQ, which
     /// callers must treat as "unknown", never as "no SRQ".
@@ -126,6 +143,27 @@ pub struct NiUsbHsBackend<T: NiTransport> {
     eos_char: u8,
     eos_enabled: bool,
     timeout_ms: u32,
+    /// The talker the bus is currently addressed to, when that addressing was
+    /// set up by a read and nothing has disturbed it since.
+    ///
+    /// Re-addressing means asserting ATN, and asserting ATN over a byte the
+    /// chip is already holding discards it — the second half of the lost-byte
+    /// fault (see `read`). Consecutive reads from the same instrument must
+    /// therefore address once and then leave the bus alone, which is also what
+    /// linux-gpib does: it addresses in the user library and loops the kernel
+    /// read with no addressing in between.
+    ///
+    /// Cleared by `send_command_bounded`, so *any* other command traffic
+    /// invalidates it by construction, and by the operations that move the bus
+    /// without sending command bytes.
+    read_addressing: Option<ReadAddressing>,
+}
+
+/// The addressing a read set up: who talks, who listens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ReadAddressing {
+    talker: Option<u8>,
+    listener: u8,
 }
 
 impl<T: NiTransport> NiUsbHsBackend<T> {
@@ -138,7 +176,23 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
             eos_char: b'\n',
             eos_enabled: false,
             timeout_ms,
+            read_addressing: None,
         }
+    }
+
+    /// The adapter timeout code for the current GPIB timeout, floored to an
+    /// exact step so the adapter's own wait never outlasts the transport's wait
+    /// for its reply. See `timeout_code_floor`.
+    fn timeout_code(&self) -> u8 {
+        self.adapter_timeout_code(self.timeout_ms)
+    }
+
+    /// As `timeout_code`, for a caller with its own budget, keeping the
+    /// transport's reply deadline in step with what the adapter is told.
+    fn adapter_timeout_code(&self, timeout_ms: u32) -> u8 {
+        let (code, wait_ms) = timeout_code_floor(timeout_ms);
+        self.transport.set_adapter_wait(wait_ms);
+        code
     }
 
     fn eos_mode(&self) -> u16 {
@@ -161,7 +215,7 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
     /// standby. Command bytes are capped at 16 per transfer by the hardware.
     /// The data half of a write: no addressing, chip already talker.
     async fn write_data_body(&self, data: &[u8], send_eoi: bool) -> Result<()> {
-        let tc = timeout_code(self.timeout_ms);
+        let tc = self.timeout_code();
         // Split anything past the adapter's 16-bit length field, asserting EOI
         // only on the final chunk so the message still terminates once.
         let mut remaining = data;
@@ -190,19 +244,14 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
     /// a mode where the transfer is driven by another controller).
     async fn read_data_body(&self, max_len: usize) -> Result<(Vec<u8>, bool)> {
         let max_len = max_len.min(MAX_TRANSFER_LEN);
-        let req = encode_data_read(
-            max_len,
-            self.eos_mode(),
-            self.eos_char,
-            timeout_code(self.timeout_ms),
-        );
+        let req = encode_data_read(max_len, self.eos_mode(), self.eos_char, self.timeout_code());
         // Data comes back in 15/30-byte framed blocks plus two status blocks.
         let resp_cap = (max_len / 30 + 1) * 0x20 + 0x20;
         let resp = self.transact(&req, resp_cap).await?;
         parse_data_read_response(&resp, max_len).context("ni data read")
     }
 
-    async fn send_command(&self, cmd: &[u8], standby_after: bool) -> Result<()> {
+    async fn send_command(&mut self, cmd: &[u8], standby_after: bool) -> Result<()> {
         self.send_command_bounded(cmd, standby_after, self.timeout_ms)
             .await
     }
@@ -211,12 +260,16 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
     /// expect the transfer may legitimately find no acceptor (init on an empty
     /// bus) and must not stall for the full bus timeout finding out.
     async fn send_command_bounded(
-        &self,
+        &mut self,
         cmd: &[u8],
         standby_after: bool,
         timeout_ms: u32,
     ) -> Result<()> {
-        let tc = timeout_code(timeout_ms);
+        // Command bytes mean ATN, and ATN costs any byte the chip is holding,
+        // so whatever addressing a read established is no longer good for
+        // skipping. Clearing here covers every caller by construction.
+        self.read_addressing = None;
+        let tc = self.adapter_timeout_code(timeout_ms);
         self.transact(&encode_take_control(true), OP_RESP_LEN)
             .await?;
         for chunk in cmd.chunks(16) {
@@ -229,6 +282,83 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
             self.transact(&encode_go_to_standby(), OP_RESP_LEN).await?;
         }
         Ok(())
+    }
+
+    /// Wait for a byte to land in the chip's data-in register and take it.
+    ///
+    /// `ISR1` bit 0 (DI) says a byte has been accepted; reading `DIR` takes it
+    /// and completes the handshake. Both are read in one adapter transaction,
+    /// because `ISR1` is read-clear and a second round trip would lose the
+    /// flag. The byte is normally there on the first look — the instrument
+    /// sources it the moment ATN falls — so the loop is for the case where it
+    /// is not, and it is bounded by the caller's GPIB timeout.
+    async fn take_status_byte(&self) -> Result<u8> {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(self.timeout_ms.into());
+        loop {
+            if let Some(b) = self
+                .take_held_byte()
+                .await
+                .context("ni serial poll: reading the status byte")?
+            {
+                return Ok(b);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("the instrument sent no status byte in response to the poll");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Make the acceptor ready to take one byte the instant ATN falls.
+    ///
+    /// Call with ATN still asserted, which is the only safe moment: no data
+    /// byte can arrive while it is. `rdy` is false whenever HALT is set, and
+    /// HALT stays set until the adapter's read op issues GO — so between "go to
+    /// standby" and that op, two separate USB round trips apart, the chip is an
+    /// addressed listener asserting NRFD. A patient talker waits it out; one
+    /// that sources its first byte on the ATN edge and moves on loses it there.
+    /// Clearing HALT by hand closes that window, and holdoff on all data stays
+    /// in force so exactly one byte is taken and the rest wait for the read op.
+    async fn ready_acceptor(&self) -> Result<()> {
+        self.register_write(&[
+            NiRegister::new(SUBDEV_TNT4882, REG_AUXMR, AUX_FH),
+            NiRegister::new(SUBDEV_TNT4882, REG_CMDR, CMDR_GO),
+        ])
+        .await
+        .context("ni: readying the acceptor")
+    }
+
+    /// Put HALT back, so an idle chip accepts nothing with no read armed.
+    async fn restore_acceptor(&self) -> Result<()> {
+        self.register_write(&[NiRegister::new(SUBDEV_TNT4882, REG_CMDR, CMDR_STOP)])
+            .await
+            .context("ni: restoring the acceptor")
+    }
+
+    /// Take the byte the chip is holding in its data-in register, if any.
+    ///
+    /// A byte can be stranded there whenever the bus is addressed while the
+    /// talker already has something to say: `rdy` is true for as long as ATN is
+    /// asserted, so at the instant ATN falls the talker sources its first byte
+    /// into an acceptor that takes it and then has nowhere to put it — the
+    /// adapter's read op runs its own transfer and never looks at what the chip
+    /// already holds. Recovering it here is what keeps that byte, which is
+    /// otherwise lost silently and only from responses the instrument had ready
+    /// before we asked for them.
+    ///
+    /// `ISR1` bit 0 (DI) reports the byte and `DIR` yields it; they are read in
+    /// one adapter transaction because `ISR1` is read-clear.
+    async fn take_held_byte(&self) -> Result<Option<u8>> {
+        /// nec7210 read-side offsets, as the TNT maps them.
+        const REG_DIR: u8 = 0x00;
+        const REG_ISR1: u8 = 0x02;
+        const ISR1_DI: u8 = 0x01;
+
+        let regs = self
+            .register_read(&[(SUBDEV_TNT4882, REG_ISR1), (SUBDEV_TNT4882, REG_DIR)])
+            .await?;
+        Ok((regs[0] & ISR1_DI != 0).then_some(regs[1]))
     }
 
     /// Read back `regs` as (device, address) pairs, in order.
@@ -255,6 +385,7 @@ impl<T: NiTransport> NiUsbHsBackend<T> {
 impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     async fn init(&mut self, my_pad: u8) -> Result<()> {
         self.my_pad = my_pad;
+        self.read_addressing = None;
         // Clear anything left queued by a dead predecessor before trusting a
         // single response byte.
         self.transport.drain_stale_responses().await;
@@ -328,7 +459,7 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // this byte is never handshaken by any instrument. Do not reorder it
         // ahead of that command. A short timeout keeps init quick, since with
         // no listener the write is expected to fail.
-        let doomed = encode_data_write(&[0x00], false, timeout_code(10));
+        let doomed = encode_data_write(&[0x00], false, self.adapter_timeout_code(10));
         if let Err(e) = self.transact(&doomed, OP_RESP_LEN).await {
             debug!("ni init: priming data write did not complete: {e}");
         }
@@ -366,10 +497,84 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if self.device_address.is_some() {
             anyhow::bail!("cannot write while in device mode: we are not the controller");
         }
+        // Same as `read`: a pending re-arm is a control transfer, and this is a
+        // point where nothing is addressed yet. Doing it here as well as in
+        // `read` keeps the monitor alive for a client that only ever writes.
+        self.transport.rearm_srq_if_pending().await;
         // Address controller as talker (pad 0), instrument as listener.
         let cmd = [GPIB_UNL, talk_address(self.my_pad), listen_address(pad)];
         self.send_command(&cmd, true).await?;
-        self.write_data_body(data, send_eoi).await
+        self.write_data_body(data, send_eoi).await?;
+
+        // Deliberately no bus turnaround here.
+        //
+        // Leaving the instrument addressed to talk after a write does make
+        // reads on a Tabor 8026 lossless — it removes the ATN edge the byte is
+        // lost at — but it breaks status
+        // reporting on instruments that behave correctly, which is a worse
+        // trade. An addressed talker starts delivering as soon as it has
+        // something to say, so its output queue drains into the transfer
+        // before the client asks: measured on a 34401A, MAV was reported in
+        // 1 of 8 queries and RQS in none, against 8 of 8 both with this
+        // removed and on the released build. A client waiting on SRQ would
+        // simply hang, and MAV is how VXI-11 clients synchronise.
+        //
+        // Re-measured on top of the SRQ re-arm fix, on both adapters, because
+        // that fix removed the mid-sequence control transfer the original
+        // measurement was taken through. The turnaround does fix the reads —
+        // 0 of 360 delayed reads on both instruments against 9 of 360, and on
+        // a GPIB-USB-HS it clears 13 read failures across 6 bench runs to 0 —
+        // but on that adapter it also breaks the poll: the 34401A reports bare
+        // MAV without RQS in 3 of 6 runs, a shape that never appears without
+        // it. A client waiting on SRQ hangs, which is worse than a short read,
+        // so it stays out until that is understood. The work is on
+        // `experiment/write-turnaround`. Shutting the acceptor (CMDR STOP)
+        // after the turnaround does not resolve it, and writes issued after a
+        // turnaround do land (verified 10 of 10), so neither is the cause.
+        //
+        // The 8026 keeps an intermittent first-byte loss on reads issued well
+        // after the query; see the module docs. The loss is flat across
+        // write-to-read delays from 50 ms to 3 s and absent at 0 and 20 ms —
+        // a byte already loaded when ATN went up, not a race.
+        //
+        // The byte is lost by the adapter's firmware, not by the instrument and
+        // not by the chip. It is left parked between operations — every read op
+        // exits with HALT set and an AUX_HLDI holdoff pending — and is re-armed
+        // only inside the *next* read op. The register semantics are confirmed
+        // by NI's own TNT5002 manual: CMDR[STOP] "sets the internal HALT
+        // signal... the local nba and rdy messages become false. HALT must be
+        // cleared to transfer data bytes", and AUXMR[HLDI] "prevents the
+        // Acceptor state machine from transitioning from ANRS to ACRS. NRFD#
+        // remains asserted".
+        //
+        // The order is wrong, and the TNT4882 manual says why. Under
+        // "Generating the rdy Message": the local rdy message becomes true "if
+        // ATN is asserted" OR if four conditions hold, the first two being that
+        // HALT is not set and the FIFOs are not full, the last two that no RFD
+        // holdoff is in progress.
+        //
+        // So while ATN is asserted the acceptor is ready whatever HALT and the
+        // holdoffs say. The instant ATN falls, readiness switches to depending
+        // on exactly the two things a finished read op leaves set. Clearing
+        // them therefore has to happen *while ATN is still asserted* — and the
+        // firmware does it afterwards, in the following operation, so rdy is
+        // false across the edge. An instrument that sources its first byte on
+        // that edge and moves on, as the 8026 does, loses it there.
+        //
+        // Arming from this side does not substitute either: RESET_FIFO precedes
+        // GO in the manual's own receive sequence, so anything accepted before
+        // the read op starts is discarded by design rather than by oversight.
+        //
+        // This is the same property `ready_acceptor` exploits for the serial
+        // poll, where arming under ATN is ours to do and does fix the byte.
+        //
+        // Hence an Agilent 82357 reads the same instrument cleanly while
+        // asserting ATN at the same point (a TMS9914 acceptor free-runs and
+        // simply takes the byte), and hence NI's own driver loses it too.
+        // Clearing HALT early from this side does not substitute: the read op
+        // owns the FIFO, so a free-running TNT delivers into nothing (280 of
+        // 360, first byte doubled).
+        Ok(())
     }
 
     async fn read(&mut self, pad: u8, max_len: usize) -> Result<(Vec<u8>, bool)> {
@@ -377,6 +582,9 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // the HiSLIP server ask for 64 KiB, one byte past the limit, which would
         // otherwise wrap the encoded count to zero and read nothing at all.
         let max_len = max_len.min(MAX_TRANSFER_LEN);
+        // Before anything is addressed: a pending re-arm is a control transfer,
+        // and one issued mid-sequence costs the first byte of the response.
+        self.transport.rearm_srq_if_pending().await;
         if self.device_address.is_some() {
             // We are not the controller. Sending command bytes is not ours to
             // do; just take whatever the controller addresses us to receive.
@@ -389,12 +597,58 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // needs the addressing hoisted out of the read instead, because it
         // asserts ATN differently; do not "unify" these without re-measuring
         // both.
-        let cmd: &[u8] = if self.listen_only {
-            &[GPIB_UNL, listen_address(self.my_pad)]
-        } else {
-            &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)]
+        //
+        // Address only when the bus is not already set up this way. Re-addressing
+        // asserts ATN, and ATN over a byte the chip is already holding discards
+        // it: measured on a GPIB-USB-HS as exactly one byte lost per read op,
+        // for every read after the first in a multi-slice transfer ("abor ",
+        // "lectr", "nics," from a 5-byte-at-a-time read of an *IDN? response).
+        // Addressing once and reading repeatedly returns the same response
+        // whole. linux-gpib is not exposed to this because it addresses in the
+        // user library and loops the kernel read with nothing in between.
+        let want = ReadAddressing {
+            talker: (!self.listen_only).then_some(pad),
+            listener: self.my_pad,
         };
-        self.send_command(cmd, true).await?;
+        if self.read_addressing != Some(want) {
+            let cmd: &[u8] = if self.listen_only {
+                &[GPIB_UNL, listen_address(self.my_pad)]
+            } else {
+                &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)]
+            };
+            // Address with ATN and drop to standby in one go.
+            //
+            // Leave the acceptor alone around this. Its state when ATN falls
+            // does dominate the first byte of the response, but every
+            // rearrangement measured is worse. On a Tabor 8026, 360 reads per
+            // arm unless noted, against 9/360 for this code: HALT set before
+            // ATN falls 167/360; HALT cleared (AUX_FH + CMDR_GO) 280/360, with
+            // the first byte doubled; CMDR_GO alone doubles every byte;
+            // finish-handshake only 7/24; go-to-standby in continuous-listen
+            // mode 7/24; the kernel's AUX_HLDI in the read request 2/24;
+            // bundled with the read into one bulk-out 13/360; +50 ms before the
+            // read op 1/24. Init-time configuration is no better: holdoff on
+            // END rather than all data 18/360, no holdoff 3/32, T1 at 2000 ns
+            // 4/32.
+            //
+            // Arming the acceptor early cannot work at any timescale, and this
+            // is why: the read op issues CMDR RESET FIFO before its GO, every
+            // time — which is the order NI's own manual prescribes for a
+            // receive, not a firmware quirk. Whatever an armed chip accepted
+            // before that op started is discarded. Bundling the arm, the go-to-standby and the read into
+            // a single bulk-out — so the firmware runs all three with no USB
+            // round trip between them — still returns the response starting
+            // mid-string. There is no window small enough.
+            //
+            // Two of those generalise. Clearing HALT lets the chip free-run
+            // with no read op armed, and the doubled first byte proves the read
+            // op already takes whatever DIR holds — so there is nothing to
+            // collect there, contrary to what this comment used to claim. And
+            // the window's duration does not matter: widening it 50 ms and
+            // collapsing it to nothing both leave the rate where it was.
+            self.send_command(cmd, true).await?;
+            self.read_addressing = Some(want);
+        }
         self.read_data_body(max_len).await
     }
 
@@ -426,6 +680,8 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn ifc(&mut self) -> Result<()> {
+        // IFC unaddresses everyone, so nothing a read set up survives it.
+        self.read_addressing = None;
         // IFC is a single pulse; the adapter has no separate de-assert.
         self.transact(&encode_interface_clear(), OP_RESP_LEN)
             .await?;
@@ -438,20 +694,72 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
             .await
     }
 
+    /// Serial-poll the instrument at `pad`.
+    ///
+    /// SPE, address the instrument as talker and ourselves as listener, drop to
+    /// standby so it can drive the byte, read one byte, then restore the bus
+    /// with SPD/UNT.
+    ///
+    /// The restore and the SRQ re-arm happen whether or not the byte arrives.
+    /// An instrument that does not answer its poll is exactly the case that
+    /// needs them: returning early would leave the whole bus in serial-poll
+    /// mode, where no instrument answers anything, and leave the adapter's
+    /// one-shot monitor unarmed so no later service request is ever reported.
     async fn serial_poll(&mut self, pad: u8) -> Result<u8> {
-        // SPE, address instrument as talker + controller as listener, standby,
-        // read one status byte, then SPD/UNT.
         let enable = [
             GPIB_UNL,
             GPIB_SPE,
             talk_address(pad),
             listen_address(self.my_pad),
         ];
-        self.send_command(&enable, true).await?;
-        let req = encode_data_read(1, 0, 0, timeout_code(self.timeout_ms));
-        let resp = self.transact(&req, 0x40).await?;
-        let (data, _end) = parse_data_read_response(&resp, 1)?;
-        self.send_command(&[GPIB_SPD, GPIB_UNT], false).await?;
+        // Prepare the acceptor while ATN is still asserted, then release it.
+        //
+        // A serial poll is the one read where the byte does not exist until
+        // ATN falls: the instrument enters SPAS and sources its status byte the
+        // instant it sees the transition. Everything else this backend reads is
+        // already waiting before the read is armed.
+        //
+        // That matters because of what the chip does in the gap between "go to
+        // standby" and the adapter's read op — two separate USB round trips.
+        // `rdy` is false while HALT is set, and HALT stays set until the read
+        // op issues GO, so in that gap the chip is an addressed listener
+        // asserting NRFD. Measured: bus lines go from `0x01 REN` before
+        // addressing to `0x31 NDAC NRFD REN` after it. A patient talker simply
+        // waits, which is why ordinary reads never noticed. An instrument that
+        // sources its status byte once and gives up — a Tabor 8026 does — loses
+        // it into that hold-off and never speaks again, and the poll times out
+        // having transferred nothing.
+        //
+        // So make the acceptor ready *before* ATN falls: drop the holdoff mode,
+        // release any immediate holdoff, and clear HALT by hand with CMDR GO.
+        // Doing it under ATN is safe — no data byte can arrive while ATN is
+        // asserted. After this the lines read `0x21 NDAC REN`, NRFD released,
+        // and the status byte lands in the chip on the transition.
+        self.send_command(&enable, false).await?;
+        self.ready_acceptor().await?;
+        let standby = self.transact(&encode_go_to_standby(), OP_RESP_LEN).await;
+
+        // Collect the byte from the chip rather than through the adapter's read
+        // op. The op arms its own transfer, which is a second round trip after
+        // the one that matters; by then the byte has already been accepted into
+        // the data-in register, and the op waits for a second byte that a
+        // polled instrument never sends. Read DIR directly: DI in ISR1 says a
+        // byte is there, and reading DIR takes it and completes the handshake.
+        let polled = match standby {
+            Err(e) => Err(e),
+            Ok(_) => self.take_status_byte().await,
+        };
+
+        // Put the acceptor back the way the rest of the backend needs it.
+        // Both halves matter: holdoff on all data is what paces an ordinary
+        // read, and HALT is what stops an idle chip accepting a byte with no
+        // read armed — leaving HALT clear costs the first byte of the next
+        // response, which is the fault this backend just fixed elsewhere.
+
+        let restored = self
+            .restore_acceptor()
+            .await
+            .and(self.send_command(&[GPIB_SPD, GPIB_UNT], false).await);
 
         // Re-arm here, because this is exactly the point where a service
         // request has been dealt with. The adapter's monitor is one-shot per
@@ -463,7 +771,10 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         if let Err(e) = self.transport.rearm_srq(IBSTA_SRQI).await {
             debug!("ni: re-arming the srq monitor failed: {e:#}");
         }
-        Ok(data.first().copied().unwrap_or(0))
+
+        let stb = polled.with_context(|| format!("ni serial poll of pad {pad}"))?;
+        restored.context("ni serial poll: restoring the bus after the poll")?;
+        Ok(stb)
     }
 
     async fn send_data_unaddressed(&mut self, data: &[u8], send_eoi: bool) -> Result<()> {
@@ -487,6 +798,8 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
             .await
             .context("ni set controller address")?;
         self.my_pad = pad;
+        // We are no longer the listener the old addressing named.
+        self.read_addressing = None;
         Ok(())
     }
 
@@ -497,6 +810,10 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn set_atn(&mut self, assert: bool) -> Result<()> {
+        // Asserting ATN is exactly what costs a held byte; a client driving it
+        // by hand takes the same risk, but must not also get a skipped
+        // addressing on the next read.
+        self.read_addressing = None;
         let req = if assert {
             encode_take_control(true)
         } else {
@@ -525,6 +842,8 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn set_listen_only(&mut self, enable: bool) -> Result<()> {
+        // The addressing changes wholesale with the mode.
+        self.read_addressing = None;
         // Preserve the binary-EOS bit the init sequence computes; it lives in
         // the same AUXRA write as the holdoff bit, so rewriting one without it
         // would silently turn binary mode off.
@@ -582,6 +901,8 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
     }
 
     async fn set_device_mode(&mut self, address: Option<u8>) -> Result<()> {
+        // Leaving controller mode makes any addressing we set up meaningless.
+        self.read_addressing = None;
         let Some(addr) = address else {
             // Back to controller. Re-initialise rather than trying to invert
             // the sequence below: `init` retakes system control and pulses IFC,
@@ -644,6 +965,10 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
 
     fn set_timeout(&mut self, timeout_ms: u32) {
         self.timeout_ms = timeout_ms;
+        // Keep the transport's reply deadline in step even if the next
+        // operation is one that does not carry a timeout code of its own.
+        self.transport
+            .set_adapter_wait(timeout_code_floor(timeout_ms).1);
     }
 
     fn name(&self) -> &'static str {
@@ -723,6 +1048,10 @@ mod tests {
     struct MockTransport {
         written: Mutex<Vec<Vec<u8>>>,
         responses: Mutex<Vec<Vec<u8>>>,
+        /// Adapter waits the backend announced, newest last.
+        waits: Mutex<Vec<u32>>,
+        /// Masks passed to `rearm_srq`.
+        rearms: Mutex<Vec<u16>>,
     }
 
     impl MockTransport {
@@ -730,6 +1059,8 @@ mod tests {
             Self {
                 written: Mutex::new(vec![]),
                 responses: Mutex::new(responses),
+                waits: Mutex::new(vec![]),
+                rearms: Mutex::new(vec![]),
             }
         }
     }
@@ -771,6 +1102,13 @@ mod tests {
         ) -> Result<Vec<u8>> {
             self.control_in(request, v, i, m).await
         }
+        fn set_adapter_wait(&self, wait_ms: u32) {
+            self.waits.lock().unwrap().push(wait_ms);
+        }
+        async fn rearm_srq(&self, mask: u16) -> Result<()> {
+            self.rearms.lock().unwrap().push(mask);
+            Ok(())
+        }
         fn product_id(&self) -> u16 {
             usb::PID_NI_USB_HS
         }
@@ -793,6 +1131,20 @@ mod tests {
         let mut b = vec![NIUSB_REG_WRITE_ID, 0, 0, 0, 0, 0, 0, 0];
         b.push(completed);
         b.extend_from_slice(&[0; 7]);
+        b
+    }
+
+    /// A register-read response carrying `vals`: `[0x34][v..]` padded to a
+    /// 4-byte boundary, then `[0x35][count]`.
+    fn reg_read_ok(vals: &[u8]) -> Vec<u8> {
+        let mut b = vec![NIUSB_REGISTER_READ_DATA_START_ID];
+        b.extend_from_slice(vals);
+        while b.len() % 4 != 0 {
+            b.push(0x00);
+        }
+        b.push(NIUSB_REGISTER_READ_DATA_END_ID);
+        b.push(vals.len() as u8);
+        b.resize(REG_READ_RESP_LEN, 0);
         b
     }
 
@@ -973,6 +1325,34 @@ mod tests {
         assert_eq!(dw[0], NIUSB_DATA_WRITE_OP);
         assert_eq!(dw[6], 0x08);
         assert_eq!(&dw[8..13], b"*IDN?");
+    }
+
+    /// A write must NOT leave the instrument addressed to talk.
+    ///
+    /// Doing so makes reads on a Tabor 8026 lossless, which is tempting, but an
+    /// addressed talker starts delivering as soon as it has something to say —
+    /// so its output queue drains into the transfer before the client asks, and
+    /// MAV and RQS stop being reported. Measured on a 34401A: RQS in 0 of 8
+    /// queries with the turnaround, 8 of 8 without. A client waiting on SRQ
+    /// hangs. Reads are addressed by `read`, which is where addressing belongs.
+    #[tokio::test]
+    async fn a_write_leaves_nobody_addressed_to_talk() {
+        let t = MockTransport::new(vec![op_ok(), op_ok(), op_ok(), op_ok()]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.write(23, b"*IDN?", true).await.unwrap();
+
+        let writes = be.transport.written.lock().unwrap().clone();
+        let cmds: Vec<_> = writes.iter().filter(|w| w[0] == NIUSB_COMMAND_OP).collect();
+        assert_eq!(cmds.len(), 1, "a write addresses once: {writes:02x?}");
+        assert_eq!(
+            &cmds[0][4..7],
+            &[GPIB_UNL, talk_address(0), listen_address(23)],
+            "the instrument is the listener, we are the talker"
+        );
+        assert!(
+            be.read_addressing.is_none(),
+            "a write must not leave read addressing standing"
+        );
     }
 
     #[tokio::test]
@@ -1228,5 +1608,241 @@ mod tests {
         let writes = be.transport.written.lock().unwrap().clone();
         assert_eq!(writes[0][0], NIUSB_REG_WRITE_ID);
         assert_eq!(&writes[0][3..6], &[SUBDEV_TNT4882, REG_AUXMR, AUX_SREN]);
+    }
+
+    /// A read block carrying one status byte, as the adapter frames it.
+    fn read_one_byte(byte: u8) -> Vec<u8> {
+        let mut resp = vec![NIUSB_IBRD_DATA_ID, byte];
+        resp.resize(16, 0); // the 15-byte data block
+        resp.extend_from_slice(&[NIUSB_IBRD_STATUS_ID, 0x20, 0x00, 0, 0, 0, 0, 0]);
+        resp.push(0x00); // reserved
+        resp.push(0x01); // real length of the last block
+        resp
+    }
+
+    /// The take-control + command-bytes pair every `send_command` performs.
+    fn command_bytes(writes: &[Vec<u8>], i: usize) -> Vec<u8> {
+        assert_eq!(
+            writes[i][0], NIUSB_COMMAND_OP,
+            "transfer {i} is not a command"
+        );
+        writes[i][4..].to_vec()
+    }
+
+    /// The status byte comes from the chip's data-in register, not from the
+    /// adapter's read op, and the acceptor is opened before ATN falls and shut
+    /// again afterwards. See `serial_poll` for why.
+    #[tokio::test]
+    async fn serial_poll_reads_the_status_byte_and_restores_the_bus() {
+        let t = MockTransport::new(vec![
+            op_ok(),                    // take control
+            op_ok(),                    // SPE + addressing
+            reg_write_ok(2),            // ready the acceptor: rhdf + GO
+            op_ok(),                    // go to standby
+            reg_read_ok(&[0x01, 0x41]), // ISR1 (DI set), DIR
+            reg_write_ok(1),            // restore the acceptor: STOP
+            op_ok(),                    // take control
+            op_ok(),                    // SPD + UNT
+        ]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        assert_eq!(be.serial_poll(4).await.unwrap(), 0x41);
+
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert_eq!(
+            &command_bytes(&writes, 1)[..4],
+            &[GPIB_UNL, GPIB_SPE, talk_address(4), listen_address(0)]
+        );
+        // The acceptor must be opened while ATN is still asserted — after the
+        // command bytes and before the go-to-standby — or the byte the
+        // instrument sources on the ATN edge is refused and lost.
+        assert_eq!(writes[2][0], NIUSB_REG_WRITE_ID, "acceptor write");
+        assert_eq!(&writes[2][3..6], &[SUBDEV_TNT4882, REG_AUXMR, AUX_FH]);
+        assert_eq!(&writes[2][6..9], &[SUBDEV_TNT4882, REG_CMDR, CMDR_GO]);
+        assert_eq!(writes[3], encode_go_to_standby(), "standby comes after");
+        // And shut again, so an idle chip accepts nothing with no read armed.
+        assert_eq!(&writes[5][3..6], &[SUBDEV_TNT4882, REG_CMDR, CMDR_STOP]);
+        assert_eq!(&command_bytes(&writes, 7)[..2], &[GPIB_SPD, GPIB_UNT]);
+    }
+
+    /// The poll must not use the adapter's data-read op. It runs its own
+    /// transfer and never looks at the data-in register, so it waits for a
+    /// second byte a polled instrument never sends — measured as a poll that
+    /// timed out while the status byte sat in the chip.
+    #[tokio::test]
+    async fn serial_poll_does_not_use_the_data_read_op() {
+        let t = MockTransport::new(vec![
+            op_ok(),
+            op_ok(),
+            reg_write_ok(2),
+            op_ok(),
+            reg_read_ok(&[0x01, 0x50]),
+            reg_write_ok(1),
+            op_ok(),
+            op_ok(),
+        ]);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        assert_eq!(be.serial_poll(4).await.unwrap(), 0x50);
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert!(
+            !writes.iter().any(|w| w[0] == NIUSB_DATA_READ_OP),
+            "the poll issued a data-read op: {writes:02x?}"
+        );
+    }
+
+    /// An instrument that ignores its poll is the case that most needs the bus
+    /// put back: SPE is a bus-wide mode, so returning early leaves every
+    /// instrument on the bus answering status bytes instead of data, and leaves
+    /// the adapter's one-shot SRQ monitor unarmed so no later service request
+    /// is ever reported. Both survive only until the daemon is restarted, which
+    /// is a heavy price for one unanswered poll.
+    #[tokio::test]
+    async fn a_failed_serial_poll_still_restores_the_bus_and_rearms_srq() {
+        let t = MockTransport::new(vec![
+            op_ok(),
+            op_ok(),
+            reg_write_ok(2),
+            op_ok(),
+            reg_read_ok(&[0x00, 0x00]), // DI clear: no byte ever arrives
+            reg_write_ok(1),
+            op_ok(),
+            op_ok(),
+        ]);
+        // A zero GPIB timeout, so the wait for the byte gives up after one
+        // look rather than depending on how fast the test host runs.
+        let mut be = NiUsbHsBackend::new(t, 0);
+        let err = be.serial_poll(4).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no status byte"),
+            "an empty poll must not be reported as a status of zero: {msg}"
+        );
+
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert_eq!(writes.len(), 8, "SPD/UNT must go out on the failure path");
+        assert_eq!(&command_bytes(&writes, 7)[..2], &[GPIB_SPD, GPIB_UNT]);
+        assert_eq!(
+            be.transport.rearms.lock().unwrap().clone(),
+            vec![IBSTA_SRQI],
+            "the monitor must be re-armed even when the poll found nothing"
+        );
+    }
+
+    /// Consecutive reads from the same instrument must address once, not once
+    /// per read. Re-addressing asserts ATN, and ATN over a byte the chip is
+    /// already holding discards it: a 5-byte-at-a-time read of a 32-byte
+    /// response came back "abor ", "lectr", "nics," — one byte gone per read
+    /// op. Addressing once and reading repeatedly returns the response whole.
+    #[tokio::test]
+    async fn consecutive_reads_address_the_bus_once() {
+        let responses = vec![
+            op_ok(),             // take control
+            op_ok(),             // addressing command bytes
+            op_ok(),             // go to standby
+            read_one_byte(b'T'), // first read
+            read_one_byte(b'a'), // second read: no addressing in between
+            read_one_byte(b'b'), // third
+        ];
+        let t = MockTransport::new(responses);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        for want in *b"Tab" {
+            let (data, _) = be.read(4, 1).await.unwrap();
+            assert_eq!(data, vec![want]);
+        }
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert_eq!(
+            writes.iter().filter(|w| w[0] == NIUSB_COMMAND_OP).count(),
+            1,
+            "three reads must address once: {writes:02x?}"
+        );
+    }
+
+    /// Anything that puts command bytes on the bus invalidates that addressing,
+    /// because it asserts ATN itself. The skip is only ever safe while nothing
+    /// has touched the bus since.
+    #[tokio::test]
+    async fn other_bus_traffic_forces_re_addressing() {
+        let responses = vec![
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            read_one_byte(b'T'),
+            op_ok(), // trigger: take control
+            op_ok(), // trigger: command bytes
+            op_ok(), // read: take control
+            op_ok(), // read: addressing again
+            op_ok(), // read: go to standby
+            read_one_byte(b'a'),
+        ];
+        let t = MockTransport::new(responses);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.read(4, 1).await.unwrap();
+        be.trigger(4).await.unwrap();
+        be.read(4, 1).await.unwrap();
+        let writes = be.transport.written.lock().unwrap().clone();
+        assert_eq!(
+            writes.iter().filter(|w| w[0] == NIUSB_COMMAND_OP).count(),
+            3,
+            "the read after a trigger must address again: {writes:02x?}"
+        );
+    }
+
+    /// A read of a different instrument is different addressing, so it must be
+    /// sent even though the previous read left the bus addressed.
+    #[tokio::test]
+    async fn a_read_of_another_instrument_re_addresses() {
+        let responses = vec![
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            read_one_byte(b'T'),
+            op_ok(),
+            op_ok(),
+            op_ok(),
+            read_one_byte(b'a'),
+        ];
+        let t = MockTransport::new(responses);
+        let mut be = NiUsbHsBackend::new(t, 3000);
+        be.read(4, 1).await.unwrap();
+        be.read(9, 1).await.unwrap();
+        let writes = be.transport.written.lock().unwrap().clone();
+        let cmds: Vec<_> = writes.iter().filter(|w| w[0] == NIUSB_COMMAND_OP).collect();
+        assert_eq!(cmds.len(), 2, "each instrument needs its own addressing");
+        assert_eq!(cmds[0][6], talk_address(4));
+        assert_eq!(cmds[1][6], talk_address(9));
+    }
+
+    /// The adapter must never be given a longer deadline than the daemon will
+    /// wait for its reply. It was: 5000 ms rounded *up* to the 10 s step while
+    /// the daemon gave up at 7 s, so it abandoned a transfer the adapter was
+    /// still running. The late reply was then read as the answer to the next
+    /// request, and every reply after that answered the one before — on new
+    /// links too, until the daemon was restarted.
+    #[tokio::test]
+    async fn the_adapter_is_never_told_to_wait_longer_than_the_daemon() {
+        for timeout_ms in [1, 5, 100, 1500, 5000, 9999, 45_000] {
+            let t = MockTransport::new(vec![op_ok(), op_ok(), op_ok(), read_one_byte(0x00)]);
+            let mut be = NiUsbHsBackend::new(t, 3000);
+            be.set_timeout(timeout_ms);
+            be.read(4, 16).await.unwrap();
+
+            let (_, wait_ms) = timeout_code_floor(timeout_ms);
+            assert!(
+                wait_ms <= timeout_ms,
+                "{timeout_ms} ms floored up to {wait_ms} ms"
+            );
+            let writes = be.transport.written.lock().unwrap().clone();
+            let read = writes.last().unwrap();
+            assert_eq!(read[0], NIUSB_DATA_READ_OP);
+            assert_eq!(
+                read[3],
+                timeout_code_floor(timeout_ms).0,
+                "the read must carry the floored code for {timeout_ms} ms"
+            );
+            assert_eq!(
+                be.transport.waits.lock().unwrap().last().copied(),
+                Some(wait_ms),
+                "the transport must be told the wait it has to outlast"
+            );
+        }
     }
 }

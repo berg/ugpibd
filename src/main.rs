@@ -160,9 +160,10 @@ async fn main() -> Result<()> {
     // the only evidence available when triaging a report, and knowing which build
     // produced it is the first question.
     info!("ugpibd {} starting", ugpibd::VERSION);
-    if !args.enable_prologix && args.hislip_port == 0 {
+    if !args.enable_prologix && args.hislip_port == 0 && args.vxi11_port == 0 {
         anyhow::bail!(
-            "no front-end enabled: pass --enable-prologix and/or a nonzero --hislip-port"
+            "no front-end enabled: pass --enable-prologix and/or a nonzero \
+             --hislip-port or --vxi11-port"
         );
     }
     let backend = match args.backend.as_str() {
