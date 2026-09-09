@@ -14,7 +14,9 @@ use nusb::transfer::{Buffer, Bulk, ControlIn, ControlType, In, Interrupt, Out, R
 use nusb::{Endpoint, MaybeFuture};
 use tracing::{debug, info, warn};
 
-use super::protocol::{IBSTA_DEFINED_BITS, IBSTA_SRQI, NIUSB_TERM_ID};
+use super::protocol::{
+    reply_answers_request, timeout_code_floor, IBSTA_DEFINED_BITS, IBSTA_SRQI, NIUSB_TERM_ID,
+};
 use super::NiTransport;
 
 pub const USB_VENDOR_ID_NI: u16 = 0x3923;
@@ -31,6 +33,16 @@ const SRQ_CHANNEL_CAPACITY: usize = 16;
 /// Cap on vendor control transfers. These are all short status/handshake
 /// exchanges, so anything approaching this means the adapter is not responding.
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Delivery margin added to the adapter's own transfer deadline to get the
+/// deadline for its reply. Covers USB scheduling and the adapter's own
+/// bookkeeping, nothing more — the substance of the wait is the GPIB timeout.
+const BULK_REPLY_MARGIN_MS: u64 = 2000;
+
+/// How long to wait on a drain read once the pipe is expected to be quiet. Long
+/// enough for a reply already queued, short enough not to stall a healthy
+/// caller that has nothing to discard.
+const DRAIN_POLL: Duration = Duration::from_millis(100);
 
 // Vendor control requests.
 const NI_USB_STOP_REQUEST: u8 = 0x20;
@@ -92,12 +104,16 @@ pub fn endpoints_for_test(pid: u16) -> (u8, u8, u8) {
 ///
 /// `abandoned` covers the other way the pair can be broken: a HiSLIP client
 /// that gives up cancels the task mid-await, and a failed bulk-in returns
-/// early. Either way the adapter still sends the reply. The flag is set before
-/// the exchange and cleared only on success, so the next caller knows to drain.
+/// early. Either way the adapter still sends the reply. It holds the instant by
+/// which that late reply must have arrived — the adapter's own deadline for the
+/// transfer, plus room to deliver it — and is set before the exchange and
+/// cleared only on success, so the next caller knows both to drain and how long
+/// draining has to wait. Draining for a fixed 100 ms is no use here: the reply
+/// that has to be discarded does not exist yet.
 struct BulkIo {
     out: Endpoint<Bulk, Out>,
     r#in: Endpoint<Bulk, In>,
-    abandoned: bool,
+    abandoned: Option<tokio::time::Instant>,
 }
 
 pub struct NiUsbTransport {
@@ -105,7 +121,12 @@ pub struct NiUsbTransport {
     device: nusb::Device,
     io: tokio::sync::Mutex<BulkIo>,
     pid: u16,
-    timeout_ms: u32,
+    /// The adapter's current per-transfer wait, in milliseconds: whatever the
+    /// backend last floored to a timeout step. Shared rather than fixed at open
+    /// because the front ends change the GPIB timeout per operation, and a bulk
+    /// wait sized on the value from open would be shorter than the transfer the
+    /// adapter is actually running.
+    adapter_wait_ms: std::sync::atomic::AtomicU32,
     srq: tokio::sync::broadcast::Sender<()>,
     /// Set by the interrupt reader when a report consumes the one-shot SRQ
     /// arming, cleared by whichever bulk transaction re-arms next. Without
@@ -144,7 +165,7 @@ impl NiUsbTransport {
             r#in: interface
                 .endpoint::<Bulk, In>(eps.bulk_in)
                 .with_context(|| format!("open bulk-in endpoint {:#04x}", eps.bulk_in))?,
-            abandoned: false,
+            abandoned: None,
         });
 
         // Read the interrupt endpoint from the moment the adapter is open, and
@@ -169,7 +190,7 @@ impl NiUsbTransport {
             device,
             io,
             pid,
-            timeout_ms,
+            adapter_wait_ms: std::sync::atomic::AtomicU32::new(timeout_code_floor(timeout_ms).1),
             srq,
             srq_needs_rearm,
             _reader_task: reader_task,
@@ -181,8 +202,20 @@ impl NiUsbTransport {
         self.srq.subscribe()
     }
 
+    /// How long to wait for a reply: the adapter's own deadline for the
+    /// transfer plus delivery margin.
+    ///
+    /// It must never be the shorter of the two. Giving up on a transfer the
+    /// adapter is still running leaves its reply to be read as the answer to
+    /// the next request, and every reply after that answers the one before —
+    /// which is why the backend floors the timeout code rather than rounding it
+    /// up, and why this is derived from the floored wait rather than from the
+    /// requested timeout.
     fn bulk_timeout(&self) -> Duration {
-        Duration::from_millis(self.timeout_ms as u64 + 2000)
+        let wait = self
+            .adapter_wait_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Duration::from_millis(u64::from(wait).saturating_add(BULK_REPLY_MARGIN_MS))
     }
 
     /// Abort any transfer the adapter still believes is in flight and clear
@@ -201,6 +234,7 @@ impl NiUsbTransport {
             let mut io = self.io.lock().await;
             let _ = MaybeFuture::wait(io.out.clear_halt());
             let _ = MaybeFuture::wait(io.r#in.clear_halt());
+            io.abandoned = None;
         }
         self.drain_bulk_in().await;
     }
@@ -215,7 +249,7 @@ impl NiUsbTransport {
     /// their response was already consumed by the one before.
     pub async fn drain_bulk_in(&self) {
         let mut io = self.io.lock().await;
-        drain_bulk_in_locked(&mut io).await;
+        drain_bulk_in_locked(&mut io, DRAIN_POLL).await;
     }
 }
 
@@ -302,14 +336,24 @@ async fn vendor_control_in(
 
 /// Read and discard any bulk response left queued by an earlier exchange.
 ///
+/// `first_wait` bounds the wait for the *first* packet, and is what makes this
+/// usable against a transfer the adapter has not finished yet: after an
+/// abandoned exchange the reply to discard does not exist until the adapter's
+/// own timeout expires, so a caller draining then has to wait that long or it
+/// will find the pipe empty, declare it clean, and be handed the late reply as
+/// the answer to its next request. Once something has arrived the rest of it is
+/// already queued behind it, so subsequent reads use the short poll.
+///
 /// Caller holds the I/O lock.
-async fn drain_bulk_in_locked(io: &mut BulkIo) {
+async fn drain_bulk_in_locked(io: &mut BulkIo, first_wait: Duration) {
     let mps = io.r#in.max_packet_size().max(1);
+    let mut wait = first_wait;
     for _ in 0..16 {
         io.r#in.submit(Buffer::new(256usize.div_ceil(mps) * mps));
-        match tokio::time::timeout(Duration::from_millis(100), io.r#in.next_complete()).await {
+        match tokio::time::timeout(wait, io.r#in.next_complete()).await {
             Ok(c) if c.status.is_ok() && !c.buffer.is_empty() => {
                 debug!(packet = %hex(&c.buffer), "ni drained stale bulk response");
+                wait = DRAIN_POLL;
             }
             // Timed out or errored: the endpoint is empty, which is normal.
             // next_complete is cancel-safe, so the timed-out transfer stays
@@ -508,20 +552,51 @@ impl NiTransport for NiUsbTransport {
             }
         }
 
-        if io.abandoned {
-            debug!("ni: draining after an abandoned transaction");
-            drain_bulk_in_locked(&mut io).await;
-            io.abandoned = false;
+        if let Some(deadline) = io.abandoned.take() {
+            // Wait out whatever the adapter was still doing when the last
+            // caller gave up, or its reply arrives after the drain and answers
+            // *this* request.
+            let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+            debug!(
+                wait_ms = wait.as_millis(),
+                "ni: draining after an abandoned transaction"
+            );
+            drain_bulk_in_locked(&mut io, wait.max(DRAIN_POLL)).await;
         }
 
         // Assume the worst until the pair completes. If this future is dropped
-        // between the halves, or the bulk-in fails, the flag stays set and the
-        // next transaction clears the orphaned reply before using the endpoint.
-        io.abandoned = true;
+        // between the halves, or the bulk-in fails, the deadline stays set and
+        // the next transaction clears the orphaned reply before using the
+        // endpoint.
+        io.abandoned = Some(tokio::time::Instant::now() + timeout);
         bulk_out_locked(&mut io, req, timeout).await?;
-        let resp = bulk_in_locked(&mut io, resp_len, timeout).await?;
-        io.abandoned = false;
-        Ok(resp)
+
+        // A reply that does not echo the request's id answers something
+        // earlier. Discard it and read again rather than handing the parser a
+        // block it will reject: one desynchronised reply otherwise makes every
+        // reply after it answer the request before, for the life of the daemon.
+        const MAX_RESYNC: usize = 4;
+        for _ in 0..MAX_RESYNC {
+            let resp = bulk_in_locked(&mut io, resp_len, timeout).await?;
+            if reply_answers_request(req, &resp) {
+                io.abandoned = None;
+                return Ok(resp);
+            }
+            warn!(
+                request = req.first().map(|b| format!("{b:#04x}")),
+                reply = resp.first().map(|b| format!("{b:#04x}")),
+                packet = %hex(&resp),
+                "ni: discarding a reply to an earlier request"
+            );
+        }
+        anyhow::bail!(
+            "ni bulk pipe is out of step: {MAX_RESYNC} replies in a row answered an earlier request"
+        )
+    }
+
+    fn set_adapter_wait(&self, wait_ms: u32) {
+        self.adapter_wait_ms
+            .store(wait_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Re-arm the adapter's interrupt monitor.

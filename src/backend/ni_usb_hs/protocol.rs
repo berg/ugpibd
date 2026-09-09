@@ -52,6 +52,11 @@ pub const REG_IMR3: u8 = 0x12;
 pub const REG_IMR0: u8 = 0x1d;
 pub const REG_HSSEL: u8 = 0x0d;
 pub const REG_CMDR: u8 = 0x1c; // TNT command register
+/// CMDR "GO": clears the Turbo488 HALT signal. While HALT is set the chip's
+/// `rdy` message is false and it accepts no data byte, holding NRFD asserted.
+pub const CMDR_GO: u8 = 0x04;
+/// CMDR "STOP": sets HALT again, so an idle chip accepts nothing.
+pub const CMDR_STOP: u8 = 0x08;
 pub const REG_KEYREG: u8 = 0x17;
 pub const REG_BSR: u8 = 0x1f; // bus control/status register (live GPIB lines)
 
@@ -398,6 +403,18 @@ pub fn parse_write_response(buf: &[u8], requested: usize) -> Result<usize> {
 /// Encode a GPIB data read (`0x0a`). The request embeds a 2-register aux write
 /// (holdoff-immediate + clear-end) exactly as the kernel driver does.
 pub fn encode_data_read(len: usize, eos_mode: u16, eos_char: u8, timeout_code: u8) -> Vec<u8> {
+    encode_data_read_with_aux(len, eos_mode, eos_char, timeout_code, &[AUX_CLEAR_END])
+}
+
+/// `encode_data_read` with an explicit set of AUXMR commands to run before the
+/// transfer starts.
+pub fn encode_data_read_with_aux(
+    len: usize,
+    eos_mode: u16,
+    eos_char: u8,
+    timeout_code: u8,
+    aux: &[u8],
+) -> Vec<u8> {
     let complement = !((len as u16).wrapping_sub(1));
     let mut buf = Vec::with_capacity(0x20);
     buf.push(NIUSB_DATA_READ_OP);
@@ -408,12 +425,24 @@ pub fn encode_data_read(len: usize, eos_mode: u16, eos_char: u8, timeout_code: u
     buf.push((complement >> 8) as u8);
     buf.push(0x00);
     buf.push(0x00);
-    // Embedded register-write block: 2 aux commands to the TNT4882.
+    // Embedded register-write block, executed before the transfer starts.
+    //
+    // Deliberately *not* the kernel driver's pair. It also writes AUX_HLDI
+    // (rfd holdoff immediately) here, and that discards a byte the chip is
+    // already holding: measured on a GPIB-USB-HS, every read issued while the
+    // talker had a byte waiting came back exactly one byte short, silently and
+    // with a matching count. Serial poll is a one-byte read, so it lost its
+    // only byte and looked like an instrument that ignores SPE.
+    //
+    // Holdoff is not lost by dropping it: init already puts the chip in
+    // holdoff-on-all-data (`AUXRA | HR_HLDA`), which is the mode that paces the
+    // talker. AUX_HLDI on top of it buys nothing and costs the pending byte.
     buf.push(NIUSB_REG_WRITE_ID);
-    buf.push(0x02);
+    buf.push(aux.len() as u8);
     buf.push(0x00);
-    buf.extend_from_slice(&[SUBDEV_TNT4882, REG_AUXMR, AUX_HLDI]);
-    buf.extend_from_slice(&[SUBDEV_TNT4882, REG_AUXMR, AUX_CLEAR_END]);
+    for cmd in aux {
+        buf.extend_from_slice(&[SUBDEV_TNT4882, REG_AUXMR, *cmd]);
+    }
     pad_to_4(&mut buf);
     push_termination(&mut buf);
     buf
@@ -459,6 +488,26 @@ pub fn parse_data_read_response(buf: &[u8], max_len: usize) -> Result<(Vec<u8>, 
     let status = parse_status_block(buf.get(i..).unwrap_or(&[]))?;
     if status.id != NIUSB_IBRD_STATUS_ID {
         bail!("ni read: bad status id {:#04x}", status.id);
+    }
+    // A read that transferred nothing is otherwise indistinguishable from one
+    // the bus refused, and the callers cannot tell them apart from the byte
+    // count: the VXI-11 read loop treats an empty chunk as "nothing yet" and
+    // retries until the client's deadline, so an addressing error would be
+    // reported as a timeout after the full wait instead of as the bus fault it
+    // is. Only the adapter's own timeout is benign here — that *is* "nothing
+    // yet" — and an aborted transfer keeps what it managed to read.
+    match status.error_code {
+        NIUSB_NO_ERROR | NIUSB_ABORTED_ERROR | NIUSB_TIMEOUT_ERROR => {}
+        NIUSB_ATN_STATE_ERROR => bail!("ni read: ATN asserted during transfer"),
+        NIUSB_ADDRESSING_ERROR => {
+            bail!("ni read: addressing error (controller not in LACS/TACS)")
+        }
+        NIUSB_EOSMODE_ERROR => {
+            bail!("ni read: eos-mode error (bad eos bits or an invalid timeout code)")
+        }
+        NIUSB_NO_BUS_ERROR => bail!("ni read: no devices on the GPIB bus"),
+        NIUSB_NO_LISTENER_ERROR => bail!("ni read: no listener on bus"),
+        code => bail!("ni read: error code {code:#04x}"),
     }
     i += 8;
     // One reserved byte, then the trailing real-length count for the last block.
@@ -508,6 +557,11 @@ pub fn encode_interface_clear() -> Vec<u8> {
 /// *microseconds*. A timeout of 0 means "wait forever" (code `0xf0`). Note the
 /// codes are not monotonic: the two longest ranges wrap around to `0x01`/`0x02`.
 ///
+/// Rounds *up*, which is what the kernel driver does and is wrong for anything
+/// whose own wait is derived from the same number: 5000 ms rounds to the 10 s
+/// step, and a daemon that gives up at 7 s abandons a transfer the adapter is
+/// still executing. Use [`timeout_code_floor`] wherever that matters.
+///
 /// There is no valid code `0x00` — sending one makes the adapter reject command
 /// and data transfers with `NIUSB_EOSMODE_ERROR`.
 pub fn timeout_code(timeout_ms: u32) -> u8 {
@@ -532,6 +586,87 @@ pub fn timeout_code(timeout_ms: u32) -> u8 {
         u if u <= 300_000_000 => 0x01,
         u if u <= 1_000_000_000 => 0x02,
         _ => 0xf0,
+    }
+}
+
+/// The adapter's timeout steps as (milliseconds, code), longest first.
+///
+/// The whole-millisecond tail of the `timeout_code` table. The sub-millisecond
+/// steps are left out: nothing here expresses a timeout in anything finer.
+const TIMEOUT_STEPS_MS: [(u32, u8); 13] = [
+    (1_000_000, 0x02),
+    (300_000, 0x01),
+    (100_000, 0xff),
+    (30_000, 0xfe),
+    (10_000, 0xfd),
+    (3_000, 0xfc),
+    (1_000, 0xfb),
+    (300, 0xfa),
+    (100, 0xf9),
+    (30, 0xf8),
+    (10, 0xf7),
+    (3, 0xf6),
+    (1, 0xf5),
+];
+
+/// Sentinel wait for the "wait forever" code, so a caller sizing its own
+/// timeout on the returned wait cannot end up waiting less than the adapter.
+pub const ADAPTER_WAIT_FOREVER_MS: u32 = u32::MAX;
+
+/// The largest timeout step at or below `timeout_ms`, as `(code, wait_ms)`.
+///
+/// The counterpart to [`timeout_code`], and the one to use when the caller also
+/// has to decide how long to wait for the reply. Rounding up hands the adapter
+/// a longer deadline than the daemon is prepared to honour, and the two must
+/// not disagree: when the daemon gives up first it abandons a transfer that is
+/// still running, and the adapter's late reply is then read as the answer to
+/// the *next* request — every reply from that point answers the one before,
+/// which no amount of retrying recovers from.
+///
+/// A `timeout_ms` of 0 keeps its "wait forever" meaning, reported as
+/// [`ADAPTER_WAIT_FOREVER_MS`].
+pub fn timeout_code_floor(timeout_ms: u32) -> (u8, u32) {
+    if timeout_ms == 0 {
+        return (0xf0, ADAPTER_WAIT_FOREVER_MS);
+    }
+    for (ms, code) in TIMEOUT_STEPS_MS {
+        if ms <= timeout_ms {
+            return (code, ms);
+        }
+    }
+    // Shorter than the shortest whole-millisecond step. Unreachable for
+    // `timeout_ms >= 1`, and the 1 ms step is still the safe answer.
+    (0xf5, 1)
+}
+
+/// Whether `reply` can be the answer to `request`, by their leading id byte.
+///
+/// The bulk pipe is strictly request/response and a reply echoes the id of the
+/// request it answers, so a reply that does not match belongs to an earlier
+/// request the daemon abandoned — the adapter finished it late and queued the
+/// result. That is worth discarding and reading again; passing it to the parser
+/// instead reports it as a malformed reply and leaves the pipe off by one.
+///
+/// Reads are the many-to-one case: a data read answers with its first data
+/// block, or straight with the status block when it read nothing, and a
+/// register read with its first data chunk. An empty request or reply is not
+/// judged here — that is the transport's problem, not a desync.
+pub fn reply_answers_request(request: &[u8], reply: &[u8]) -> bool {
+    let (Some(op), Some(id)) = (request.first().copied(), reply.first().copied()) else {
+        return true;
+    };
+    match op {
+        NIUSB_DATA_READ_OP => matches!(
+            id,
+            NIUSB_IBRD_DATA_ID | NIUSB_IBRD_EXTENDED_DATA_ID | NIUSB_IBRD_STATUS_ID
+        ),
+        NIUSB_REG_READ_ID => matches!(
+            id,
+            NIUSB_REGISTER_READ_DATA_START_ID | NIUSB_REGISTER_READ_DATA_END_ID
+        ),
+        // Everything else — take control, go to standby, IFC, command bytes,
+        // data write, register write — echoes its own opcode.
+        other => id == other,
     }
 }
 
@@ -673,15 +808,24 @@ mod tests {
         assert_eq!(no_eoi[6], 0x00, "no EOI flag");
     }
 
+    /// The read request must not carry AUX_HLDI. Writing holdoff-immediate
+    /// here discards a byte the chip is already holding — measured as exactly
+    /// one byte lost from every read whose talker was ready first, and as a
+    /// serial poll (a one-byte read) that never returned anything at all.
+    /// Holdoff is still in force: init sets holdoff-on-all-data.
     #[test]
-    fn data_read_embeds_aux_writes() {
+    fn data_read_does_not_hold_off_over_a_waiting_byte() {
         let buf = encode_data_read(64, 0, b'\n', 0);
         assert_eq!(buf[0], NIUSB_DATA_READ_OP);
         assert_eq!(buf[2], b'\n', "eos char");
-        // Embedded 2-register write block at offset 8.
-        assert_eq!(&buf[8..11], &[NIUSB_REG_WRITE_ID, 0x02, 0x00]);
-        assert_eq!(&buf[11..14], &[SUBDEV_TNT4882, REG_AUXMR, AUX_HLDI]);
-        assert_eq!(&buf[14..17], &[SUBDEV_TNT4882, REG_AUXMR, AUX_CLEAR_END]);
+        // Embedded 1-register write block at offset 8.
+        assert_eq!(&buf[8..11], &[NIUSB_REG_WRITE_ID, 0x01, 0x00]);
+        assert_eq!(&buf[11..14], &[SUBDEV_TNT4882, REG_AUXMR, AUX_CLEAR_END]);
+        assert!(
+            !buf.windows(3)
+                .any(|w| w == [SUBDEV_TNT4882, REG_AUXMR, AUX_HLDI]),
+            "the read request must not write AUX_HLDI: {buf:02x?}"
+        );
         is_4_aligned_terminated(&buf);
     }
 
@@ -697,6 +841,115 @@ mod tests {
         assert_eq!(timeout_code(300_000), 0x01); // table wraps around here
         assert_eq!(timeout_code(1_000_000), 0x02);
         assert_eq!(timeout_code(u32::MAX), 0xf0, "out of range falls back");
+    }
+
+    /// The property the daemon depends on: the adapter's wait is never longer
+    /// than the budget it was derived from. `timeout_code` rounds up and breaks
+    /// it — 5000 ms becomes a 10 s adapter wait — which is what desynchronised
+    /// the bulk pipe when the daemon gave up first.
+    #[test]
+    fn floored_timeout_codes_never_outlast_their_budget() {
+        for ms in [1u32, 2, 3, 7, 100, 999, 1500, 5000, 9999, 45_000, 250_000] {
+            let (code, wait) = timeout_code_floor(ms);
+            assert!(wait <= ms, "{ms} ms floored up to {wait} ms");
+            assert_eq!(
+                code,
+                timeout_code(wait),
+                "the code for {ms} ms must be the exact code for its own step"
+            );
+            assert_ne!(code, 0x00, "there is no valid code 0x00");
+        }
+        assert_eq!(timeout_code_floor(5000), (0xfc, 3000), "the reported case");
+        assert_eq!(timeout_code_floor(3000), (0xfc, 3000), "an exact step");
+        assert_eq!(
+            timeout_code_floor(0),
+            (0xf0, ADAPTER_WAIT_FOREVER_MS),
+            "0 still means wait forever"
+        );
+    }
+
+    #[test]
+    fn replies_are_matched_to_the_request_they_answer() {
+        // The desync seen on hardware: a late data-read reply read as the
+        // answer to a take-control, then every reply off by one after it.
+        assert!(!reply_answers_request(
+            &encode_take_control(true),
+            &[NIUSB_IBRD_DATA_ID, 0, 0, 0]
+        ));
+        assert!(!reply_answers_request(
+            &encode_command(&[GPIB_UNL], 0xfc),
+            &[NIUSB_IBCAC_ID, 0, 0, 0]
+        ));
+
+        assert!(reply_answers_request(
+            &encode_take_control(true),
+            &[NIUSB_IBCAC_ID, 0, 0, 0]
+        ));
+        assert!(reply_answers_request(
+            &encode_go_to_standby(),
+            &[NIUSB_IBGTS_ID, 0, 0, 0]
+        ));
+        assert!(reply_answers_request(
+            &encode_command(&[GPIB_UNL], 0xfc),
+            &[NIUSB_COMMAND_OP, 0, 0, 0]
+        ));
+        assert!(reply_answers_request(
+            &encode_data_write(b"x", true, 0xfc),
+            &[NIUSB_DATA_WRITE_OP, 0, 0, 0]
+        ));
+
+        // A read answers with a data block, or straight with its status block
+        // when it read nothing.
+        for id in [
+            NIUSB_IBRD_DATA_ID,
+            NIUSB_IBRD_EXTENDED_DATA_ID,
+            NIUSB_IBRD_STATUS_ID,
+        ] {
+            assert!(
+                reply_answers_request(&encode_data_read(1, 0, 0, 0xfc), &[id, 0, 0, 0]),
+                "a read must accept a {id:#04x} reply"
+            );
+        }
+        assert!(reply_answers_request(
+            &encode_register_read(&[(0, 0)]),
+            &[NIUSB_REGISTER_READ_DATA_START_ID, 0, 0, 0]
+        ));
+    }
+
+    /// A read block with `error` in its status, carrying no data.
+    fn empty_read_with(error: u8) -> Vec<u8> {
+        let mut b = vec![NIUSB_IBRD_STATUS_ID, 0x00, 0x00, error, 0, 0, 0, 0];
+        b.push(0x00);
+        b.push(0x00);
+        b
+    }
+
+    /// The adapter's timeout is "nothing yet" and must stay benign — the
+    /// VXI-11 read loop slices reads and retries on an empty chunk. Anything
+    /// else is a bus fault, and returning it as an empty read hides it: the
+    /// loop would retry until the client's deadline and report a timeout.
+    #[test]
+    fn a_read_reports_bus_faults_but_not_its_own_timeout() {
+        let (data, _end) = parse_data_read_response(&empty_read_with(NIUSB_TIMEOUT_ERROR), 1)
+            .expect("an adapter timeout is an empty read, not a failure");
+        assert!(data.is_empty());
+        parse_data_read_response(&empty_read_with(NIUSB_NO_ERROR), 1).unwrap();
+
+        for (code, want) in [
+            (NIUSB_ADDRESSING_ERROR, "addressing"),
+            (NIUSB_NO_LISTENER_ERROR, "no listener"),
+            (NIUSB_NO_BUS_ERROR, "no devices"),
+            (NIUSB_ATN_STATE_ERROR, "ATN"),
+        ] {
+            let err = parse_data_read_response(&empty_read_with(code), 1)
+                .expect_err("error code {code} must not read as an empty transfer");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(want), "error {code}: {msg}");
+            assert!(
+                !msg.to_ascii_lowercase().contains("timeout"),
+                "a bus fault must not be classified as a timeout: {msg}"
+            );
+        }
     }
 
     #[test]
