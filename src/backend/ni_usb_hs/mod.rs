@@ -509,8 +509,8 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // Deliberately no bus turnaround here.
         //
         // Leaving the instrument addressed to talk after a write does make
-        // reads on a Tabor 8026 lossless — it removes the ATN edge that
-        // instrument discards a loaded byte on — but it breaks status
+        // reads on a Tabor 8026 lossless — it removes the ATN edge the byte is
+        // lost at — but it breaks status
         // reporting on instruments that behave correctly, which is a worse
         // trade. An addressed talker starts delivering as soon as it has
         // something to say, so its output queue drains into the transfer
@@ -519,12 +519,61 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // removed and on the released build. A client waiting on SRQ would
         // simply hang, and MAV is how VXI-11 clients synchronise.
         //
+        // Re-measured on top of the SRQ re-arm fix, on both adapters, because
+        // that fix removed the mid-sequence control transfer the original
+        // measurement was taken through. The turnaround does fix the reads —
+        // 0 of 360 delayed reads on both instruments against 9 of 360, and on
+        // a GPIB-USB-HS it clears 13 read failures across 6 bench runs to 0 —
+        // but on that adapter it also breaks the poll: the 34401A reports bare
+        // MAV without RQS in 3 of 6 runs, a shape that never appears without
+        // it. A client waiting on SRQ hangs, which is worse than a short read,
+        // so it stays out until that is understood. The work is on
+        // `experiment/write-turnaround`. Shutting the acceptor (CMDR STOP)
+        // after the turnaround does not resolve it, and writes issued after a
+        // turnaround do land (verified 10 of 10), so neither is the cause.
+        //
         // The 8026 keeps an intermittent first-byte loss on reads issued well
-        // after the query; see the module docs. That is the instrument
-        // discarding a byte it has already loaded, and per its own firmware
-        // there is nothing a controller can do about it once ATN has been
-        // asserted — short of arming the read before ATN drops, which this
-        // adapter's read op does not allow.
+        // after the query; see the module docs. The loss is flat across
+        // write-to-read delays from 50 ms to 3 s and absent at 0 and 20 ms —
+        // a byte already loaded when ATN went up, not a race.
+        //
+        // The byte is lost by the adapter's firmware, not by the instrument and
+        // not by the chip. It is left parked between operations — every read op
+        // exits with HALT set and an AUX_HLDI holdoff pending — and is re-armed
+        // only inside the *next* read op. The register semantics are confirmed
+        // by NI's own TNT5002 manual: CMDR[STOP] "sets the internal HALT
+        // signal... the local nba and rdy messages become false. HALT must be
+        // cleared to transfer data bytes", and AUXMR[HLDI] "prevents the
+        // Acceptor state machine from transitioning from ANRS to ACRS. NRFD#
+        // remains asserted".
+        //
+        // The order is wrong, and the TNT4882 manual says why. Under
+        // "Generating the rdy Message": the local rdy message becomes true "if
+        // ATN is asserted" OR if four conditions hold, the first two being that
+        // HALT is not set and the FIFOs are not full, the last two that no RFD
+        // holdoff is in progress.
+        //
+        // So while ATN is asserted the acceptor is ready whatever HALT and the
+        // holdoffs say. The instant ATN falls, readiness switches to depending
+        // on exactly the two things a finished read op leaves set. Clearing
+        // them therefore has to happen *while ATN is still asserted* — and the
+        // firmware does it afterwards, in the following operation, so rdy is
+        // false across the edge. An instrument that sources its first byte on
+        // that edge and moves on, as the 8026 does, loses it there.
+        //
+        // Arming from this side does not substitute either: RESET_FIFO precedes
+        // GO in the manual's own receive sequence, so anything accepted before
+        // the read op starts is discarded by design rather than by oversight.
+        //
+        // This is the same property `ready_acceptor` exploits for the serial
+        // poll, where arming under ATN is ours to do and does fix the byte.
+        //
+        // Hence an Agilent 82357 reads the same instrument cleanly while
+        // asserting ATN at the same point (a TMS9914 acceptor free-runs and
+        // simply takes the byte), and hence NI's own driver loses it too.
+        // Clearing HALT early from this side does not substitute: the read op
+        // owns the FIFO, so a free-running TNT delivers into nothing (280 of
+        // 360, first byte doubled).
         Ok(())
     }
 
@@ -567,11 +616,36 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
             } else {
                 &[GPIB_UNL, listen_address(self.my_pad), talk_address(pad)]
             };
-            // Address with ATN, ready the acceptor while ATN is still up, then
-            // release it — so a talker that answers on the edge is taken rather
-            // than refused. The byte lands in the chip's data-in register,
-            // which the adapter's read op does not look at, so collect it here
-            // and let the op fetch the rest.
+            // Address with ATN and drop to standby in one go.
+            //
+            // Leave the acceptor alone around this. Its state when ATN falls
+            // does dominate the first byte of the response, but every
+            // rearrangement measured is worse. On a Tabor 8026, 360 reads per
+            // arm unless noted, against 9/360 for this code: HALT set before
+            // ATN falls 167/360; HALT cleared (AUX_FH + CMDR_GO) 280/360, with
+            // the first byte doubled; CMDR_GO alone doubles every byte;
+            // finish-handshake only 7/24; go-to-standby in continuous-listen
+            // mode 7/24; the kernel's AUX_HLDI in the read request 2/24;
+            // bundled with the read into one bulk-out 13/360; +50 ms before the
+            // read op 1/24. Init-time configuration is no better: holdoff on
+            // END rather than all data 18/360, no holdoff 3/32, T1 at 2000 ns
+            // 4/32.
+            //
+            // Arming the acceptor early cannot work at any timescale, and this
+            // is why: the read op issues CMDR RESET FIFO before its GO, every
+            // time — which is the order NI's own manual prescribes for a
+            // receive, not a firmware quirk. Whatever an armed chip accepted
+            // before that op started is discarded. Bundling the arm, the go-to-standby and the read into
+            // a single bulk-out — so the firmware runs all three with no USB
+            // round trip between them — still returns the response starting
+            // mid-string. There is no window small enough.
+            //
+            // Two of those generalise. Clearing HALT lets the chip free-run
+            // with no read op armed, and the doubled first byte proves the read
+            // op already takes whatever DIR holds — so there is nothing to
+            // collect there, contrary to what this comment used to claim. And
+            // the window's duration does not matter: widening it 50 ms and
+            // collapsing it to nothing both leave the rate where it was.
             self.send_command(cmd, true).await?;
             self.read_addressing = Some(want);
         }

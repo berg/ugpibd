@@ -402,6 +402,17 @@ pub fn parse_write_response(buf: &[u8], requested: usize) -> Result<usize> {
 
 /// Encode a GPIB data read (`0x0a`). The request embeds a 2-register aux write
 /// (holdoff-immediate + clear-end) exactly as the kernel driver does.
+/// There is a second read opcode, 0x0B, on both adapters. It shares the same
+/// arming path as 0x0A and is still terminated with CMDR STOP, but its epilogue
+/// omits the unconditional `AUX_HLDI`/clear-END pair, so it leaves no pending
+/// RFD holdoff (GPIB-USB-HS handler 0x2456/0x2457 with epilogue 0x27A8;
+/// GPIB-USB-HS+ handler 0x0101909c with epilogue 0x01019244). It is not a drop-in: it takes
+/// a 32-bit count in a different operand order, and it returns its payload on
+/// EP8 (wire 0x88) rather than the EP4 this transport opens — only its status
+/// block arrives on 0x84. Noted because it looks useful and is not: the loss it
+/// would appear to address, a read straight after a serial poll, is caused by
+/// the poll's own SPE/SPD asserting ATN over a byte the instrument has already
+/// loaded, which no holdoff change affects.
 pub fn encode_data_read(len: usize, eos_mode: u16, eos_char: u8, timeout_code: u8) -> Vec<u8> {
     encode_data_read_with_aux(len, eos_mode, eos_char, timeout_code, &[AUX_CLEAR_END])
 }
@@ -425,18 +436,34 @@ pub fn encode_data_read_with_aux(
     buf.push((complement >> 8) as u8);
     buf.push(0x00);
     buf.push(0x00);
-    // Embedded register-write block, executed before the transfer starts.
+    // A register-write block, which runs *after* the transfer, not before.
+    //
+    // It is not embedded in the read op at all: both firmwares' 0x0A handlers
+    // consume exactly the seven operand bytes above and return to the
+    // dispatcher, which then executes this as the next operation in the
+    // stream. So it lands after the transfer has completed, after the
+    // firmware's own STOP, and after the AUX_HLDI the firmware issues in its
+    // epilogue. (GPIB-USB-HS handler 0x3809, epilogue 0x3A2B; GPIB-USB-HS+
+    // handler 0x010192bc, epilogue 0x01019554.)
+    //
+    // The GPIB-USB-HS addresses here are from one firmware build. A second
+    // build, read off a different adapter, places the same handler at 0x37E8
+    // with its epilogue at 0x3A03 and is instruction-identical once register
+    // allocation is normalised away — so this holds across both.
     //
     // Deliberately *not* the kernel driver's pair. It also writes AUX_HLDI
     // (rfd holdoff immediately) here, and that discards a byte the chip is
     // already holding: measured on a GPIB-USB-HS, every read issued while the
     // talker had a byte waiting came back exactly one byte short, silently and
     // with a matching count. Serial poll is a one-byte read, so it lost its
-    // only byte and looked like an instrument that ignores SPE.
+    // only byte and looked like an instrument that ignores SPE. Given the
+    // ordering above, what it discards is the byte held for the *next* read.
     //
-    // Holdoff is not lost by dropping it: init already puts the chip in
-    // holdoff-on-all-data (`AUXRA | HR_HLDA`), which is the mode that paces the
-    // talker. AUX_HLDI on top of it buys nothing and costs the pending byte.
+    // Holdoff is not lost by dropping it, and not for the reason first
+    // recorded here: the read op rewrites AUXRA itself with holdoff-on-all-data
+    // cleared and holdoff-on-END set, so whatever init configured does not
+    // survive a read. What holds the bus afterwards is the firmware's own
+    // unconditional AUX_HLDI, which no host block is needed to supply.
     buf.push(NIUSB_REG_WRITE_ID);
     buf.push(aux.len() as u8);
     buf.push(0x00);
@@ -542,6 +569,21 @@ pub fn encode_take_control(synchronous: bool) -> Vec<u8> {
 }
 
 /// Release ATN and go to standby.
+///
+/// The argument byte must stay zero. It is not a "do the full setup" flag: a
+/// non-zero value means *go to standby as an unaddressed continuous listener*,
+/// and the firmware rejects it with status 3 unless the board is CIC, ATN is
+/// still asserted, and the board is addressed as neither talker nor listener
+/// (GPIB-USB-HS handler 0x586A, checks at 0x58CC/0x58CF/0x58D2; a second
+/// build places it at 0x5882 with the same tests at 0x58E2/0x58E7/0x58EA and
+/// is otherwise instruction-identical). Every read
+/// here has just sent its own listen address, so LA is set and the op is
+/// refused — and since the reply is not parsed, it fails silently and ATN is
+/// never released. Measured with the byte set to 1 on a GPIB-USB-HS: every
+/// read short and every poll timing out with error 17.
+///
+/// The request is three operand bytes either way — `[flag, eos_bits, eos_char]`
+/// — so this is a semantic constraint, not a framing one.
 pub fn encode_go_to_standby() -> Vec<u8> {
     encode_simple_op(NIUSB_IBGTS_ID, 0x00)
 }
