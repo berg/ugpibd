@@ -65,7 +65,17 @@ async fn main() -> Result<()> {
 
         // NI vendor reads that carry identity. Read-only; a device that does
         // not implement one simply stalls.
-        for (req, what) in [(0x41u8, "serial number"), (0x40, "poll ready")] {
+        //
+        // 0x40 is the one that matters: on a GPIB-USB-HS its reply carries the
+        // firmware version block stored in the EEPROM between the two firmware
+        // images — bytes 6..10 of the reply are that block's version field and
+        // checksum. 0x48/0x4b are what the HS+ init path reads.
+        for (req, what) in [
+            (0x41u8, "serial number"),
+            (0x40, "poll ready/ver"),
+            (0x48, "hs+ init 0x48"),
+            (0x4b, "hs+ init 0x4b"),
+        ] {
             match dev
                 .control_in(
                     nusb::transfer::ControlIn {
