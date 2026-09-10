@@ -332,6 +332,14 @@ needs `bus_lines()` and a look at ATN.
   HiSLIP conformance and the `hislip-stress` suite pass, including SRQ push and
   MAV-driven service requests.
 
+- **USBTMC** — Rigol DHO824 (`1ab1:044d`, fw 00.01.04) and Siglent SDG2122X
+  (fw 2.01.01), on macOS, over VXI-11: `*IDN?`, real device queries, and
+  timeout recovery (an unsupported query fails, the next command succeeds, the
+  device stays alive). The Rigol advertises no USB488 capabilities and needs
+  the status-byte and stale-fragment workarounds; the Siglent advertises
+  remote/local, TRIGGER and SR1 and behaves to spec. Serial poll, SRQ and
+  trigger on the Siglent are not yet exercised.
+
 Two instruments asserting SRQ at almost the same moment used to lose the
 second request: SRQ is a wired-OR line and the adapter notifies on a
 transition, so a device asserting while the line is already low produces no new
@@ -401,9 +409,10 @@ resource strings above work with the `,9010` removed.
 
 ## USBTMC backend
 
-Implemented against the USBTMC 1.0 and USB488 specifications and **never run
-on hardware**. Candidate instruments: a Siglent SDG2042X and a Rigol DHO804,
-both USB488 with an interrupt endpoint. First contact:
+Implemented against the USBTMC 1.0 and USB488 specifications. Verified for
+request/response on two instruments (2026-09-10): a Rigol DHO824 and a Siglent
+SDG2122X, both USB488 with an interrupt endpoint. Serial poll, SRQ, trigger and
+GTL/LLO are advertised by the Siglent but not yet exercised. First contact:
 
 ```bash
 ugpibd --list                       # the instrument appears as backend usbtmc

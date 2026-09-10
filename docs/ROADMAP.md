@@ -81,11 +81,12 @@ item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
 
-## 6. USBTMC backend: untested, and one instrument per process
+## 6. USBTMC backend: one instrument per process, address ignored
 
 **Now:** `--backend usbtmc` drives any USB488 interface through the GPIB
-trait, written against the specification and not yet run on hardware. The
-trait's primary address is ignored: a USB488 interface is one instrument, so
+trait. Verified on a Rigol DHO824 and a Siglent SDG2122X (request/response
+over VXI-11: identity, real queries, and timeout recovery). The trait's
+primary address is ignored: a USB488 interface is one instrument, so
 `gpib0,5` and `gpib0,14` reach the same device. The lock registry keys on the
 address, so two clients using different addresses for the same USBTMC
 instrument do not contend for a lock.

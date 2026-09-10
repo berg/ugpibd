@@ -29,7 +29,7 @@ untested, but take the same code path as the GPIB-USB-HS.
 
 The `usbtmc` backend puts an instrument's own USB port on the network. It is
 one instrument per daemon, so the GPIB address in a resource string is
-ignored, and it is not yet verified on hardware.
+ignored. Verified on a Rigol DHO824 and a Siglent SDG2122X.
 
 The adapter is picked with `--backend`; the default, `auto`, detects a single
 connected adapter by USB id.

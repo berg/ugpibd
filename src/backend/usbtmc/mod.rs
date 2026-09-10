@@ -43,7 +43,7 @@ use protocol::*;
 pub const ID: &str = "usbtmc";
 
 /// Human-readable description shown by `--backend list`.
-pub const DESCRIPTION: &str = "any USBTMC/USB488 instrument (USB class fe/03; untested)";
+pub const DESCRIPTION: &str = "any USBTMC/USB488 instrument (USB class fe/03)";
 
 /// Cap on one REQUEST_DEV_DEP_MSG_IN. Front-ends ask for 64 KiB at a time, so
 /// this only bounds what an unusual caller can make a device queue.
