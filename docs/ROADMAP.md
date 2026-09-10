@@ -112,8 +112,9 @@ byte rather than stalling the whole timeout on every poll. The scope also wedged
 (USB stopped responding) under `hardware_exercise.py`, which is a DMM script: it
 sends many unsupported queries that time out, each provoking abort/clear recovery,
 across a dozen concurrent VISA sessions. Recovery was softened to abort bulk-IN and
-escalate to INITIATE_CLEAR only if that fails, but this firmware is fragile enough
-that a USBTMC-shaped exercise script is still wanted.
+escalate to INITIATE_CLEAR only if that fails. `contrib/usbtmc_exercise.py` is the
+USBTMC-shaped exercise (488.2 status model, serial poll, SRQ push, trigger,
+remote/local, timeout recovery), replacing the DMM `hardware_exercise.py` here.
 
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 
