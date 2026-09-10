@@ -69,6 +69,15 @@ struct BulkIo {
     r#in: Endpoint<Bulk, In>,
 }
 
+/// Render a short packet as hex for the debug log, so a malformed reply from a
+/// misbehaving device can be read byte by byte.
+fn hex(data: &[u8]) -> String {
+    data.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub struct UsbtmcTransport {
     interface: nusb::Interface,
     /// Held so the device stays open for the transport's lifetime.
@@ -276,7 +285,10 @@ impl TmcTransport for UsbtmcTransport {
     }
 
     async fn bulk_in(&self, max_len: usize) -> Result<Vec<u8>> {
-        let timeout = self.timeout();
+        self.bulk_in_within(max_len, self.timeout()).await
+    }
+
+    async fn bulk_in_within(&self, max_len: usize, wait: Duration) -> Result<Vec<u8>> {
         let mut io = self.io.lock().await;
         let mps = io.r#in.max_packet_size().max(1);
         let mut data = Vec::with_capacity(max_len.min(MAX_URB));
@@ -287,13 +299,13 @@ impl TmcTransport for UsbtmcTransport {
         while data.len() < max_len {
             let want = (max_len - data.len()).min(MAX_URB).div_ceil(mps) * mps;
             io.r#in.submit(Buffer::new(want));
-            let completion = match tokio::time::timeout(timeout, io.r#in.next_complete()).await {
+            let completion = match tokio::time::timeout(wait, io.r#in.next_complete()).await {
                 Ok(c) => c,
                 Err(_) => {
                     // Leave nothing behind: the transfer is still pending and
                     // would otherwise complete into the next caller's read.
                     discard_pending(&mut io.r#in).await;
-                    bail!("usbtmc bulk-in timed out after {timeout:?}");
+                    bail!("usbtmc bulk-in timed out after {wait:?}");
                 }
             };
             completion
@@ -305,7 +317,7 @@ impl TmcTransport for UsbtmcTransport {
                 break;
             }
         }
-        debug!(len = data.len(), "usbtmc bulk-in");
+        debug!(len = data.len(), packet = %hex(&data), "usbtmc bulk-in");
         Ok(data)
     }
 

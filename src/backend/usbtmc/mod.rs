@@ -65,6 +65,17 @@ const DRAIN_READ: usize = 4096;
 /// at once; this only bounds the flaky case.
 const STATUS_BYTE_WAIT_MS: u64 = 1000;
 
+/// How many extra bulk-IN reads to spend skipping stale fragments before a
+/// read gives up. A Rigol DHO800 leaves a short fragment from an aborted read
+/// in the pipe that its own clear does not flush; discarding it and reading
+/// again recovers the real reply.
+const READ_RESYNC_ATTEMPTS: usize = 3;
+
+/// Wait for each of those resync reads. Short, because if the real reply is
+/// coming it is already queued behind the fragment, and if it is not, this is
+/// wasted time repeated a few times.
+const READ_RESYNC_WAIT_MS: u64 = 300;
+
 /// The USB operations the backend needs, abstracted so the message sequencing
 /// and the abort/clear handshakes are unit-tested against a mock.
 #[async_trait::async_trait]
@@ -76,6 +87,15 @@ pub trait TmcTransport: Send + Sync {
     /// sends up to the short packet that ends the transfer. On a timeout the
     /// transport must leave nothing of its own queued on the endpoint.
     async fn bulk_in(&self, max_len: usize) -> Result<Vec<u8>>;
+
+    /// As [`bulk_in`](Self::bulk_in), but waiting only `wait` rather than the
+    /// full GPIB timeout. Used to skip stale fragments a flaky device leaves
+    /// in the pipe without stalling the whole timeout when there is nothing
+    /// more to read. The default ignores `wait`.
+    async fn bulk_in_within(&self, max_len: usize, wait: Duration) -> Result<Vec<u8>> {
+        let _ = wait;
+        self.bulk_in(max_len).await
+    }
 
     /// A class control-IN request. `index` is the interface number or the
     /// endpoint address, as the recipient demands.
@@ -406,22 +426,55 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
         .await?;
 
         self.pending_in = Some(tag);
-        let buf = match self
-            .transport
-            .bulk_in(HEADER_LEN + want + pad_len(want))
-            .await
-        {
-            Ok(buf) => buf,
-            Err(e) => return self.fail(e.context("usbtmc read")).await,
-        };
-        let msg = match parse_dev_dep_msg_in(&buf, tag) {
-            Ok(msg) => msg,
-            // Garbled, short, or an answer to an earlier request: `pending_in`
-            // is still set, so recovery aborts bulk-IN, which also drains a
-            // stale reply sitting in the pipe. Only if that abort itself fails
-            // does it escalate to INITIATE_CLEAR — the heavier reset that a
-            // fragile device is happiest not seeing on every unsupported query.
-            Err(e) => return self.fail(e).await,
+        let cap = HEADER_LEN + want + pad_len(want);
+        let resync_wait =
+            Duration::from_millis(u64::from(self.timeout_ms).min(READ_RESYNC_WAIT_MS));
+
+        // Read, and if the reply cannot be parsed — too short, wrong MsgID, or
+        // an answer to an earlier request — discard it and read again. A Rigol
+        // DHO800 leaves a stale fragment in the pipe after an aborted read that
+        // its own clear does not flush, so the real reply is queued behind it;
+        // skipping the fragment recovers it. The first read waits the full
+        // timeout, the resync reads only briefly, so a device that genuinely
+        // has nothing more does not restall the whole timeout each attempt.
+        let mut parse_err = None;
+        let mut msg = None;
+        for attempt in 0..=READ_RESYNC_ATTEMPTS {
+            let buf = if attempt == 0 {
+                self.transport.bulk_in(cap).await
+            } else {
+                self.transport.bulk_in_within(cap, resync_wait).await
+            };
+            let buf = match buf {
+                Ok(buf) => buf,
+                // A transport error on the first read is a real timeout; on a
+                // resync read it just means nothing more is queued, so the
+                // fragment was all there was — surface the parse error.
+                Err(e) if attempt == 0 => return self.fail(e.context("usbtmc read")).await,
+                Err(_) => break,
+            };
+            match parse_dev_dep_msg_in(&buf, tag) {
+                Ok(m) => {
+                    msg = Some(m);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        attempt,
+                        "usbtmc: discarding an unparseable bulk-in reply, re-reading: {e:#}"
+                    );
+                    parse_err = Some(e);
+                }
+            }
+        }
+        let Some(msg) = msg else {
+            // pending_in is still set, so recovery aborts bulk-IN, which also
+            // drains whatever is stuck. Only if that abort itself fails does it
+            // escalate to INITIATE_CLEAR — the heavier reset a fragile device
+            // is happiest not seeing on every unsupported query.
+            return self
+                .fail(parse_err.expect("a failed read left no error"))
+                .await;
         };
         self.pending_in = None;
         if msg.data.len() < msg.transfer_size {
@@ -468,6 +521,23 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
         // abort whatever a dead predecessor left in flight and start from
         // empty buffers.
         self.clear_device().await.context("initial device clear")?;
+        // Some firmware (a Rigol DHO800) leaves a stale response queued that
+        // INITIATE_CLEAR reports flushed but is not — it surfaces on the first
+        // read and corrupts it. Pull it now with a couple of brief reads so the
+        // first real command starts clean. Best-effort and quiet: on a healthy
+        // device these just time out with nothing.
+        let drain_wait = Duration::from_millis(u64::from(self.timeout_ms).min(READ_RESYNC_WAIT_MS));
+        for _ in 0..READ_RESYNC_ATTEMPTS {
+            match self.transport.bulk_in_within(DRAIN_READ, drain_wait).await {
+                Ok(buf) if !buf.is_empty() => {
+                    warn!(
+                        len = buf.len(),
+                        "usbtmc: drained a stale response left over at open"
+                    )
+                }
+                _ => break,
+            }
+        }
         if self.caps.remote_local {
             if let Err(e) = self.ren(true).await {
                 warn!("usbtmc: could not assert REN at init: {e:#}");
@@ -941,6 +1011,34 @@ mod tests {
             "should not escalate: {reqs:?}"
         );
         assert!(be.pending_out.is_none() && be.pending_in.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_skips_a_stale_fragment_and_returns_the_real_reply() {
+        // The Rigol case: a short fragment left in the pipe, the real reply
+        // queued behind it. The read discards the fragment and re-reads.
+        let mut be = ready(usb488_caps()).await;
+        be.transport.queue_in(Ok(vec![0x01, 0x1d])); // a 2-byte fragment
+        be.transport
+            .queue_in(Ok(in_transfer(be.tag + 1, b"RIGOL,DHO824", 0x01)));
+        let (data, end) = be.read(5, 64).await.unwrap();
+        assert_eq!(data, b"RIGOL,DHO824");
+        assert!(end);
+        // Recovered by re-reading, not by aborting or clearing the device.
+        assert!(be.transport.controls.lock().unwrap().is_empty());
+        assert!(be.pending_in.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_gives_up_after_only_fragments() {
+        let mut be = ready(usb488_caps()).await;
+        // Nothing but a fragment, then the pipe is empty.
+        be.transport.queue_in(Ok(vec![0x01, 0x1d]));
+        let e = format!("{:#}", be.read(5, 64).await.unwrap_err());
+        assert!(e.contains("shorter than"), "{e}");
+        // The read gave up and ran recovery.
+        let reqs = be.transport.requests();
+        assert!(reqs.contains(&REQ_INITIATE_ABORT_BULK_IN), "{reqs:?}");
     }
 
     #[tokio::test]
