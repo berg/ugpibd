@@ -380,12 +380,12 @@ impl TmcTransport for UsbtmcTransport {
 
     /// Wait for the notification tagged `tag`. Earlier tags still queued are
     /// answers to polls whose caller gave up, and are dropped.
-    async fn status_byte_notification(&self, tag: u8) -> Result<u8> {
+    async fn status_byte_notification(&self, tag: u8, wait: Duration) -> Result<u8> {
         let Some(rx) = &self.status_bytes else {
             bail!("this interface has no interrupt endpoint");
         };
         let mut rx = rx.lock().await;
-        let deadline = tokio::time::Instant::now() + self.timeout();
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             let next = tokio::time::timeout_at(deadline, rx.recv())
                 .await

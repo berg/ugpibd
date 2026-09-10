@@ -60,6 +60,11 @@ const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Size of the reads that empty a bulk-IN FIFO during abort and clear.
 const DRAIN_READ: usize = 4096;
 
+/// Longest wait for a READ_STATUS_BYTE reply on the interrupt endpoint before
+/// falling back to the control reply's byte. A status byte is meant to arrive
+/// at once; this only bounds the flaky case.
+const STATUS_BYTE_WAIT_MS: u64 = 1000;
+
 /// The USB operations the backend needs, abstracted so the message sequencing
 /// and the abort/clear handshakes are unit-tested against a mock.
 #[async_trait::async_trait]
@@ -102,10 +107,14 @@ pub trait TmcTransport: Send + Sync {
         false
     }
 
-    /// Wait for the READ_STATUS_BYTE reply tagged `tag` on the interrupt
-    /// endpoint and return the status byte it carried.
-    async fn status_byte_notification(&self, tag: u8) -> Result<u8> {
-        let _ = tag;
+    /// Wait up to `wait` for the READ_STATUS_BYTE reply tagged `tag` on the
+    /// interrupt endpoint and return the status byte it carried.
+    ///
+    /// Bounded separately from the GPIB timeout because a status byte is
+    /// meant to arrive at once: waiting the whole timeout on a device that
+    /// never delivers it — a Rigol DHO800 is one — would stall every poll.
+    async fn status_byte_notification(&self, tag: u8, wait: Duration) -> Result<u8> {
+        let _ = (tag, wait);
         bail!("this interface has no interrupt endpoint")
     }
 
@@ -155,6 +164,13 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
     /// What the interface advertised at init.
     pub fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    /// How long to wait for a status byte on the interrupt endpoint: capped
+    /// well below the GPIB timeout so a device that never delivers it does not
+    /// stall every poll for the full timeout.
+    fn status_byte_wait(&self) -> Duration {
+        Duration::from_millis(u64::from(self.timeout_ms).min(STATUS_BYTE_WAIT_MS))
     }
 
     fn take_tag(&mut self) -> u8 {
@@ -400,13 +416,12 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
         };
         let msg = match parse_dev_dep_msg_in(&buf, tag) {
             Ok(msg) => msg,
-            // A reply for some other request: the pipe is out of step and a
-            // plain abort will not fix it, so make the next call clear.
-            Err(e) => {
-                self.pending_in = None;
-                self.pending_out = Some(tag);
-                return self.fail(e).await;
-            }
+            // Garbled, short, or an answer to an earlier request: `pending_in`
+            // is still set, so recovery aborts bulk-IN, which also drains a
+            // stale reply sitting in the pipe. Only if that abort itself fails
+            // does it escalate to INITIATE_CLEAR — the heavier reset that a
+            // fragile device is happiest not seeing on every unsupported query.
+            Err(e) => return self.fail(e).await,
         };
         self.pending_in = None;
         if msg.data.len() < msg.transfer_size {
@@ -522,9 +537,17 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
         check_status("LOCAL_LOCKOUT", &reply)
     }
 
-    /// USB488 §4.3.1.2: the status byte comes back in the control reply on
-    /// an interface without an interrupt endpoint, and on the interrupt
-    /// endpoint — tagged to match — when there is one.
+    /// USB488 §4.3.1.2: the status byte comes back in the control reply on an
+    /// interface without an interrupt endpoint, and on the interrupt endpoint —
+    /// tagged to match — when there is one.
+    ///
+    /// The spec calls the control reply's byte undefined when an interrupt
+    /// endpoint is present, but a Rigol DHO800 delivers the interrupt late or
+    /// not at all while filling that byte in anyway. So wait briefly for the
+    /// interrupt and fall back to the control byte: a compliant device is read
+    /// from the endpoint the spec names, and a flaky one still answers without
+    /// stalling the whole timeout on every poll (the HiSLIP front-end polls
+    /// after every write).
     async fn serial_poll(&mut self, _pad: u8) -> Result<u8> {
         self.require_usb488("serial poll")?;
         self.status_tag = next_status_tag(self.status_tag);
@@ -540,14 +563,24 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
                 reply.get(1)
             );
         }
+        let control_byte = reply.get(2).copied();
         if self.transport.has_interrupt_in() {
-            self.transport.status_byte_notification(tag).await
-        } else {
-            reply
-                .get(2)
-                .copied()
-                .context("READ_STATUS_BYTE reply is missing the status byte")
+            let wait = self.status_byte_wait();
+            match self.transport.status_byte_notification(tag, wait).await {
+                Ok(stb) => return Ok(stb),
+                Err(e) => match control_byte {
+                    Some(stb) => {
+                        debug!(
+                            "usbtmc: no status byte on the interrupt endpoint \
+                             ({e:#}); using the control reply's {stb:#04x}"
+                        );
+                        return Ok(stb);
+                    }
+                    None => return Err(e).context("READ_STATUS_BYTE via the interrupt endpoint"),
+                },
+            }
         }
+        control_byte.context("READ_STATUS_BYTE reply is missing the status byte")
     }
 
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
@@ -630,6 +663,9 @@ mod tests {
         caps: Vec<u8>,
         stb: u8,
         interrupt: bool,
+        /// Whether the interrupt endpoint actually delivers the notification.
+        /// A Rigol DHO800 sometimes does not, which is the fallback path.
+        deliver_notification: bool,
         /// Status byte the interrupt endpoint would deliver, keyed by tag.
         notified: StdMutex<Vec<(u8, u8)>>,
     }
@@ -658,6 +694,7 @@ mod tests {
                 caps,
                 stb: 0x50,
                 interrupt: false,
+                deliver_notification: true,
                 notified: StdMutex::new(vec![]),
             }
         }
@@ -700,12 +737,13 @@ mod tests {
                 REQ_GET_CAPABILITIES => self.caps.clone(),
                 REQ_CHECK_CLEAR_STATUS => vec![STATUS_SUCCESS, 0],
                 REQ_READ_STATUS_BYTE => {
-                    if self.interrupt {
+                    // The status byte is always in the control reply here; the
+                    // interrupt notification is delivered too, unless the
+                    // device is one that drops it.
+                    if self.interrupt && self.deliver_notification {
                         self.notified.lock().unwrap().push((value as u8, self.stb));
-                        vec![STATUS_SUCCESS, value as u8, 0]
-                    } else {
-                        vec![STATUS_SUCCESS, value as u8, self.stb]
                     }
+                    vec![STATUS_SUCCESS, value as u8, self.stb]
                 }
                 REQ_INITIATE_ABORT_BULK_IN | REQ_INITIATE_ABORT_BULK_OUT => {
                     vec![STATUS_SUCCESS, value as u8]
@@ -737,7 +775,7 @@ mod tests {
         fn has_interrupt_in(&self) -> bool {
             self.interrupt
         }
-        async fn status_byte_notification(&self, tag: u8) -> Result<u8> {
+        async fn status_byte_notification(&self, tag: u8, _wait: Duration) -> Result<u8> {
             let mut n = self.notified.lock().unwrap();
             let pos = n
                 .iter()
@@ -887,16 +925,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_step_reply_makes_the_next_call_clear_the_device() {
+    async fn out_of_step_reply_recovers_by_aborting_bulk_in() {
         let mut be = ready(usb488_caps()).await;
         // The device answers with the reply to some earlier request.
         be.transport.queue_in(Ok(in_transfer(9, b"stale", 0x01)));
-        let e = be.read(5, 64).await.unwrap_err().to_string();
+        let e = format!("{:#}", be.read(5, 64).await.unwrap_err());
         assert!(e.contains("out of step"), "{e}");
-        // A plain abort reports nothing in flight on the device's side, so
-        // the recovery escalates to INITIATE_CLEAR.
+        // Recovery drains the pipe by aborting bulk-IN, which reads out the
+        // stale reply. It does not touch bulk-OUT or clear the whole device
+        // for what is only a stale read.
         let reqs = be.transport.requests();
-        assert!(reqs.contains(&REQ_INITIATE_ABORT_BULK_OUT), "{reqs:?}");
+        assert!(reqs.contains(&REQ_INITIATE_ABORT_BULK_IN), "{reqs:?}");
+        assert!(
+            !reqs.contains(&REQ_INITIATE_ABORT_BULK_OUT) && !reqs.contains(&REQ_INITIATE_CLEAR),
+            "should not escalate: {reqs:?}"
+        );
         assert!(be.pending_out.is_none() && be.pending_in.is_none());
     }
 
@@ -995,6 +1038,19 @@ mod tests {
         be.init(0).await.unwrap();
         assert_eq!(be.serial_poll(5).await.unwrap(), 0x44);
         assert!(be.transport.notified.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serial_poll_falls_back_to_the_control_reply_when_the_interrupt_is_silent() {
+        // A Rigol DHO800: interrupt endpoint present, notification never
+        // delivered, status byte in the control reply instead.
+        let mut t = MockTransport::new(usb488_caps());
+        t.interrupt = true;
+        t.deliver_notification = false;
+        t.stb = 0x41;
+        let mut be = UsbtmcBackend::new(t, 3000);
+        be.init(0).await.unwrap();
+        assert_eq!(be.serial_poll(5).await.unwrap(), 0x41);
     }
 
     #[tokio::test]

@@ -101,6 +101,19 @@ key. Hotplug autostart also matches USBTMC devices now, so a host with several
 instruments and `UGPIBD_AUTOSTART=yes` needs the one-process-per-device
 service template that does not exist yet.
 
+**Seen on a Rigol DHO824 (2026-09-10), first hardware contact:** open, capabilities,
+device clear, REN and `*IDN?` all work over VXI-11. Two firmware quirks handled:
+the interface advertises `bcdUSBTMC` and `bcdUSB488` both as `210` (its `bcdUSB`,
+not a real version), and it delivers the READ_STATUS_BYTE reply on the interrupt
+endpoint late or not at all while filling in the control reply's status byte — so
+the serial poll waits briefly for the interrupt and then falls back to the control
+byte rather than stalling the whole timeout on every poll. The scope also wedged
+(USB stopped responding) under `hardware_exercise.py`, which is a DMM script: it
+sends many unsupported queries that time out, each provoking abort/clear recovery,
+across a dozen concurrent VISA sessions. Recovery was softened to abort bulk-IN and
+escalate to INITIATE_CLEAR only if that fails, but this firmware is fragile enough
+that a USBTMC-shaped exercise script is still wanted.
+
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 
 Removed as an open gap, recorded because the failure mode is invisible and
