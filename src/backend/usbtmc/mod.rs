@@ -162,6 +162,10 @@ pub struct UsbtmcBackend<T: TmcTransport> {
     eos_char: u8,
     eos_enabled: bool,
     timeout_ms: u32,
+    /// Serve serial poll from a `*STB?` query rather than READ_STATUS_BYTE.
+    /// Set at init when the two disagree — cheap firmware (a Siglent SDG)
+    /// answers READ_STATUS_BYTE with a sentinel while `*STB?` is correct.
+    status_via_stb_query: bool,
 }
 
 impl<T: TmcTransport> UsbtmcBackend<T> {
@@ -178,6 +182,7 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
             eos_char: b'\n',
             eos_enabled: false,
             timeout_ms,
+            status_via_stb_query: false,
         }
     }
 
@@ -493,6 +498,122 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
         );
         Ok((msg.data, msg.eom || msg.term_char_seen))
     }
+
+    /// Read the status byte the USB488 way: READ_STATUS_BYTE, then take the
+    /// byte from the interrupt endpoint when the interface has one (as the
+    /// Linux kernel driver does), else from the control reply.
+    ///
+    /// The interrupt is where the spec puts the byte, but where cheap firmware
+    /// gets it wrong — hence the init-time probe against `*STB?`, which flips
+    /// `serial_poll` to [`read_status_byte_via_query`](Self::read_status_byte_via_query)
+    /// when this disagrees with the instrument's own answer.
+    async fn read_status_byte_native(&mut self) -> Result<u8> {
+        self.status_tag = next_status_tag(self.status_tag);
+        let tag = self.status_tag;
+        let reply = self
+            .interface_request(REQ_READ_STATUS_BYTE, u16::from(tag), 3)
+            .await
+            .context("READ_STATUS_BYTE")?;
+        check_status("READ_STATUS_BYTE", &reply)?;
+        if reply.get(1) != Some(&tag) {
+            bail!(
+                "READ_STATUS_BYTE reply carries bTag {:?}, expected {tag}",
+                reply.get(1)
+            );
+        }
+        let control_byte = reply.get(2).copied();
+        if self.transport.has_interrupt_in() {
+            let wait = self.status_byte_wait();
+            match self.transport.status_byte_notification(tag, wait).await {
+                Ok(stb) => return Ok(stb),
+                // A device with an interrupt endpoint that does not deliver:
+                // the control byte is defined as reserved here, but a Rigol
+                // DHO800 fills it in correctly, so it is a better guess than
+                // failing outright.
+                Err(e) => match control_byte {
+                    Some(stb) => {
+                        debug!(
+                            "usbtmc: no status byte on the interrupt endpoint \
+                             ({e:#}); using the control reply's {stb:#04x}"
+                        );
+                        return Ok(stb);
+                    }
+                    None => return Err(e).context("READ_STATUS_BYTE via the interrupt endpoint"),
+                },
+            }
+        }
+        control_byte.context("READ_STATUS_BYTE reply is missing the status byte")
+    }
+
+    /// Read the status byte with an IEEE 488.2 `*STB?` query — the fallback for
+    /// a device whose USB488 READ_STATUS_BYTE lies (see the probe below). This
+    /// is ordinary bulk traffic, not a control transfer, so it only serves a
+    /// device that has proven it needs it.
+    async fn read_status_byte_via_query(&mut self) -> Result<u8> {
+        self.write_message(b"*STB?", true).await?;
+        let (data, _end) = self.read_message(64).await?;
+        let text = std::str::from_utf8(&data)
+            .context("*STB? reply is not UTF-8")?
+            .trim();
+        let value: i64 = text
+            .parse()
+            .with_context(|| format!("*STB? reply {text:?} is not an integer"))?;
+        Ok((value & 0xff) as u8)
+    }
+
+    /// Decide, once, where `serial_poll` reads the status byte.
+    ///
+    /// READ_STATUS_BYTE is the native USB488 mechanism and the fast one (a
+    /// control transfer, out of band from the message pipe), so it is used by
+    /// default. But cheap firmware gets it wrong — a Siglent SDG2122X answers
+    /// the interrupt endpoint with a constant `0xa5` sentinel while `*STB?` is
+    /// correct. So on a 488.2 device with an interrupt endpoint, compare the
+    /// two after a `*CLS`; if they disagree, serve serial poll from `*STB?`
+    /// thereafter. `*STB?` is the 488.2 ground truth, so preferring it on any
+    /// disagreement is safe even if the reading shifted between the two reads.
+    ///
+    /// Only when an interrupt endpoint is present: without one the control
+    /// reply carries the byte and the spec makes it authoritative, so there is
+    /// nothing to distrust.
+    async fn probe_status_source(&mut self) {
+        if self.caps.bcd_usb488 == 0 || !self.caps.ieee_488_2 || !self.transport.has_interrupt_in()
+        {
+            return;
+        }
+        if let Err(e) = self.write_message(b"*CLS", true).await {
+            debug!("usbtmc: status probe *CLS failed, keeping the native path: {e:#}");
+            return;
+        }
+        let native = match self.read_status_byte_native().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    "usbtmc: status probe READ_STATUS_BYTE failed, keeping the native path: {e:#}"
+                );
+                return;
+            }
+        };
+        let queried = match self.read_status_byte_via_query().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("usbtmc: status probe *STB? failed, keeping the native path: {e:#}");
+                return;
+            }
+        };
+        if native != queried {
+            warn!(
+                read_status_byte = format!("{native:#04x}"),
+                stb_query = format!("{queried:#04x}"),
+                "usbtmc: READ_STATUS_BYTE disagrees with *STB?; serving serial poll from *STB?"
+            );
+            self.status_via_stb_query = true;
+        } else {
+            debug!(
+                stb = format!("{native:#04x}"),
+                "usbtmc: READ_STATUS_BYTE agrees with *STB?; using the native path"
+            );
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -543,6 +664,10 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
                 warn!("usbtmc: could not assert REN at init: {e:#}");
             }
         }
+        // Decide where serial poll reads the status byte, now that the pipe is
+        // clean and REN is set. Must follow the drain so the probe's own reads
+        // are not corrupted by a leftover fragment.
+        self.probe_status_source().await;
         Ok(())
     }
 
@@ -607,50 +732,15 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
         check_status("LOCAL_LOCKOUT", &reply)
     }
 
-    /// USB488 §4.3.1.2: the status byte comes back in the control reply on an
-    /// interface without an interrupt endpoint, and on the interrupt endpoint —
-    /// tagged to match — when there is one.
-    ///
-    /// The spec calls the control reply's byte undefined when an interrupt
-    /// endpoint is present, but a Rigol DHO800 delivers the interrupt late or
-    /// not at all while filling that byte in anyway. So wait briefly for the
-    /// interrupt and fall back to the control byte: a compliant device is read
-    /// from the endpoint the spec names, and a flaky one still answers without
-    /// stalling the whole timeout on every poll (the HiSLIP front-end polls
-    /// after every write).
     async fn serial_poll(&mut self, _pad: u8) -> Result<u8> {
         self.require_usb488("serial poll")?;
-        self.status_tag = next_status_tag(self.status_tag);
-        let tag = self.status_tag;
-        let reply = self
-            .interface_request(REQ_READ_STATUS_BYTE, u16::from(tag), 3)
-            .await
-            .context("READ_STATUS_BYTE")?;
-        check_status("READ_STATUS_BYTE", &reply)?;
-        if reply.get(1) != Some(&tag) {
-            bail!(
-                "READ_STATUS_BYTE reply carries bTag {:?}, expected {tag}",
-                reply.get(1)
-            );
+        if self.status_via_stb_query {
+            return self
+                .read_status_byte_via_query()
+                .await
+                .context("serial poll via *STB?");
         }
-        let control_byte = reply.get(2).copied();
-        if self.transport.has_interrupt_in() {
-            let wait = self.status_byte_wait();
-            match self.transport.status_byte_notification(tag, wait).await {
-                Ok(stb) => return Ok(stb),
-                Err(e) => match control_byte {
-                    Some(stb) => {
-                        debug!(
-                            "usbtmc: no status byte on the interrupt endpoint \
-                             ({e:#}); using the control reply's {stb:#04x}"
-                        );
-                        return Ok(stb);
-                    }
-                    None => return Err(e).context("READ_STATUS_BYTE via the interrupt endpoint"),
-                },
-            }
-        }
-        control_byte.context("READ_STATUS_BYTE reply is missing the status byte")
+        self.read_status_byte_native().await
     }
 
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
@@ -1149,6 +1239,50 @@ mod tests {
         let mut be = UsbtmcBackend::new(t, 3000);
         be.init(0).await.unwrap();
         assert_eq!(be.serial_poll(5).await.unwrap(), 0x41);
+    }
+
+    #[tokio::test]
+    async fn probe_switches_to_stb_query_when_the_native_status_byte_lies() {
+        // The Siglent SDG2122X: interrupt endpoint returns a constant 0xa5
+        // sentinel, while *STB? correctly reports 0.
+        let mut t = MockTransport::new(usb488_caps());
+        t.interrupt = true;
+        t.stb = 0xa5;
+        let mut be = UsbtmcBackend::new(t, 3000);
+        be.caps.bcd_usb488 = 0x100;
+        be.caps.ieee_488_2 = true;
+        // Tags: *CLS write=1, *STB? write=2, its read request=3.
+        be.transport.queue_in(Ok(in_transfer(3, b"0\n", 0x01)));
+        be.probe_status_source().await;
+        assert!(be.status_via_stb_query, "0xa5 != 0 must switch to *STB?");
+    }
+
+    #[tokio::test]
+    async fn probe_keeps_the_native_path_when_read_status_byte_agrees() {
+        let mut t = MockTransport::new(usb488_caps());
+        t.interrupt = true;
+        t.stb = 0x10; // and *STB? reports the same 16
+        let mut be = UsbtmcBackend::new(t, 3000);
+        be.caps.bcd_usb488 = 0x100;
+        be.caps.ieee_488_2 = true;
+        be.transport.queue_in(Ok(in_transfer(3, b"16\n", 0x01)));
+        be.probe_status_source().await;
+        assert!(!be.status_via_stb_query, "they agree; keep the native path");
+    }
+
+    #[tokio::test]
+    async fn serial_poll_via_stb_query_parses_the_reply() {
+        // usb488_caps has no interrupt endpoint, so the probe is skipped and
+        // the tag counter starts clean.
+        let mut be = ready(usb488_caps()).await;
+        be.status_via_stb_query = true;
+        // *STB? write=1, its read request=2.
+        be.transport.queue_in(Ok(in_transfer(2, b"+16\n", 0x01)));
+        assert_eq!(be.serial_poll(5).await.unwrap(), 16);
+        // It queried; no READ_STATUS_BYTE control request.
+        assert!(be.transport.controls.lock().unwrap().is_empty());
+        let w = be.transport.written.lock().unwrap();
+        assert_eq!(&w[0][12..17], b"*STB?");
     }
 
     #[tokio::test]

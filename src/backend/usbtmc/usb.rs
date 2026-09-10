@@ -239,11 +239,15 @@ async fn interrupt_reader(
         match completion.status {
             Ok(()) if completion.buffer.len() < 2 => {}
             Ok(()) => {
+                // bNotify1 discrimination, as the Linux usbtmc driver does it:
+                // exactly 0x81 is a service request; anything greater is a
+                // tagged READ_STATUS_BYTE response (0x80 | bTag, bTag >= 2).
+                // 0x80 and below are neither.
                 let (b1, b2) = (completion.buffer[0], completion.buffer[1]);
                 if b1 == NOTIFY_SRQ {
                     debug!(stb = format!("{b2:#04x}"), "usbtmc service request");
                     let _ = srq.send(());
-                } else if b1 & 0x80 != 0 {
+                } else if b1 > NOTIFY_SRQ {
                     let tag = b1 & 0x7f;
                     debug!(tag, stb = format!("{b2:#04x}"), "usbtmc status byte");
                     if status_bytes.send((tag, b2)).is_err() {
