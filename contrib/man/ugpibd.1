@@ -45,7 +45,8 @@ Only meaningful with
 .BI \-\-backend " ID"
 Adapter backend to use.
 .I auto
-(the default) detects a single attached adapter by USB VID/PID.
+(the default) detects a single attached adapter by USB VID/PID, or a single
+USBTMC instrument by interface class.
 .I list
 prints the known backend ids and exits.
 .TP
@@ -163,9 +164,9 @@ gives up if none is found.
 .B failed to claim interface 0
 Another process holds the adapter: a second
 .BR ugpibd ,
-or a linux-gpib userspace tool. The kernel GPIB drivers
-.RI ( agilent_82357a ", " ni_usb_gpib )
-are detached from the adapter automatically and do not cause this.
+or a linux-gpib userspace tool. The kernel drivers
+.RI ( agilent_82357a ", " ni_usb_gpib ", " usbtmc )
+are detached from the device automatically and do not cause this.
 .SH BUGS
 Report bugs at https://github.com/berg/ugpibd/issues \- never to the linux-gpib
 project or the kernel

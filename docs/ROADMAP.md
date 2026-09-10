@@ -81,6 +81,50 @@ item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
 
+## 6. USBTMC backend: one instrument per process, address ignored
+
+**Now:** `--backend usbtmc` drives any USB488 interface through the GPIB
+trait. Verified on a Rigol DHO824 and a Siglent SDG2122X (request/response
+over VXI-11: identity, real queries, and timeout recovery). The trait's
+primary address is ignored: a USB488 interface is one instrument, so
+`gpib0,5` and `gpib0,14` reach the same device. The lock registry keys on the
+address, so two clients using different addresses for the same USBTMC
+instrument do not contend for a lock.
+
+**Why:** the trait was shaped by adapters that address a bus. Threading a
+"no addressing" notion through every front-end for one backend was not worth
+it before the backend had been seen working.
+
+**To finish:** verify on a real instrument (`docs/HARDWARE-TEST.md`, USBTMC
+section); if the pad/lock mismatch bites, give `Instrument::resource_key` a
+backend-supplied form so every address on a single-device backend maps to one
+key. Hotplug autostart also matches USBTMC devices now, so a host with several
+instruments and `UGPIBD_AUTOSTART=yes` needs the one-process-per-device
+service template that does not exist yet.
+
+**Seen on a Rigol DHO824 and a Siglent SDG2122X (2026-09-10):** open,
+capabilities, device clear, REN and `*IDN?` all work over VXI-11. The Rigol
+advertises `bcdUSBTMC`/`bcdUSB488` both as `210` (its `bcdUSB`, not a real
+version) and leaves a stale bulk-IN fragment after an aborted read that its
+clear does not flush; the read path resyncs past it. It also wedged (USB
+stopped responding) under `hardware_exercise.py`, a DMM script that fires many
+unsupported queries across concurrent sessions; recovery was softened to abort
+bulk-IN and escalate to INITIATE_CLEAR only if that fails.
+
+**Serial poll on a non-compliant device is not worked around.** The Siglent
+answers READ_STATUS_BYTE on the interrupt endpoint with a constant `0xa5`
+sentinel while its real status (and `*STB?`) is `0`. USB488 §4.3.1 makes the
+interrupt the only status source when one is present (the control reply's byte
+is reserved), so there is nothing to fall back to, and the Linux kernel usbtmc
+driver misreads this device identically. We relay what the device reports
+rather than inject an out-of-band `*STB?` to second-guess it: a `*CLS` at
+connect would clobber the instrument's error queue, and `*STB?` per poll is
+message-pipe traffic the caller did not ask for. A future opt-in
+`--serial-poll=stb-query` could paper over such firmware for a caller that
+wants it, but it must not be the default. `contrib/usbtmc_exercise.py` is the
+USBTMC-shaped exercise (488.2 status model, serial poll, SRQ push, trigger,
+remote/local, timeout recovery), replacing the DMM `hardware_exercise.py` here.
+
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 
 Removed as an open gap, recorded because the failure mode is invisible and
