@@ -100,10 +100,10 @@ it before the backend had been seen working.
 every address on a single-device backend maps to one key. The concrete
 symptom, reproducible on the bench: `contrib/hardware_exercise.py` fails its
 "dead addr isolated" check, because a query to an address nothing lives at is
-answered by the one instrument that does. Hotplug autostart also matches
-USBTMC devices now, so a host with several instruments and
-`UGPIBD_AUTOSTART=yes` needs the one-process-per-device service template that
-does not exist yet.
+answered by the one instrument that does. Hotplug autostart can also match USBTMC
+devices (opt-in, `UGPIBD_CLAIM_USBTMC` in `/etc/ugpibd/udev.conf`), so a host
+with several instruments that sets both that and `UGPIBD_AUTOSTART=yes` needs
+the one-process-per-device service template that does not exist yet.
 
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 

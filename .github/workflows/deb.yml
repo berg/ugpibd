@@ -120,6 +120,28 @@ jobs:
           test -x /usr/bin/ugpibd-scpi
           test -f /usr/lib/udev/rules.d/60-ugpibd.rules
           test -f /etc/default/ugpibd
+          test -f /etc/ugpibd/udev.conf
+
+          # USBTMC instruments are claimed only on request: the flag ships
+          # commented out, and the rules that act on it are gated by it. A
+          # package that grabbed every instrument on the box on install would
+          # pass every other check here.
+          grep -q '^#UGPIBD_CLAIM_USBTMC=yes' /etc/ugpibd/udev.conf
+          ! grep -qE '^UGPIBD_CLAIM_USBTMC' /etc/ugpibd/udev.conf
+          test "$(grep -c 'fe03??' /usr/lib/udev/rules.d/60-ugpibd.rules)" -eq 3
+          ! grep -E 'fe03\?\?' /usr/lib/udev/rules.d/60-ugpibd.rules \
+              | grep -v 'IMPORT{file}' \
+              | grep -qv 'ENV{UGPIBD_CLAIM_USBTMC}=="yes"'
+
+          # udev accepts the shipped rules (the service account exists by now,
+          # so an unknown-group failure here is real). `udevadm verify` is
+          # systemd 254 and later; the runner may be older, and the rules are
+          # the same either way, so skip rather than fail there.
+          if udevadm verify --help >/dev/null 2>&1; then
+              udevadm verify /usr/lib/udev/rules.d/60-ugpibd.rules
+          else
+              echo "udevadm verify unavailable (systemd < 254), skipped"
+          fi
           test -f /usr/share/man/man1/ugpibd.1.gz
           test -f /usr/share/man/man1/ugpibd-scpi.1.gz
 

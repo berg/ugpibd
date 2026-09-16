@@ -432,6 +432,8 @@ SDG2122X, both USB488 with an interrupt endpoint. Serial poll, SRQ, trigger and
 GTL/LLO are advertised by the Siglent but not yet exercised. First contact:
 
 ```bash
+# On Linux, the instrument needs UGPIBD_CLAIM_USBTMC=yes in
+# /etc/ugpibd/udev.conf first -- USBTMC devices are opt-in, unlike adapters.
 ugpibd --list                       # the instrument appears as backend usbtmc
 RUST_LOG=ugpibd=debug ugpibd --backend usbtmc
 printf '*IDN?\n' | ugpibd-scpi --transport vxi11 --addr 0

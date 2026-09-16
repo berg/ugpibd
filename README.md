@@ -64,9 +64,25 @@ sudo install -d /etc/apt/keyrings \
 ```bash
 cargo build --release
 sudo cp contrib/60-ugpibd.rules /usr/lib/udev/rules.d/
+sudo install -Dm644 contrib/ugpibd-udev.conf /etc/ugpibd/udev.conf
 sudo groupadd -f ugpibd && sudo usermod -aG ugpibd "$USER"
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
+
+That grants the ugpibd group access to USB-GPIB *adapters*. USBTMC
+instruments — a scope, DMM or generator driven over its own USB port, or a
+GPIB bridge that presents as a USB488 device — are matched by interface class
+rather than by id, which is every instrument on the machine, so ugpibd does
+not claim them unless asked. To opt in, uncomment `UGPIBD_CLAIM_USBTMC=yes` in
+`/etc/ugpibd/udev.conf` and reload:
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --action=add
+```
+
+To claim only particular instruments, leave that unset and write a rule
+matching them by `idVendor`/`idProduct` in `/etc/udev/rules.d/`.
 
 Then check the adapter is visible and start the daemon:
 
