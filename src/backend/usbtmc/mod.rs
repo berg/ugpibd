@@ -60,9 +60,12 @@ const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Size of the reads that empty a bulk-IN FIFO during abort and clear.
 const DRAIN_READ: usize = 4096;
 
-/// Longest wait for a READ_STATUS_BYTE reply on the interrupt endpoint before
-/// falling back to the control reply's byte. A status byte is meant to arrive
-/// at once; this only bounds the flaky case.
+/// Longest wait for a READ_STATUS_BYTE reply on the interrupt endpoint. A
+/// status byte is meant to arrive at once, so this only bounds the case of a
+/// device that advertises the endpoint and then does not deliver: the poll
+/// fails here rather than stalling for the whole GPIB timeout. There is no
+/// fallback to the control reply's byte -- USB488 4.3.1 makes that byte
+/// reserved whenever an interrupt endpoint exists.
 const STATUS_BYTE_WAIT_MS: u64 = 1000;
 
 /// How many extra bulk-IN reads to spend skipping stale fragments before a
@@ -413,7 +416,36 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
             .await
     }
 
+    /// Read one whole message, continuing across transfers until the device
+    /// marks the end or `max_len` is reached.
+    ///
+    /// A device answers REQUEST_DEV_DEP_MSG_IN with as much as its own buffer
+    /// holds and clears bEOM when there is more to come -- a XyphroLabs
+    /// UsbGpib tops out at 1012 bytes, so a 200-reading burst arrives in four
+    /// transfers. That chunking is an artefact of the device's buffer, not a
+    /// message boundary the caller should ever see: stopping at the first
+    /// transfer silently truncates the reply.
     async fn read_message(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
+        let want = max_len.clamp(1, MAX_READ_TRANSFER);
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let remaining = want - out.len();
+            let (data, ended) = self.read_one_transfer(remaining).await?;
+            let short = data.len() < remaining;
+            out.extend_from_slice(&data);
+            if ended || out.len() >= want {
+                return Ok((out, ended));
+            }
+            if short && data.is_empty() {
+                // Nothing came back and no end marker: there is nothing more
+                // to be had, and asking again would only burn the timeout.
+                return Ok((out, false));
+            }
+        }
+    }
+
+    /// One REQUEST_DEV_DEP_MSG_IN and the transfer that answers it.
+    async fn read_one_transfer(&mut self, max_len: usize) -> Result<(Vec<u8>, bool)> {
         let want = max_len.clamp(1, MAX_READ_TRANSFER);
         let term_char = (self.eos_enabled && self.caps.term_char).then_some(self.eos_char);
         let tag = self.take_tag();
