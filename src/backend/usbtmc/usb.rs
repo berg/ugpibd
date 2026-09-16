@@ -229,10 +229,14 @@ async fn interrupt_reader(
     srq: tokio::sync::broadcast::Sender<()>,
     status_bytes: tokio::sync::mpsc::UnboundedSender<(u8, u8)>,
 ) {
-    let buf_len = {
-        let mps = endpoint.max_packet_size().max(1);
-        64usize.div_ceil(mps) * mps
-    };
+    // Exactly one packet per submission, as the kernel driver does. A USB488
+    // notification is two bytes and always fits in one. Asking for more is not
+    // merely wasteful: on an endpoint whose max packet size is exactly 2 (a
+    // XyphroLabs UsbGpib), a two-byte notification is a *full* packet rather
+    // than a short one, so a multi-packet request does not complete until
+    // enough notifications have accumulated to fill it -- and every serial poll
+    // times out waiting for a byte the device has already sent.
+    let buf_len = endpoint.max_packet_size().max(2);
     loop {
         endpoint.submit(Buffer::new(buf_len));
         let completion = endpoint.next_complete().await;
