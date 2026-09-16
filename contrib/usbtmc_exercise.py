@@ -75,6 +75,45 @@ def poll_stb(inst) -> int:
     return int(inst.read_stb())
 
 
+def clear_and_sync(inst) -> None:
+    """*CLS, then wait for the instrument to have actually done it.
+
+    A write completes when the bytes are accepted, not when they are parsed, so
+    a serial poll issued straight after *CLS can still see the pre-*CLS byte.
+    *OPC? does not answer until the preceding commands have executed, which is
+    what makes the following poll mean something.
+    """
+    # *ESE/*SRE survive *CLS, *RST and the end of a session, so a previous
+    # run of this script -- which deliberately provokes command errors -- can
+    # leave the enable registers set and the next run starting dirty. Put the
+    # whole status model in a known state, not just the event registers.
+    inst.write("*CLS")
+    inst.write("*ESE 0")
+    inst.write("*SRE 0")
+    inst.query("*OPC?")
+
+
+def settled_status(inst, timeout_s: float = 1.0) -> tuple[int, int]:
+    """(serial poll, *STB?) once the two have had a chance to agree.
+
+    A serial poll is answered by the instrument's interface from the status
+    register as it stands right now, while *CLS is a queued command the parser
+    executes in its own time -- so even after an *OPC? sync the first poll can
+    still catch the pre-*CLS byte, and the next one is clear. Give them a
+    bounded moment to agree rather than asserting on the first read.
+
+    Bounded, not unbounded: a device whose poll *never* matches its own *STB?
+    -- a Siglent SDG2122X answers a constant 0xa5 -- must still fail here.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        stb = poll_stb(inst)
+        star = int(inst.query("*STB?").strip())
+        if stb == star or time.monotonic() >= deadline:
+            return stb, star
+        time.sleep(0.05)
+
+
 def wait_for_bit(inst, mask: int, timeout_s: float = 2.0) -> int:
     """Serial-poll until `mask` appears in the status byte, or time out.
 
@@ -121,9 +160,8 @@ def main() -> int:
     # *STB? is the instrument computing the same byte itself.
     supports_status = True
     try:
-        inst.write("*CLS")
-        stb = poll_stb(inst)
-        star = int(inst.query("*STB?").strip())
+        clear_and_sync(inst)
+        stb, star = settled_status(inst)
         if stb == star:
             rep.line(PASS, "serial poll == *STB?", f"0x{stb:02x}")
         else:
@@ -147,7 +185,7 @@ def main() -> int:
     esb_ok = False
     if supports_status:
         try:
-            inst.write("*CLS")
+            clear_and_sync(inst)
             inst.write("*ESE 255")
             base = poll_stb(inst)
             inst.write(BOGUS.rstrip("?"))  # a bogus *write*, no reply expected
@@ -167,9 +205,9 @@ def main() -> int:
     # no VXI-11 event support.
     if supports_status and esb_ok:
         try:
-            inst.write("*CLS")
+            clear_and_sync(inst)
             inst.write("*ESE 255")
-            inst.write("*SRE 0x20")  # ESB summary -> SRQ
+            inst.write("*SRE 32")  # 0x20, ESB summary -> SRQ
             inst.enable_event(constants.EventType.service_request, constants.EventMechanism.queue)
             inst.write(BOGUS.rstrip("?"))
             try:
