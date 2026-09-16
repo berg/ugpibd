@@ -145,6 +145,17 @@ pub trait TmcTransport: Send + Sync {
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         None
     }
+
+    /// The status byte carried by an SRQ notification that has not been read
+    /// by a serial poll yet, taken out of the latch by reading it.
+    fn take_srq_status(&self) -> Option<u8> {
+        None
+    }
+
+    /// The same byte, left in the latch.
+    fn peek_srq_status(&self) -> Option<u8> {
+        None
+    }
 }
 
 /// One USBTMC interface, driven as if it were a GPIB instrument.
@@ -538,6 +549,20 @@ impl<T: TmcTransport> UsbtmcBackend<T> {
     /// non-compliant; the kernel misreads it identically, and we relay what the
     /// device reports rather than paper over it with an out-of-band `*STB?`.
     async fn read_status_byte_native(&mut self) -> Result<u8> {
+        // A service request already delivered this instrument's status byte,
+        // with RQS set, and the device cleared RQS when it sent it. On GPIB
+        // the device would still be holding RQS for this poll to take, so
+        // hand back the byte the notification carried: it is what a poll of
+        // a GPIB device at this point in the sequence would return, and the
+        // front-ends' "who asked for service?" logic is written against that.
+        // Reading it empties the latch, so the next poll goes to the device.
+        if let Some(stb) = self.transport.take_srq_status() {
+            debug!(
+                stb = format!("{stb:#04x}"),
+                "usbtmc serial poll taking the byte from the service request"
+            );
+            return Ok(stb);
+        }
         self.status_tag = next_status_tag(self.status_tag);
         let tag = self.status_tag;
         let reply = self
@@ -687,6 +712,17 @@ impl<T: TmcTransport> GpibBackend for UsbtmcBackend<T> {
         self.transport.subscribe_srq()
     }
 
+    /// There is no SRQ line to read a level from: a USB488 interface reports
+    /// service requests as notifications. An undrained notification is the
+    /// nearest equivalent of the line being asserted, which is what the
+    /// front-ends' re-check wants to know.
+    async fn srq_asserted(&mut self) -> Result<bool> {
+        if !self.transport.has_interrupt_in() {
+            bail!("this interface has no interrupt endpoint to report SRQ");
+        }
+        Ok(self.transport.peek_srq_status().is_some())
+    }
+
     fn controller_pad(&self) -> u8 {
         self.my_pad
     }
@@ -768,6 +804,8 @@ mod tests {
         deliver_notification: bool,
         /// Status byte the interrupt endpoint would deliver, keyed by tag.
         notified: StdMutex<Vec<(u8, u8)>>,
+        /// Status byte an SRQ notification latched, as the real reader does.
+        srq_status: StdMutex<Option<u8>>,
     }
 
     /// A full USB488 capabilities block: TermChar, 488.2, remote/local,
@@ -796,6 +834,7 @@ mod tests {
                 interrupt: false,
                 deliver_notification: true,
                 notified: StdMutex::new(vec![]),
+                srq_status: StdMutex::new(None),
             }
         }
 
@@ -874,6 +913,12 @@ mod tests {
         fn set_timeout(&self, _timeout_ms: u32) {}
         fn has_interrupt_in(&self) -> bool {
             self.interrupt
+        }
+        fn take_srq_status(&self) -> Option<u8> {
+            self.srq_status.lock().unwrap().take()
+        }
+        fn peek_srq_status(&self) -> Option<u8> {
+            *self.srq_status.lock().unwrap()
         }
         async fn status_byte_notification(&self, tag: u8, _wait: Duration) -> Result<u8> {
             let mut n = self.notified.lock().unwrap();
@@ -1258,5 +1303,63 @@ mod tests {
             be.subscribe_srq().is_none(),
             "no interrupt endpoint, no SRQ path"
         );
+    }
+
+    /// An interrupt-endpoint device whose own status byte is `stb`.
+    async fn ready_with_interrupt(stb: u8) -> UsbtmcBackend<MockTransport> {
+        let mut t = MockTransport::new(usb488_caps());
+        t.interrupt = true;
+        t.stb = stb;
+        let mut be = UsbtmcBackend::new(t, 3000);
+        be.init(0).await.unwrap();
+        be
+    }
+
+    /// A USB488 device clears RQS when it *sends* the service-request
+    /// notification, so the confirming serial poll that follows finds the bit
+    /// gone -- and the front-ends, which decide who asked for service by
+    /// looking for RQS, would discard the event. The notification's own byte
+    /// stands in for the one a GPIB device would still be holding.
+    #[tokio::test]
+    async fn serial_poll_after_a_service_request_reports_the_notified_byte() {
+        let mut be = ready_with_interrupt(0x20).await;
+        *be.transport.srq_status.lock().unwrap() = Some(0x60);
+
+        let stb = be.serial_poll(0).await.unwrap();
+        assert_eq!(stb, 0x60, "the poll must see RQS, not the cleared byte");
+    }
+
+    /// And only once: the latch stands in for a bit the instrument holds
+    /// until polled, so a second poll has to go back to the device.
+    #[tokio::test]
+    async fn the_notified_byte_is_handed_over_once() {
+        let mut be = ready_with_interrupt(0x20).await;
+        *be.transport.srq_status.lock().unwrap() = Some(0x60);
+
+        assert_eq!(be.serial_poll(0).await.unwrap(), 0x60);
+        assert_eq!(
+            be.serial_poll(0).await.unwrap(),
+            0x20,
+            "the second poll must reach the device"
+        );
+    }
+
+    /// `srq_asserted` is the level read the front-ends use to decide whether
+    /// somebody is still asking for service. A USB488 interface has no line
+    /// to read, so an undrained notification is the answer.
+    #[tokio::test]
+    async fn srq_asserted_follows_the_undrained_notification() {
+        let mut be = ready_with_interrupt(0x20).await;
+        assert!(!be.srq_asserted().await.unwrap());
+
+        *be.transport.srq_status.lock().unwrap() = Some(0x60);
+        assert!(be.srq_asserted().await.unwrap());
+        assert!(
+            be.srq_asserted().await.unwrap(),
+            "a level read must not consume the byte"
+        );
+
+        be.serial_poll(0).await.unwrap();
+        assert!(!be.srq_asserted().await.unwrap());
     }
 }

@@ -159,6 +159,15 @@ struct Link {
     /// deliberately independent of the interrupt channel's existence
     /// (OBSERVATION B.6.21).
     srq_handle: Mutex<Option<Vec<u8>>>,
+    /// The status byte the SRQ forwarder took from this link's instrument on
+    /// the client's behalf.
+    ///
+    /// The forwarder has to serial-poll to learn who asked for service, and
+    /// that poll consumes RQS at the instrument -- so a client that polls
+    /// from inside its own SRQ handler, which is the normal shape of a VISA
+    /// program, would find the bit already gone. Hold the byte and hand it
+    /// over once, exactly as the HiSLIP front-end does with `consumed_stb`.
+    consumed_stb: Mutex<Option<u8>>,
 }
 
 impl Link {
@@ -634,6 +643,7 @@ where
                 aborted: AtomicBool::new(false),
                 abort_notify: Notify::new(),
                 srq_handle: Mutex::new(None),
+                consumed_stb: Mutex::new(None),
             }),
         );
         conn.owned.lock().unwrap().push(lid);
@@ -862,6 +872,9 @@ where
                 // interface link has no instrument to poll, so it gets the
                 // spec behavior: the line itself is its signal.
                 let mut polled: HashMap<String, bool> = HashMap::new();
+                // What that poll took, per instrument, so every notified link
+                // on it can answer its client's follow-up poll.
+                let mut stash: HashMap<String, u8> = HashMap::new();
                 for link in targets {
                     let resource = link.resource();
                     let requesting = if link.is_interface() {
@@ -870,13 +883,18 @@ where
                         match polled.get(&resource) {
                             Some(&r) => r,
                             None => {
-                                let r = match link.instrument.serial_poll().await {
-                                    Ok(stb) => stb & STB_RQS != 0,
+                                let (r, taken) = match link.instrument.serial_poll().await {
+                                    Ok(stb) => (stb & STB_RQS != 0, Some(stb)),
                                     Err(e) => {
                                         debug!("vxi11 srq poll failed: {e:#}");
-                                        false
+                                        (false, None)
                                     }
                                 };
+                                if r {
+                                    if let Some(stb) = taken {
+                                        stash.insert(resource.clone(), stb);
+                                    }
+                                }
                                 polled.insert(resource.clone(), r);
                                 r
                             }
@@ -887,6 +905,9 @@ where
                         link.lid
                     );
                     if requesting {
+                        if let Some(&stb) = stash.get(&resource) {
+                            *link.consumed_stb.lock().unwrap() = Some(stb);
+                        }
                         let handle = link.srq_handle.lock().unwrap().clone();
                         if let Some(handle) = handle {
                             let _ = tx.send(handle);
@@ -1168,6 +1189,10 @@ async fn device_write(shared: &Shared, parms: DeviceWriteParms) -> DeviceWriteRe
             size: 0,
         };
     }
+    // A new command makes a held status byte stale -- `*CLS` most obviously,
+    // but anything that touches the status registers. Dropping it is cheaper
+    // and more honest than parsing the payload to find out which.
+    *link.consumed_stb.lock().unwrap() = None;
     let window = OpWindow::open(&link);
     let send_eoi = parms.flags & OP_FLAG_END != 0;
     // Interface links write with no addressing sequence: IEEE 488.2 16.2.3
@@ -1462,6 +1487,19 @@ async fn device_readstb(shared: &Shared, parms: DeviceGenericParms) -> DeviceRea
         return DeviceReadStbResp {
             error: e.as_u32(),
             stb: 0,
+        };
+    }
+    // A service request already took this byte on the client's behalf; give
+    // it to the poll that the client's SRQ handler is making right now rather
+    // than a second poll's worth of already-cleared bits.
+    if let Some(stb) = link.consumed_stb.lock().unwrap().take() {
+        debug!(
+            stb,
+            "vxi11 device_readstb answering from the forwarded status byte"
+        );
+        return DeviceReadStbResp {
+            error: ErrorCode::NoError.as_u32(),
+            stb,
         };
     }
     let window = OpWindow::open(&link);

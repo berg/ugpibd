@@ -7,6 +7,7 @@
 // USB488 status bytes and service requests.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -88,6 +89,10 @@ pub struct UsbtmcTransport {
     bulk_out_addr: u8,
     timeout_ms: AtomicU32,
     srq: tokio::sync::broadcast::Sender<()>,
+    /// Status byte from the most recent service-request notification, until a
+    /// serial poll takes it. USB488 devices clear RQS when they send this, so
+    /// it is the only chance to observe the bit.
+    srq_status: Arc<StdMutex<Option<u8>>>,
     /// READ_STATUS_BYTE replies from the interrupt reader, as `(bTag, STB)`,
     /// when the interface has an interrupt endpoint.
     status_bytes: Option<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<(u8, u8)>>>,
@@ -153,13 +158,14 @@ impl UsbtmcTransport {
         });
 
         let (srq, _) = tokio::sync::broadcast::channel(SRQ_CHANNEL_CAPACITY);
+        let srq_status: Arc<StdMutex<Option<u8>>> = Arc::new(StdMutex::new(None));
         let (status_bytes, reader_task) = match interrupt_in {
             Some(addr) => {
                 let ep = interface
                     .endpoint::<Interrupt, In>(addr)
                     .with_context(|| format!("open interrupt endpoint {addr:#04x}"))?;
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let task = tokio::spawn(interrupt_reader(ep, srq.clone(), tx));
+                let task = tokio::spawn(interrupt_reader(ep, srq.clone(), tx, srq_status.clone()));
                 (Some(tokio::sync::Mutex::new(rx)), Some(task))
             }
             None => (None, None),
@@ -174,6 +180,7 @@ impl UsbtmcTransport {
             bulk_out_addr,
             timeout_ms: AtomicU32::new(3000),
             srq,
+            srq_status,
             status_bytes,
             _reader_task: reader_task,
         })
@@ -228,6 +235,7 @@ async fn interrupt_reader(
     mut endpoint: Endpoint<Interrupt, In>,
     srq: tokio::sync::broadcast::Sender<()>,
     status_bytes: tokio::sync::mpsc::UnboundedSender<(u8, u8)>,
+    srq_status: Arc<StdMutex<Option<u8>>>,
 ) {
     // Exactly one packet per submission, as the kernel driver does. A USB488
     // notification is two bytes and always fits in one. Asking for more is not
@@ -250,6 +258,10 @@ async fn interrupt_reader(
                 let (b1, b2) = (completion.buffer[0], completion.buffer[1]);
                 if b1 == NOTIFY_SRQ {
                     debug!(stb = format!("{b2:#04x}"), "usbtmc service request");
+                    // Latch before announcing: a forwarder woken by the
+                    // broadcast polls immediately, and must not race the
+                    // byte it is about to look for.
+                    *srq_status.lock().unwrap() = Some(b2);
                     let _ = srq.send(());
                 } else if b1 > NOTIFY_SRQ {
                     let tag = b1 & 0x7f;
@@ -426,5 +438,13 @@ impl TmcTransport for UsbtmcTransport {
 
     fn subscribe_srq(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         self.status_bytes.as_ref().map(|_| self.srq.subscribe())
+    }
+
+    fn take_srq_status(&self) -> Option<u8> {
+        self.srq_status.lock().unwrap().take()
+    }
+
+    fn peek_srq_status(&self) -> Option<u8> {
+        *self.srq_status.lock().unwrap()
     }
 }
