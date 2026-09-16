@@ -80,12 +80,7 @@ pub fn enumerate() -> Result<Vec<DiscoveredAdapter>> {
         .wait()
         .context("failed to list USB devices")?
     {
-        let ids = (dev.vendor_id(), dev.product_id());
-        if let Some(kind) = BackendKind::ALL
-            .iter()
-            .copied()
-            .find(|k| k.usb_ids().contains(&ids))
-        {
+        if let Some(kind) = BackendKind::detect(&dev) {
             // A pre-firmware adapter carries no strings of its own; anything the
             // OS reports is a neighbour's (typically the parent hub). Show
             // nothing rather than something misleading — the pre-firmware pid in
@@ -173,7 +168,7 @@ pub fn resolve<'a>(
             match backend {
                 Some(id) => anyhow::bail!("no {id} adapter found"),
                 None => anyhow::bail!(
-                    "no supported USB-GPIB adapter detected (known backends: {})",
+                    "no supported USB-GPIB adapter or USBTMC instrument detected (known backends: {})",
                     super::known_ids()
                 ),
             }

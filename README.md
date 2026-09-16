@@ -21,10 +21,15 @@ cooperating with system rpcbind where present.
 | `ni-usb-hs` | NI GPIB-USB-HS+ | `3923:7618` |
 | `ni-usb-hs` | KUSB-488A | `3923:725c` |
 | `ni-usb-hs` | MC-USB-488 | `3923:725d` |
+| `usbtmc` | Any USBTMC/USB488 instrument, or a USBTMC-class GPIB bridge | class `fe`/`03` |
 
 The second USB id is what the adapter enumerates as once ugpibd has uploaded
 its firmware, which it does automatically. KUSB-488A and MC-USB-488 are
 untested, but take the same code path as the GPIB-USB-HS.
+
+The `usbtmc` backend puts an instrument's own USB port on the network. It is
+one instrument per daemon, so the GPIB address in a resource string is
+ignored. Verified on a Rigol DHO824 and a Siglent SDG2122X.
 
 The adapter is picked with `--backend`; the default, `auto`, detects a single
 connected adapter by USB id.
@@ -59,9 +64,25 @@ sudo install -d /etc/apt/keyrings \
 ```bash
 cargo build --release
 sudo cp contrib/60-ugpibd.rules /usr/lib/udev/rules.d/
+sudo install -Dm644 contrib/ugpibd-udev.conf /etc/ugpibd/udev.conf
 sudo groupadd -f ugpibd && sudo usermod -aG ugpibd "$USER"
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
+
+That grants the ugpibd group access to USB-GPIB *adapters*. USBTMC
+instruments — a scope, DMM or generator driven over its own USB port, or a
+GPIB bridge that presents as a USB488 device — are matched by interface class
+rather than by id, which is every instrument on the machine, so ugpibd does
+not claim them unless asked. To opt in, uncomment `UGPIBD_CLAIM_USBTMC=yes` in
+`/etc/ugpibd/udev.conf` and reload:
+
+```bash
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --action=add
+```
+
+To claim only particular instruments, leave that unset and write a rule
+matching them by `idVendor`/`idProduct` in `/etc/udev/rules.d/`.
 
 Then check the adapter is visible and start the daemon:
 
@@ -247,9 +268,9 @@ instance drives one adapter, so put `--usb-port` in `UGPIBD_OPTS`.
 
 ## Kernel GPIB drivers (Linux)
 
-ugpibd detaches the kernel GPIB driver (`agilent_82357a`, `ni_usb_gpib`) from
-the adapter it opens, so nothing needs blacklisting. The adapter goes back to
-the kernel driver when ugpibd exits.
+ugpibd detaches the kernel driver (`agilent_82357a`, `ni_usb_gpib`, or
+`usbtmc`) from the device it opens, so nothing needs blacklisting. The device
+goes back to the kernel driver when ugpibd exits.
 
 ## Origin and relationship to linux-gpib
 
