@@ -337,8 +337,25 @@ needs `bus_lines()` and a look at ATN.
   timeout recovery (an unsupported query fails, the next command succeeds, the
   device stays alive). The Rigol advertises no USB488 capabilities and needs
   the status-byte and stale-fragment workarounds; the Siglent advertises
-  remote/local, TRIGGER and SR1 and behaves to spec. Serial poll, SRQ and
-  trigger on the Siglent are not yet exercised.
+  remote/local, TRIGGER and SR1 and behaves to spec.
+
+- **USBTMC, full USB488 status model** — XyphroLabs UsbGpib V2 (`03eb:2065`),
+  a GPIB bridge that presents one USBTMC interface per instrument, with an
+  HP 34401A behind it (2026-09-15, macOS). This is the first device on the
+  bench that advertises *and* implements the whole set — TermChar,
+  remote/local, TRIGGER, SR1 — so it is the one that exercises serial poll,
+  SRQ push, trigger and GTL/LLO for real. Verified: `contrib/usbtmc_exercise.py`
+  clean, `contrib/hardware_exercise.py` 11/12 (the failure is the known
+  address-ignored gap, ROADMAP item 6), all three front-ends, 2000-reading
+  (32 KB) transfers, 300-query rapid fire, and repeated timeout recovery.
+
+  Its interrupt endpoint has a **max packet size of 2**, which is what caught
+  the multi-packet interrupt read: a 2-byte notification is a full packet, not
+  a short one, so a read asking for more than one packet never completes.
+  Its bulk-IN buffer tops out at **1012 bytes per transfer**, which is what
+  caught reads that stopped at the first transfer instead of continuing to
+  bEOM. Any device with a small mps or a small buffer is worth re-running
+  these against; the two big instruments on the bench hide both faults.
 
 Two instruments asserting SRQ at almost the same moment used to lose the
 second request: SRQ is a wired-OR line and the adapter notifies on a
@@ -423,6 +440,12 @@ printf '*IDN?\n' | ugpibd-scpi --transport vxi11 --addr 0
 The debug log's `usbtmc interface capabilities` line is the first thing to
 record: it says whether the device advertises TermChar, remote/local control,
 TRIGGER and SR1, which is what decides which of the tests below can pass.
+
+A note on provoking errors: the status-model tests raise ESB with a command
+the instrument rejects, and a 34401A beeps at every one. To exercise the same
+timeout-recovery path quietly, read when nothing is queued instead — an empty
+read times out through the identical INITIATE_ABORT_BULK_IN handshake without
+a command error.
 
 Then Tests 3–8 and 10 as written, with `<PAD>` being any address (it is
 ignored). Test 5's REN/GTL/LLO and Test 7's SRQ need the corresponding
