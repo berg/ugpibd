@@ -532,10 +532,18 @@ impl<T: NiTransport + 'static> GpibBackend for NiUsbHsBackend<T> {
         // after the turnaround does not resolve it, and writes issued after a
         // turnaround do land (verified 10 of 10), so neither is the cause.
         //
-        // The 8026 keeps an intermittent first-byte loss on reads issued well
-        // after the query; see the module docs. The loss is flat across
-        // write-to-read delays from 50 ms to 3 s and absent at 0 and 20 ms —
-        // a byte already loaded when ATN went up, not a race.
+        // The 8026's first-byte loss is fixed at the instrument, not here; see
+        // docs/TABOR-8026.md and examples/hs488_config.rs. Two command bytes
+        // (CFE, CFG15) enable HS488 in its TNT4882, whose start-up makes the
+        // talker hold NRFD itself after ATN falls, so there is no longer an
+        // instant when a byte can be handshaked into a chip with no read op
+        // armed: measured 100/100 lost to 0/100 on a one-character response.
+        //
+        // Do not add timing mitigations here for it. A logic capture of the
+        // addressing-to-ATN gap shows the loss is a pure race — a one-character
+        // response goes from 23% lost at 231 us to 100% at 400 us — so
+        // shrinking the gap only moves the odds, for every instrument, to suit
+        // one. The measured numbers are in the doc.
         //
         // The byte is lost by the adapter's firmware, not by the instrument and
         // not by the chip. It is left parked between operations — every read op
