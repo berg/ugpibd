@@ -5,6 +5,72 @@ as its release notes, so it is written for someone deciding whether to upgrade
 rather than for someone reading the diff — `scripts/release` refuses to tag a
 version that has no entry here.
 
+## v0.9.0 — 2026-09-21
+
+ugpibd now serves USB instruments that speak USBTMC directly, not just GPIB
+adapters. A scope, a DMM or a GPIB-to-USB488 bridge on the machine's own USB
+port becomes a network instrument through the same three front ends, with no
+GPIB hardware involved.
+
+### USBTMC/USB488 instruments are a backend
+
+Any device with a USB Test & Measurement Class interface is matched by class
+rather than by id, so conforming instruments work without being added to a
+list. USB488 was designed as IEEE-488 over USB and maps directly: the
+device-dependent bulk messages are read and write, INITIATE_CLEAR is device
+clear, TRIGGER is trigger, READ_STATUS_BYTE is serial poll, and REN_CONTROL,
+GO_TO_LOCAL and LOCAL_LOCKOUT are the remote/local operations. An operation the
+device does not advertise is refused with a message saying so rather than
+failing obscurely.
+
+Verified on hardware: a Rigol DHO824 oscilloscope, a Siglent SDG2122X generator
+and a XyphroLabs UsbGpib V2, which is a GPIB bridge presenting its instrument
+as a USB488 device.
+
+### Service requests reach the client
+
+A USB488 device clears RQS when it sends the SRQ notification, and the byte it
+carries is the only place that bit ever appears. Both front ends decide who
+asked for service by serial-polling for RQS, so both found the bit already gone
+and dropped the event — a service request never reached a client on this
+backend at all. The notification's byte is now latched and handed to the next
+serial poll, which is the byte a GPIB device would still be holding at that
+point, so the front ends work unchanged.
+
+### Device quirks, handled without second-guessing the spec
+
+A Siglent answers READ_STATUS_BYTE on the control pipe with a constant sentinel
+while its real status is zero. Rather than probe `*STB?` and pick whichever
+looked right — which meant a `*CLS` at connect and an unrequested query per
+poll — the status byte now comes from the interrupt endpoint when one is
+present, as the USB488 spec and the Linux kernel driver both do. A Rigol
+DHO800's un-flushed fragments from a previous session are resynced past instead
+of being returned as someone else's answer, reads continue across transfers
+until the device sets bEOM, and the interrupt endpoint is read one packet at a
+time so a two-byte maximum packet size behaves.
+
+### Upgrade note: USBTMC devices are not claimed unless you ask
+
+Matching by interface class covers every USB instrument attached to the
+machine, so installing the package no longer hands the `ugpibd` group raw USB
+I/O on all of them — those devices may be driven by the kernel usbtmc driver,
+pyvisa-py or vendor software. The USBTMC permission and hotplug rules are gated
+on `UGPIBD_CLAIM_USBTMC=yes` in `/etc/ugpibd/udev.conf`. GPIB adapters are
+unchanged and stay unconditional: an adapter exists to be a GPIB controller and
+has no other use.
+
+### Known limitation, corrected
+
+The first-byte loss on an NI adapter described in v0.8.0 is real but was
+explained wrongly there. A logic-analyser capture of the bus shows the chip is
+*ready* across the ATN edge, not deaf: it accepts the byte and the read
+operation then discards it, because the adapter arms that operation only after
+ATN has already been released. It is a race, not a fixed window — widening the
+gap between addressing and the ATN release drives the loss to every read, and
+narrowing it only shifts the odds. Instruments that wait before sourcing are
+unaffected, an Agilent 82357 is unaffected on the same bus with the same
+instrument, and NI's own driver loses the same byte.
+
 ## v0.8.0 — 2026-09-09
 
 Correctness work on the NI backend. A serial poll could wedge the bus until
