@@ -50,9 +50,12 @@ misleading here.
 the *controller* would present, which is meaningless for a controller-only
 implementation. `++mode 0` (device mode) is correctly rejected as unsupported.
 
-`++mode 0` is the one worth revisiting: real Prologix device mode dumps received
-data straight to the client, which is the same primitive an unaddressed-listen
-capture needs. See `CAPTURE.md` for the design that would close it.
+`++mode 0` is the one worth revisiting, and it is now smaller than it was when
+this entry was written. Real Prologix device mode dumps received data straight
+to the client, which is the same primitive an unaddressed-listen capture needs
+— and that primitive is built and working: `++dev <addr>` captured 4408 bytes
+of HP-GL from an SR620 (`CAPTURE.md` §14.14). What is left is wiring `++mode 0`
+to it as a second entry point, not designing it (`CAPTURE.md` §4.6, §10 step 3).
 
 ## 4. Secondary addressing
 
@@ -80,6 +83,27 @@ the type numbers. If it turns out to belong to the TLS story, fold this into
 item 1 rather than implementing it separately. The cheap interim fix, and the
 one consistent with how the lock refusal is reported, is a device-defined error
 code with a message saying we recognize the type and do not implement it.
+
+## 6. USBTMC backend: one instrument per process, address ignored
+
+**Now:** `--backend usbtmc` drives any USB488 interface through the GPIB
+trait. The trait's primary address is ignored: a USB488 interface is one
+instrument, so `gpib0,5` and `gpib0,14` reach the same device. The lock
+registry keys on the address, so two clients using different addresses for
+the same USBTMC instrument do not contend for a lock.
+
+**Why:** the trait was shaped by adapters that address a bus. Threading a
+"no addressing" notion through every front-end for one backend was not worth
+it before the backend had been seen working.
+
+**To finish:** give `Instrument::resource_key` a backend-supplied form so
+every address on a single-device backend maps to one key. The concrete
+symptom, reproducible on the bench: `contrib/hardware_exercise.py` fails its
+"dead addr isolated" check, because a query to an address nothing lives at is
+answered by the one instrument that does. Hotplug autostart can also match USBTMC
+devices (opt-in, `UGPIBD_CLAIM_USBTMC` in `/etc/ugpibd/udev.conf`), so a host
+with several instruments that sets both that and `UGPIBD_AUTOSTART=yes` needs
+the one-process-per-device service template that does not exist yet.
 
 ## 6a. Adapter desync (fixed 2026-08-06, kept as a warning)
 
@@ -111,3 +135,33 @@ Two causes, both fixed:
 The general lesson for this codebase: never cancel a future that owns a USB
 transfer. If a timeout or a disconnect has to interrupt one, the pipe must be
 resynchronised afterwards, not merely abandoned.
+
+## 6b. USBTMC serial poll on a non-compliant device (decision, not a gap)
+
+Recorded so that "we chose this" stays distinguishable from "nobody noticed".
+
+A Siglent SDG2122X answers READ_STATUS_BYTE on the interrupt endpoint with a
+constant `0xa5` sentinel while its real status (and `*STB?`) is `0`. USB488
+4.3.1 makes the interrupt the only status source when one is present — the
+control reply's byte is reserved — so there is nothing to fall back to, and the
+Linux kernel usbtmc driver misreads this device identically.
+
+We relay what the device reports rather than inject an out-of-band `*STB?` to
+second-guess it: a `*CLS` at connect would clobber the instrument's error
+queue, and an `*STB?` per poll is message-pipe traffic the caller did not ask
+for. A future opt-in `--serial-poll=stb-query` could paper over such firmware
+for a caller that wants it, but it must not be the default.
+
+## 6c. Unlocked multi-client access corrupts replies (not a USBTMC gap)
+
+Four unlocked sessions querying one instrument at once interleave and corrupt
+each other's replies — observed as `HEWHEWHEWLETT-PACKARD...`. A write and its
+read are separate VXI-11 calls and nothing binds them into a transaction, so
+this is inherent to the protocol rather than particular to any backend, and it
+is what `device_lock` exists for. Wrapping each query in
+`device_lock`/`device_unlock` is clean *and* eight times faster, because the
+unlocked run spends its time in timeouts and retries.
+
+The daemon resynchronises on its own afterwards, so nothing here needs fixing.
+It is listed because the symptom looks exactly like a transport bug, and it is
+the first thing to suspect when a multi-client script reports garbage.

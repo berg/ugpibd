@@ -61,17 +61,21 @@ HiSLIP and VXI-11 servers (either reachable with an ordinary pyvisa resource \
 string; VXI-11 additionally covers instruments that only produce output once \
 addressed to talk) and an optional Prologix-compatible line protocol.
 .
-Supported adapters: Agilent/Keysight 82357B, NI GPIB-USB-HS, and -- so far \
-untested on hardware -- the Agilent 82357A, NI GPIB-USB-HS+, KUSB-488A and \
-MC-USB-488. Firmware for the Agilent adapters is embedded and uploaded \
-automatically.
+Supported adapters: Agilent/Keysight 82357B and 82357A, NI GPIB-USB-HS and \
+HS+, and -- so far untested on hardware -- the KUSB-488A and MC-USB-488. \
+Firmware for the Agilent adapters is embedded and uploaded automatically. \
+Any USBTMC/USB488 instrument can also be served directly (untested).
 .
 The packaged service does not start on its own. Set UGPIBD_AUTOSTART=yes in \
 /etc/default/ugpibd to start it when an adapter is plugged in, or run \
 `systemctl enable ugpibd` to start it at boot regardless of hardware.
 .
-The kernel GPIB drivers (drivers/gpib, or out-of-tree linux-gpib) need no \
-blacklisting: ugpibd detaches them from the adapter it opens."""
+The kernel drivers (drivers/gpib, out-of-tree linux-gpib, or usbtmc) need no \
+blacklisting: ugpibd detaches them from the device it opens.
+.
+USB-GPIB adapters are granted to the ugpibd group on install. USBTMC \
+instruments are not: set UGPIBD_CLAIM_USBTMC=yes in /etc/ugpibd/udev.conf to \
+let ugpibd drive a scope, DMM or generator over its own USB port."""
 assets = [
     ["target/release/ugpibd", "usr/bin/", "755"],
     ["target/release/ugpibd-scpi", "usr/bin/", "755"],
@@ -79,6 +83,7 @@ assets = [
     ["contrib/ugpibd.service", "usr/lib/systemd/system/ugpibd.service", "644"],
     ["contrib/ugpibd-hotplug.service", "usr/lib/systemd/system/ugpibd-hotplug.service", "644"],
     ["contrib/ugpibd.default", "etc/default/ugpibd", "644"],
+    ["contrib/ugpibd-udev.conf", "etc/ugpibd/udev.conf", "644"],
     ["contrib/man/ugpibd.1", "usr/share/man/man1/ugpibd.1", "644"],
     ["contrib/man/ugpibd-scpi.1", "usr/share/man/man1/ugpibd-scpi.1", "644"],
     ["debian/copyright", "usr/share/doc/ugpibd/copyright", "644"],
@@ -89,7 +94,7 @@ assets = [
 # cargo-deb gzips it into /usr/share/doc/ugpibd/changelog.Debian.gz. lintian
 # errors (not warns) on a package with a Debian revision that lacks one.
 changelog = "target/changelog.Debian"
-conf-files = ["/etc/default/ugpibd"]
+conf-files = ["/etc/default/ugpibd", "/etc/ugpibd/udev.conf"]
 maintainer-scripts = "debian/"
 # The units are installed as plain assets and wired up by hand in debian/postinst
 # rather than via cargo-deb's systemd-units integration, because they must be
