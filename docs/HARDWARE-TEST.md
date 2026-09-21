@@ -349,6 +349,28 @@ needs `bus_lines()` and a look at ATN.
   address-ignored gap, ROADMAP item 6), all three front-ends, 2000-reading
   (32 KB) transfers, 300-query rapid fire, and repeated timeout recovery.
 
+  **What it actually does on the GPIB bus** (2026-09-20, 16-channel capture of
+  the bus between the bridge and the instrument). Worth knowing because the USB
+  side cannot show it, and it shapes what our status-byte semantics mean:
+
+  - `READ_STATUS_BYTE` is a **real serial poll**: `UNL UNT LAD0 SPE TAD23`,
+    status byte, `SPD UNT`. Not a cached value.
+  - **The MAV bit is the bridge's, not the instrument's.** The byte on the wire
+    was `0x00` while the client received `0x10`. Bit 4 reflects the bridge's own
+    buffer, which is what USB488 asks of a USBTMC device, but it means a client
+    watching MAV is watching the bridge.
+  - **The bridge prefetches.** About 10 ms after a write it addresses itself as
+    listener and reads the response, with no client read outstanding — so the
+    instrument's own MAV clears immediately and every client read is served
+    from the bridge's buffer.
+  - **It pre-addresses the poll and leaves the bus in serial-poll state.** In
+    one capture it sent `SPE` plus the talk address and then completed the
+    handshake only when the host called `READ_STATUS_BYTE`, three seconds
+    later, holding the instrument addressed to talk under SPE for that whole
+    time.
+  - `TRIGGER` sends `GET` addressed to the instrument, and device clear sends
+    `SDC` addressed rather than universal `DCL`. Both correct.
+
   Its interrupt endpoint has a **max packet size of 2**, which is what caught
   the multi-packet interrupt read: a 2-byte notification is a full packet, not
   a short one, so a read asking for more than one packet never completes.
