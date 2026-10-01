@@ -12,6 +12,12 @@
 // them. TLS/SASL handshakes are rejected. Multi-device is out of scope: one
 // bus, addressed per session by the hislip<N> sub-address.
 //
+// Sessions run synchronized (§3.1) unless `Config::modes` offers overlapped
+// (§3.2). The daemon never does: on one GPIB bus there is nothing to overlap,
+// and synchronized is what GPIB clients expect. Overlapped exists so a test
+// harness can put a client into that mode against a server that implements it
+// rather than a mock that only claims to.
+//
 // Service requests reach the client from two places. When the adapter reports
 // SRQ while the bus is idle, a per-session task serial-polls the device and
 // pushes an AsyncServiceRequest carrying the status byte. When one is raised by
@@ -171,11 +177,40 @@ const SRQ_RECHECK_BUDGET: std::time::Duration = std::time::Duration::from_millis
 /// how fast an overlapping request is noticed against bus traffic.
 const SRQ_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Which of the §3 operating modes the server supports, and which it prefers.
+///
+/// §3: "HiSLIP servers shall support either synchronized or overlapped mode or
+/// both." The preferred mode is the one announced in InitializeResponse and
+/// proposed in AsyncDeviceClearAcknowledge; a server supporting both accepts
+/// whichever the client asks for in DeviceClearComplete (§6.12.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Modes {
+    /// Synchronized only. What the daemon runs.
+    #[default]
+    Synchronized,
+    /// Both, starting synchronized.
+    PreferSynchronized,
+    /// Both, starting overlapped.
+    PreferOverlapped,
+}
+
+impl Modes {
+    fn supports_overlapped(self) -> bool {
+        self != Modes::Synchronized
+    }
+
+    fn prefers_overlapped(self) -> bool {
+        self == Modes::PreferOverlapped
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub vendor_id: u16,
     pub max_message_size: u64,
     pub max_sessions: usize,
+    /// Operating modes on offer. Synchronized only unless set otherwise.
+    pub modes: Modes,
     /// The lock registry this server enforces. Passed in rather than created
     /// here because locks protect the *instrument*: a daemon serving several
     /// front-ends hands the same registry to each, so a lock taken over one
@@ -190,6 +225,7 @@ impl Default for Config {
             vendor_id: 0xBEEF,
             max_message_size: 1024 * 1024,
             max_sessions: 16,
+            modes: Modes::default(),
             locks: Arc::new(LockRegistry::new()),
         }
     }
@@ -263,6 +299,14 @@ struct SessionEntry {
     /// MessageID of the most recent Data/DataEND/Trigger from this client.
     /// §6.14.3 reports MAV false to a status query quoting any other id.
     last_message_id: AtomicU32,
+    /// Whether the session is in overlapped mode (§3.2). Set at Initialize and
+    /// renegotiated by every device clear (§6.12.1).
+    overlapped: AtomicBool,
+    /// Overlapped mode only: the MessageID the next Data/DataEND this server
+    /// sends will carry (§3.2.1). Each one takes the next id, so the client can
+    /// say exactly how much it has been handed, and MAV follows from that
+    /// (§6.14.2).
+    next_server_message_id: AtomicU32,
     /// Service requests the server raises itself, from the sync loop to
     /// whichever task owns the async channel's writer.
     async_tx: mpsc::Sender<AsyncPush>,
@@ -296,6 +340,7 @@ impl SessionEntry {
         device: Arc<dyn Device>,
         locks: Arc<LockRegistry>,
         max_message_size: u64,
+        overlapped: bool,
     ) -> Self {
         let (async_tx, async_rx) = mpsc::channel(SRQ_QUEUE_DEPTH);
         // One fatal ends the session, so there is never a second to queue.
@@ -313,6 +358,8 @@ impl SessionEntry {
             mav: AtomicBool::new(false),
             // The id a client quotes before it has sent anything, per §6.14.
             last_message_id: AtomicU32::new(FIRST_MESSAGE_ID.wrapping_sub(2)),
+            overlapped: AtomicBool::new(overlapped),
+            next_server_message_id: AtomicU32::new(FIRST_MESSAGE_ID),
             async_tx,
             async_rx: Mutex::new(Some(async_rx)),
             sync_tx,
@@ -359,8 +406,41 @@ impl SessionEntry {
         self.take_consumed_stb();
     }
 
+    fn is_overlapped(&self) -> bool {
+        self.overlapped.load(Ordering::Acquire)
+    }
+
+    /// Enter the mode a device clear agreed on, restarting the server's
+    /// MessageIDs as §3.2.1 rule 1 requires after a clear.
+    fn set_overlapped(&self, overlapped: bool) {
+        self.overlapped.store(overlapped, Ordering::Release);
+        self.next_server_message_id
+            .store(FIRST_MESSAGE_ID, Ordering::Release);
+    }
+
+    /// MessageID for a Data/DataEND about to be sent: in synchronized mode the
+    /// id of the client message that asked for it (§3.1.1), in overlapped mode
+    /// the next one in the server's own sequence (§3.2.1 rule 2).
+    fn response_message_id(&self, request_id: u32) -> u32 {
+        if self.is_overlapped() {
+            self.next_server_message_id.fetch_add(2, Ordering::AcqRel)
+        } else {
+            request_id
+        }
+    }
+
     /// MAV as a status-byte bit, for a status query quoting `message_id`.
     fn mav_bit(&self, message_id: u32) -> u8 {
+        if self.is_overlapped() {
+            // §6.14.2: the client quotes the last message it has been handed in
+            // full, so anything sent after that one is still available. Before
+            // anything is sent both sides sit at the first id minus two.
+            let last_sent = self
+                .next_server_message_id
+                .load(Ordering::Acquire)
+                .wrapping_sub(2);
+            return if message_id == last_sent { 0 } else { STB_MAV };
+        }
         if !self.mav.load(Ordering::Acquire) {
             return 0;
         }
@@ -541,6 +621,7 @@ where
             device.clone(),
             locks.clone(),
             config.max_message_size,
+            config.modes.prefers_overlapped(),
         ));
         reg.insert(id, entry.clone());
         (id, entry)
@@ -549,11 +630,10 @@ where
     debug!(session_id, %subaddr, %protocol, "hislip sync initialized");
 
     let resp_param = InitializeResponseParameter::new(protocol, session_id);
-    // Synchronized, not overlapped: commands are executed one at a time on a
-    // single bus. Advertising a preference for overlap would also change which
-    // MAV rules apply — §6.14.2 compares MessageIDs where §6.14.1, which this
-    // server implements, uses message flow.
-    let resp_ctrl = InitializeResponseControl::new(false, false, false);
+    // Bit 0 is not a preference the client gets a say in: it is the mode the
+    // session starts in (§6.1). A client wanting the other one asks for it at
+    // the next device clear.
+    let resp_ctrl = InitializeResponseControl::new(config.modes.prefers_overlapped(), false, false);
     MessageType::InitializeResponse
         .message_params(resp_ctrl.0, resp_param.0)
         .no_payload()
@@ -831,12 +911,17 @@ where
                 }
             }
             MessageType::DeviceClearComplete => {
-                // Client ack of clear — finish the handshake.
-                let features = FeatureBitmap(msg.control_code);
-                // Echoing the client's preference would claim an overlapped
-                // mode this server does not implement.
-                let _ = features.overlapped();
-                let agreed = FeatureBitmap::new(false, false, false);
+                // Client ack of clear — finish the handshake. §6.12.1: take
+                // the mode the client asks for if this server supports it,
+                // otherwise stay synchronized, which every server here does.
+                let requested = FeatureBitmap(msg.control_code);
+                let overlapped = requested.overlapped() && config.modes.supports_overlapped();
+                // Here rather than on the async channel: the sync loop is
+                // sequential, so any reply from before the clear has already
+                // gone out under the old numbering.
+                entry.set_overlapped(overlapped);
+                debug!(session = entry.id, overlapped, "device clear complete");
+                let agreed = FeatureBitmap::new(overlapped, false, false);
                 {
                     let mut wr = writer.lock().await;
                     MessageType::DeviceClearAcknowledge
@@ -902,10 +987,13 @@ const MIN_CHUNK: u64 = 256;
 /// Push a reply on the sync channel, split so that no message — header
 /// included — exceeds the maximum the client declared with AsyncMaxMsgSize.
 /// The client states its own limit in that request; the response states ours.
+///
+/// `request_id` is the MessageID of the client message being answered; see
+/// [`SessionEntry::response_message_id`] for what each chunk carries.
 async fn write_response<W>(
     wr: &mut W,
     entry: &SessionEntry,
-    message_id: u32,
+    request_id: u32,
     data: &[u8],
 ) -> io::Result<()>
 where
@@ -920,7 +1008,7 @@ where
     // gets one, rather than blocking until its timeout.
     if data.is_empty() {
         MessageType::DataEnd
-            .message_params(0, message_id)
+            .message_params(0, entry.response_message_id(request_id))
             .no_payload()
             .write_to(wr)
             .await?;
@@ -934,7 +1022,7 @@ where
         } else {
             MessageType::Data
         };
-        ty.message_params(0, message_id)
+        ty.message_params(0, entry.response_message_id(request_id))
             .with_payload(chunk.to_vec())
             .write_to(wr)
             .await?;
@@ -1279,7 +1367,9 @@ where
                 if let Err(e) = entry.device.clear().await {
                     warn!("device clear failed: {e:#}");
                 }
-                let features = FeatureBitmap::new(false, false, false);
+                // §6.12.1 step 1: propose the mode this server prefers. The
+                // client answers with the one it wants in DeviceClearComplete.
+                let features = FeatureBitmap::new(config.modes.prefers_overlapped(), false, false);
                 MessageType::AsyncDeviceClearAcknowledge
                     .message_params(features.0, 0)
                     .no_payload()
@@ -1369,7 +1459,7 @@ where
                 }
                 // MAV is the server's to report, not the instrument's: the read
                 // that fetched the reply cleared the instrument's own bit, and
-                // §6.14.1 defines MAV by message flow anyway. Overwrite bit 4
+                // §6.14 defines MAV by message flow or MessageIDs anyway. Overwrite bit 4
                 // in whatever came back rather than OR-ing, so a stale set bit
                 // cannot outlive the response it belonged to.
                 stb = (stb & !STB_MAV) | entry.mav_bit(msg.message_parameter);

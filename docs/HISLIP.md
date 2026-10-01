@@ -55,3 +55,29 @@ it consumed on the next `AsyncStatusQuery`, once.
 
 This needs an adapter that can report SRQ asynchronously, which both the NI
 GPIB-USB-HS and the 82357B do.
+
+## Synchronized and overlapped modes
+
+The daemon runs every session in synchronized mode (§3.1), and says so in
+InitializeResponse and at every device clear. A client asking for overlapped
+mode at a device clear is answered with synchronized, which §6.12.1 permits
+and the client is bound to accept. One GPIB bus executes one command at a time,
+so there is nothing for overlapped mode to overlap.
+
+The server itself can do both. `Config::modes` selects `Synchronized` (the
+default, and the only thing the daemon uses), `PreferSynchronized` or
+`PreferOverlapped`. A server offering both starts sessions in its preferred
+mode and grants whichever one a client asks for at a device clear. In
+overlapped mode (§3.2):
+
+- replies are still sent in order, one command at a time, so queries a client
+  pipelines are answered in the order it sent them;
+- every Data and DataEND carries the next MessageID from the server's own
+  sequence, starting at `0xffffff00` and restarting at each device clear
+  (§3.2.1), rather than the id of the request that produced it;
+- MAV compares the MessageID in AsyncStatusQuery with the last one sent: it is
+  set while anything sent has not been delivered (§6.14.2). RMT-delivered no
+  longer affects it.
+
+This is there for test harnesses that need a real overlapped server to drive a
+client against; testgear-network-stress vendors this code for that purpose.
