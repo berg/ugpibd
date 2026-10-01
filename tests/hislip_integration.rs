@@ -15,7 +15,7 @@ use ugpibd::hislip::messages::{
     InitializeParameter, InitializeResponseParameter, Message, MessageType,
 };
 use ugpibd::hislip::protocol::PROTOCOL_2_0;
-use ugpibd::hislip::server::{run, Config, Device, Execution};
+use ugpibd::hislip::server::{run, Config, Device, Execution, Modes};
 
 /// A stand-in instrument. `reply` is what every query answers with, `delay` how
 /// long the bus transaction pretends to take, `service_request` the status byte
@@ -116,12 +116,32 @@ async fn start_server_with<F>(make: F) -> std::net::SocketAddr
 where
     F: Fn(&str) -> Option<Arc<dyn Device>> + Send + Sync + 'static,
 {
+    start_server_configured(Config::default(), make).await
+}
+
+async fn start_server_configured<F>(config: Config, make: F) -> std::net::SocketAddr
+where
+    F: Fn(&str) -> Option<Arc<dyn Device>> + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = run(listener, Config::default(), make).await;
+        let _ = run(listener, config, make).await;
     });
     addr
+}
+
+/// A server offering `modes`, every sub-address an echoing test device.
+async fn start_server_offering(modes: Modes) -> std::net::SocketAddr {
+    let config = Config {
+        modes,
+        ..Default::default()
+    };
+    start_server_configured(config, |_| {
+        let dev: Arc<dyn Device> = Arc::new(TestDevice::new());
+        Some(dev)
+    })
+    .await
 }
 
 async fn start_server() -> std::net::SocketAddr {
@@ -142,6 +162,8 @@ struct Session {
     sync: BufStream<TcpStream>,
     async_ch: BufStream<TcpStream>,
     message_id: u32,
+    /// Control code of the InitializeResponse: bit 0 is the starting mode.
+    init_control: u8,
 }
 
 impl Session {
@@ -157,6 +179,7 @@ impl Session {
 
         let resp = read_msg(&mut sync).await;
         assert_eq!(resp.message_type, MessageType::InitializeResponse);
+        let init_control = resp.control_code;
         let session_id = InitializeResponseParameter(resp.message_parameter).session_id();
 
         let mut async_ch = BufStream::new(TcpStream::connect(addr).await.unwrap());
@@ -174,6 +197,7 @@ impl Session {
             sync,
             async_ch,
             message_id: 0xffff_ff00,
+            init_control,
         }
     }
 
@@ -275,6 +299,35 @@ impl Session {
             resp.message_type,
             MessageType::AsyncMaximumMessageSizeResponse
         );
+    }
+
+    /// The whole §6.12 handshake, asking for overlapped mode or not. Returns
+    /// the control codes of AsyncDeviceClearAcknowledge (the server's
+    /// proposal) and DeviceClearAcknowledge (what was agreed), and restarts
+    /// this client's MessageIDs as step 8 requires.
+    async fn full_clear(&mut self, request_overlapped: bool) -> (u8, u8) {
+        let proposal = self.device_clear().await;
+        assert_eq!(
+            proposal.message_type,
+            MessageType::AsyncDeviceClearAcknowledge
+        );
+        MessageType::DeviceClearComplete
+            .message_params(u8::from(request_overlapped), 0)
+            .no_payload()
+            .write_to(&mut self.sync)
+            .await
+            .unwrap();
+        self.sync.flush().await.unwrap();
+        // Anything still queued from before the clear is the client's to
+        // discard (§6.12 step 4).
+        let agreed = loop {
+            let m = self.read_sync().await;
+            if m.message_type == MessageType::DeviceClearAcknowledge {
+                break m;
+            }
+        };
+        self.message_id = 0xffff_ff00;
+        (proposal.control_code, agreed.control_code)
     }
 
     async fn device_clear(&mut self) -> Message {
@@ -901,3 +954,406 @@ async fn a_fatal_error_is_reported_on_both_channels() {
 // API symmetry with InitializeResponseParameter in tests that might grow).
 #[allow(dead_code)]
 fn _keep_used(_p: InitializeParameter) {}
+
+// ------------------------------------------------------------ operating modes
+//
+// §3: a server supports synchronized, overlapped, or both. The daemon runs
+// synchronized only; the other two exist for test harnesses. These pin down
+// the negotiation (§6.1, §6.12.1) and what overlapped changes: the server's own
+// MessageID sequence (§3.2.1) and MAV by MessageID (§6.14.2).
+
+const OVERLAPPED: u8 = 0x01;
+const FIRST_ID: u32 = 0xffff_ff00;
+const BEFORE_FIRST_ID: u32 = 0xffff_fefe;
+
+#[test]
+fn the_daemon_default_is_synchronized_only() {
+    assert_eq!(Config::default().modes, Modes::Synchronized);
+}
+
+#[tokio::test]
+async fn synchronized_only_never_agrees_to_overlapped() {
+    let addr = start_server_offering(Modes::Synchronized).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    assert_eq!(session.init_control & OVERLAPPED, 0, "starts synchronized");
+
+    let (proposal, agreed) = session.full_clear(true).await;
+    assert_eq!(proposal & OVERLAPPED, 0, "proposes synchronized at clear");
+    assert_eq!(
+        agreed & OVERLAPPED,
+        0,
+        "a client asking for overlapped is refused by a server without it"
+    );
+
+    // Still synchronized: the reply names the request that produced it.
+    session.send(b"*CLS").await;
+    let id = session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_parameter, id);
+}
+
+#[tokio::test]
+async fn prefer_overlapped_starts_overlapped() {
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let session = Session::open(addr, "hislip0").await;
+    assert_eq!(
+        session.init_control & OVERLAPPED,
+        OVERLAPPED,
+        "InitializeResponse bit 0 announces the starting mode"
+    );
+}
+
+#[tokio::test]
+async fn prefer_synchronized_starts_synchronized() {
+    let addr = start_server_offering(Modes::PreferSynchronized).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    assert_eq!(session.init_control & OVERLAPPED, 0);
+    session.send(b"*CLS").await;
+    let id = session.send(b"*IDN?").await;
+    assert_eq!(
+        session.read_sync().await.message_parameter,
+        id,
+        "a session not yet upgraded numbers replies synchronized-style"
+    );
+}
+
+#[tokio::test]
+async fn each_server_proposes_its_preference_at_clear() {
+    for (modes, proposed) in [
+        (Modes::Synchronized, 0),
+        (Modes::PreferSynchronized, 0),
+        (Modes::PreferOverlapped, OVERLAPPED),
+    ] {
+        let addr = start_server_offering(modes).await;
+        let mut session = Session::open(addr, "hislip0").await;
+        let (proposal, _) = session.full_clear(false).await;
+        assert_eq!(proposal & OVERLAPPED, proposed, "{modes:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_server_with_both_modes_grants_whichever_the_client_asks_for() {
+    // §6.12.1: "The server shall accept the value proposed by the client in
+    // the DeviceClearComplete message if it is capable of supporting them."
+    for modes in [Modes::PreferSynchronized, Modes::PreferOverlapped] {
+        for request in [false, true] {
+            let addr = start_server_offering(modes).await;
+            let mut session = Session::open(addr, "hislip0").await;
+            let (_, agreed) = session.full_clear(request).await;
+            assert_eq!(
+                agreed & OVERLAPPED,
+                u8::from(request),
+                "{modes:?}, client asked for overlapped={request}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_mode_can_change_at_every_clear() {
+    let addr = start_server_offering(Modes::PreferSynchronized).await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    for overlapped in [true, false, true, true, false] {
+        let (_, agreed) = session.full_clear(overlapped).await;
+        assert_eq!(agreed & OVERLAPPED, u8::from(overlapped));
+        // Two sends so the client's and server's sequences diverge, which is
+        // what tells the modes apart.
+        session.send(b"*CLS").await;
+        let id = session.send(b"*IDN?").await;
+        let reply = session.read_sync().await.message_parameter;
+        if overlapped {
+            assert_eq!(reply, FIRST_ID, "overlapped: the server's own first id");
+        } else {
+            assert_eq!(reply, id, "synchronized: the request's id");
+        }
+    }
+}
+
+#[tokio::test]
+async fn overlapped_replies_carry_the_servers_own_sequence() {
+    // §3.2.1 rule 2: each Data/DataEND takes the next id from the server's
+    // counter, starting at 0xffffff00, regardless of the client's ids.
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    // Write-only commands advance the client's counter but not the server's.
+    session.send(b"*CLS").await;
+    session.send(b"*RST").await;
+    session.send(b"*IDN?").await;
+    let first = session.read_sync().await;
+    assert_eq!(first.message_type, MessageType::DataEnd);
+    assert_eq!(first.message_parameter, FIRST_ID);
+
+    session.send(b"*IDN?").await;
+    assert_eq!(
+        session.read_sync().await.message_parameter,
+        FIRST_ID.wrapping_add(2)
+    );
+}
+
+#[tokio::test]
+async fn overlapped_pipelined_queries_are_answered_in_order() {
+    // §3: "a series of independent query messages can be sent to the server
+    // without regard to when they complete. The responses from each will be
+    // returned in the order the queries were sent."
+    let addr = start_server_configured(
+        Config {
+            modes: Modes::PreferOverlapped,
+            ..Default::default()
+        },
+        |_| {
+            let dev: Arc<dyn Device> =
+                Arc::new(TestDevice::new().taking(Duration::from_millis(20)));
+            Some(dev)
+        },
+    )
+    .await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    let queries: Vec<Vec<u8>> = (0..8).map(|i| format!("Q{i}?").into_bytes()).collect();
+    for q in &queries {
+        session.send(q).await;
+    }
+    for (i, q) in queries.iter().enumerate() {
+        let reply = session.read_sync().await;
+        assert_eq!(reply.message_type, MessageType::DataEnd);
+        assert_eq!(&reply.payload, q, "reply {i} out of order");
+        assert_eq!(reply.message_parameter, FIRST_ID.wrapping_add(2 * i as u32));
+    }
+}
+
+#[tokio::test]
+async fn overlapped_every_chunk_takes_its_own_id() {
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    session.declare_max_message_size(16 + 256).await;
+
+    let big = vec![b'x'; 1000];
+    let mut cmd = big.clone();
+    cmd.push(b'?');
+    session.send(&cmd).await;
+
+    let mut expected = FIRST_ID;
+    let mut received = Vec::new();
+    loop {
+        let m = session.read_sync().await;
+        assert_eq!(m.message_parameter, expected, "chunk ids run consecutively");
+        expected = expected.wrapping_add(2);
+        received.extend_from_slice(&m.payload);
+        if m.message_type == MessageType::DataEnd {
+            break;
+        }
+        assert_eq!(m.message_type, MessageType::Data);
+    }
+    assert_eq!(received, cmd);
+    assert!(
+        expected.wrapping_sub(FIRST_ID) / 2 > 1,
+        "the reply was chunked"
+    );
+}
+
+#[tokio::test]
+async fn overlapped_an_empty_reply_takes_an_id_too() {
+    let addr = start_server_configured(
+        Config {
+            modes: Modes::PreferOverlapped,
+            ..Default::default()
+        },
+        |_| {
+            let dev: Arc<dyn Device> = Arc::new(TestDevice::new().replying(Vec::new()));
+            Some(dev)
+        },
+    )
+    .await;
+    let mut session = Session::open(addr, "hislip0").await;
+    session.send(b"*IDN?").await;
+    let empty = session.read_sync().await;
+    assert_eq!(empty.message_type, MessageType::DataEnd);
+    assert!(empty.payload.is_empty());
+    assert_eq!(empty.message_parameter, FIRST_ID);
+    session.send(b"*IDN?").await;
+    assert_eq!(
+        session.read_sync().await.message_parameter,
+        FIRST_ID.wrapping_add(2)
+    );
+}
+
+#[tokio::test]
+async fn overlapped_mav_compares_message_ids() {
+    // §6.14.2: MAV is true while any message sent has not been delivered, as
+    // told by the MessageID the client quotes (§3.2.2 rule 1).
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+
+    assert_eq!(
+        session.status(BEFORE_FIRST_ID).await & 0x10,
+        0,
+        "nothing sent yet"
+    );
+
+    session.send(b"A?").await;
+    session.send(b"B?").await;
+    let a = session.read_sync().await.message_parameter;
+    let b = session.read_sync().await.message_parameter;
+
+    assert_eq!(
+        session.status(BEFORE_FIRST_ID).await & 0x10,
+        0x10,
+        "neither reply delivered"
+    );
+    assert_eq!(session.status(a).await & 0x10, 0x10, "B not delivered");
+    assert_eq!(session.status(b).await & 0x10, 0, "everything delivered");
+}
+
+#[tokio::test]
+async fn overlapped_mav_ignores_rmt_delivered() {
+    // RMT-delivered drives MAV only in synchronized mode (§6.14.1). In
+    // overlapped mode a flag claiming delivery does not make an undelivered
+    // reply vanish.
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    session.send(b"A?").await;
+    assert_eq!(session.read_sync().await.message_type, MessageType::DataEnd);
+    session.send_rmt(b"*CLS").await;
+    assert_eq!(session.status(BEFORE_FIRST_ID).await & 0x10, 0x10);
+}
+
+#[tokio::test]
+async fn overlapped_mav_is_clear_after_write_only_traffic() {
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    session.send(b"*CLS").await;
+    session.send(b"*RST").await;
+    // A round trip on the sync channel so both commands have been processed.
+    session.send(b"*IDN?").await;
+    let id = session.read_sync().await.message_parameter;
+    assert_eq!(session.status(id).await & 0x10, 0);
+}
+
+#[tokio::test]
+async fn overlapped_message_ids_restart_after_device_clear() {
+    // §3.2.1 rule 1.
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    for _ in 0..3 {
+        session.send(b"*IDN?").await;
+        session.read_sync().await;
+    }
+    let (_, agreed) = session.full_clear(true).await;
+    assert_eq!(agreed & OVERLAPPED, OVERLAPPED);
+
+    assert_eq!(
+        session.status(BEFORE_FIRST_ID).await & 0x10,
+        0,
+        "after a clear the client quotes the first id minus two and nothing is pending"
+    );
+    session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_parameter, FIRST_ID);
+}
+
+#[tokio::test]
+async fn overlapped_replies_queued_before_a_clear_keep_their_old_numbers() {
+    // Replies already in flight when the clear arrives go out under the old
+    // numbering; the new sequence starts only once the handshake completes.
+    let addr = start_server_configured(
+        Config {
+            modes: Modes::PreferOverlapped,
+            ..Default::default()
+        },
+        |_| {
+            let dev: Arc<dyn Device> =
+                Arc::new(TestDevice::new().taking(Duration::from_millis(100)));
+            Some(dev)
+        },
+    )
+    .await;
+    let mut session = Session::open(addr, "hislip0").await;
+    session.send(b"*IDN?").await;
+    session.send(b"*IDN?").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let proposal = session.device_clear().await;
+    assert_eq!(
+        proposal.message_type,
+        MessageType::AsyncDeviceClearAcknowledge
+    );
+
+    MessageType::DeviceClearComplete
+        .message_params(OVERLAPPED, 0)
+        .no_payload()
+        .write_to(&mut session.sync)
+        .await
+        .unwrap();
+    session.sync.flush().await.unwrap();
+    let mut before = Vec::new();
+    loop {
+        let m = session.read_sync().await;
+        if m.message_type == MessageType::DeviceClearAcknowledge {
+            break;
+        }
+        before.push(m.message_parameter);
+    }
+    for (i, id) in before.iter().enumerate() {
+        assert_eq!(*id, FIRST_ID.wrapping_add(2 * i as u32));
+    }
+    session.message_id = FIRST_ID;
+    session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_parameter, FIRST_ID);
+}
+
+#[tokio::test]
+async fn returning_to_synchronized_restores_the_synchronized_mav_rules() {
+    let addr = start_server_offering(Modes::PreferOverlapped).await;
+    let mut session = Session::open(addr, "hislip0").await;
+    let (_, agreed) = session.full_clear(false).await;
+    assert_eq!(agreed & OVERLAPPED, 0);
+
+    let id = session.send(b"*IDN?").await;
+    assert_eq!(session.read_sync().await.message_parameter, id);
+    assert_eq!(
+        session.status(id).await & 0x10,
+        0x10,
+        "§6.14.1: reply not consumed"
+    );
+    let next = session.send_rmt(b"*CLS").await;
+    assert_eq!(
+        session.status(next).await & 0x10,
+        0,
+        "RMT-delivered clears it"
+    );
+}
+
+#[tokio::test]
+async fn sessions_negotiate_their_modes_independently() {
+    // Table 31: the overlapped bit is "related to current connection".
+    let addr = start_server_offering(Modes::PreferSynchronized).await;
+    let mut upgraded = Session::open(addr, "hislip0").await;
+    let mut plain = Session::open(addr, "hislip0").await;
+    upgraded.full_clear(true).await;
+
+    upgraded.send(b"*CLS").await;
+    upgraded.send(b"*IDN?").await;
+    assert_eq!(upgraded.read_sync().await.message_parameter, FIRST_ID);
+
+    plain.send(b"*CLS").await;
+    let id = plain.send(b"*IDN?").await;
+    assert_eq!(plain.read_sync().await.message_parameter, id);
+}
+
+#[tokio::test]
+async fn device_clear_drops_synchronized_mav() {
+    // §6.14.1 Figure 1: device clear takes MAV false. A reply left unread
+    // before the clear must not be reported as available after it.
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+    let id = session.send(b"*IDN?").await;
+    session.read_sync().await;
+    assert_eq!(session.status(id).await & 0x10, 0x10, "reply unread");
+
+    session.full_clear(false).await;
+    let next = session.send(b"*CLS").await;
+    assert_eq!(
+        session.status(next).await & 0x10,
+        0,
+        "MAV survived the device clear"
+    );
+}

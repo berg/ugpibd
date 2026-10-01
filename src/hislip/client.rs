@@ -214,7 +214,7 @@ impl HislipClient {
 
     /// Drive REN on (`true`) or off (`false`).
     pub async fn remote(&mut self, on: bool) -> Result<()> {
-        // Control codes per HiSLIP §6.3: 3 enables remote, 0 disables it.
+        // Control codes per HiSLIP §6.7 (Table 25): 3 enables remote, 0 disables it.
         // These match the server's set_remote mapping.
         let control = if on { 3 } else { 0 };
         let req = MessageType::AsyncRemoteLocalControl
