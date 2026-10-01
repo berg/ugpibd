@@ -32,7 +32,7 @@ bytes = "1"
 rustyline = "18"
 byteorder = "1.4"
 bitfield = "0.14"
-async-trait = "0.1"
+async-trait = "0.1.92"
 
 [dev-dependencies]
 # test-util for `#[tokio::test(start_paused = true)]`: the lock timeout tests

@@ -2,11 +2,10 @@
 #
 # CI used to install whatever `stable` was on the day it ran, so a new release
 # could fail a pull request that changed nothing it complained about: 1.99.0
-# added clippy's `double_must_use`, which fires inside every `#[async_trait]`
-# expansion with async-trait 0.1.89. Moving this version is now a deliberate
-# change that CI checks like any other. (For 1.99, bump async-trait to 0.1.92,
-# which no longer trips it.)
+# added clippy's `double_must_use`, which fired inside every `#[async_trait]`
+# expansion until async-trait 0.1.92. Moving this version is now a deliberate
+# change that CI checks like any other.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
