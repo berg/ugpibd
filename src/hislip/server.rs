@@ -1380,7 +1380,7 @@ where
                 wr.flush().await?;
             }
             MessageType::AsyncRemoteLocalControl => {
-                // Control codes per HiSLIP §6.3, in the spec's own names,
+                // Control codes per HiSLIP §6.7 (Table 25), in the spec's own names,
                 // which line up one-to-one with VISA's RENLineOperation:
                 //
                 //   0 disableRemote          drop REN; every device goes local
