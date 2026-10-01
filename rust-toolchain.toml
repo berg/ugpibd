@@ -1,0 +1,11 @@
+# The one place the Rust version is chosen, for CI and for local builds alike.
+#
+# CI used to install whatever `stable` was on the day it ran, so a new release
+# could fail a pull request that changed nothing it complained about: 1.99.0
+# added clippy's `double_must_use`, which fired inside every `#[async_trait]`
+# expansion until async-trait 0.1.92. Moving this version is now a deliberate
+# change that CI checks like any other.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
