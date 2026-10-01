@@ -1338,3 +1338,22 @@ async fn sessions_negotiate_their_modes_independently() {
     let id = plain.send(b"*IDN?").await;
     assert_eq!(plain.read_sync().await.message_parameter, id);
 }
+
+#[tokio::test]
+async fn device_clear_drops_synchronized_mav() {
+    // §6.14.1 Figure 1: device clear takes MAV false. A reply left unread
+    // before the clear must not be reported as available after it.
+    let addr = start_server().await;
+    let mut session = Session::open(addr, "hislip0").await;
+    let id = session.send(b"*IDN?").await;
+    session.read_sync().await;
+    assert_eq!(session.status(id).await & 0x10, 0x10, "reply unread");
+
+    session.full_clear(false).await;
+    let next = session.send(b"*CLS").await;
+    assert_eq!(
+        session.status(next).await & 0x10,
+        0,
+        "MAV survived the device clear"
+    );
+}

@@ -411,8 +411,10 @@ impl SessionEntry {
     }
 
     /// Enter the mode a device clear agreed on, restarting the server's
-    /// MessageIDs as §3.2.1 rule 1 requires after a clear.
+    /// MessageIDs as §3.2.1 rule 1 requires after a clear, and dropping MAV,
+    /// which §6.14.1's Figure 1 sends false on device clear in either mode.
     fn set_overlapped(&self, overlapped: bool) {
+        self.mav.store(false, Ordering::Release);
         self.overlapped.store(overlapped, Ordering::Release);
         self.next_server_message_id
             .store(FIRST_MESSAGE_ID, Ordering::Release);
