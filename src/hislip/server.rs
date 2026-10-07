@@ -1565,7 +1565,8 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
-/// Whether a command looks like a query: a `?` *outside* string literals.
+/// Whether a command looks like a query: a `?` *outside* string literals and
+/// arbitrary block payloads.
 ///
 /// This is a hint, not the decision — the device's `execute` asks the
 /// instrument itself (MAV in the status byte) whether output is pending, so a
@@ -1574,28 +1575,76 @@ fn escape_bytes(bytes: &[u8]) -> String {
 /// `DISP:TEXT "why?"` must not look like a query, or a valid command reports a
 /// timeout — observed, not theoretical.
 ///
+/// The two ways to be wrong do not cost the same, which is what shapes this.
+/// Guessing "not a query" is cheap: the MAV poll in `execute` catches it and
+/// reads anyway. Guessing "query" has no backstop — `execute` goes straight to
+/// an addressed read, and MAV cannot be consulted first because an instrument
+/// may produce output without ever setting it (see `frontend::instrument`).
+/// So a false positive costs the whole io_timeout, and every ambiguity here is
+/// resolved toward "not a query".
+///
 /// SCPI string literals are single- or double-quoted, and a doubled quote
 /// inside is an escape. The scan does not need to understand the escape: `""`
 /// reads as close-then-reopen, which keeps the text between quotes either way.
-/// An unterminated literal quotes the rest of the message, which errs toward
-/// "not a query" — the MAV check downstream covers it.
+/// An unterminated literal quotes the rest of the message.
+///
+/// IEEE 488.2 arbitrary block payloads (§7.7.6) are skipped wholesale, by the
+/// byte count their own header declares. Binary waveform data is full of 0x3f,
+/// and one of those read as a `?` is what made a 2058-byte `TRAC#42048...`
+/// block wait out a 25-second timeout for a reply that was never coming. Quote
+/// bytes in a payload are no better: a lone 0x22 would otherwise open a string
+/// literal and swallow a real query later in the message. A block ends the
+/// payload, not the scan — `TRAC#14ABCD;*OPC?` is still a query.
 pub fn query_hint(cmd: &[u8]) -> bool {
     let mut quote: Option<u8> = None;
-    for &b in cmd {
+    let mut i = 0;
+    while i < cmd.len() {
+        let b = cmd[i];
         match quote {
             Some(q) => {
                 if b == q {
                     quote = None;
                 }
+                i += 1;
             }
             None => match b {
-                b'"' | b'\'' => quote = Some(b),
+                b'"' | b'\'' => {
+                    quote = Some(b);
+                    i += 1;
+                }
                 b'?' => return true,
-                _ => {}
+                // Not every `#` opens a block — `#HFF` and `#B1010` are
+                // numeric literals — so a header that does not parse is just
+                // a character to step over.
+                b'#' => i += block_header_and_payload_len(&cmd[i..]).unwrap_or(1),
+                _ => i += 1,
             },
         }
     }
     false
+}
+
+/// How many bytes an IEEE 488.2 arbitrary block occupies, header included,
+/// given `rest` starting at its `#`. `None` means this is not a block header.
+///
+/// `#0` is the indefinite-length form: the payload runs to the end of the
+/// message (488.2 terminates it with NL+END, which is this message's own end),
+/// so it takes the rest. A definite-length count that overruns the message is
+/// a truncated block; the remainder is payload either way, and treating it as
+/// such keeps a byte of cut-off waveform from reading as a query.
+fn block_header_and_payload_len(rest: &[u8]) -> Option<usize> {
+    debug_assert_eq!(rest.first(), Some(&b'#'));
+    let digits = match *rest.get(1)? {
+        b'0' => return Some(rest.len()),
+        d @ b'1'..=b'9' => usize::from(d - b'0'),
+        _ => return None,
+    };
+    let count: &[u8] = rest.get(2..2 + digits)?;
+    if !count.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let payload: usize = std::str::from_utf8(count).ok()?.parse().ok()?;
+    Some((2 + digits + payload).min(rest.len()))
 }
 
 fn escape_bytes_truncated(bytes: &[u8], max: usize) -> String {
@@ -1641,6 +1690,60 @@ mod tests {
         assert!(!query_hint(b"SYST:REM"));
         // Unterminated literal errs toward "not a query".
         assert!(!query_hint(b"DISP:TEXT \"oops?"));
+    }
+
+    /// The failure this skipping exists for: a 2058-byte `TRAC#42048...`
+    /// block whose waveform bytes include 0x3f (`?`) and 0x22 (`"`). Read as
+    /// text it is a query, and the response-less read waits out the whole
+    /// io_timeout.
+    #[test]
+    fn query_hint_ignores_question_marks_inside_a_binary_block() {
+        let mut cmd = b"TRAC#42048".to_vec();
+        cmd.extend((0..2048u32).map(|i| match i % 7 {
+            0 => b'?',
+            1 => b'"',
+            2 => b'\'',
+            _ => (i % 256) as u8,
+        }));
+        assert_eq!(cmd.len(), 2058);
+        assert!(!query_hint(&cmd));
+    }
+
+    #[test]
+    fn query_hint_skips_exactly_the_declared_payload() {
+        // #1 4 => one length digit, four payload bytes.
+        assert!(!query_hint(b"TRAC#14?\x00?\x00"));
+        // The payload ends where the count says, so a query after it counts.
+        assert!(query_hint(b"TRAC#14ABCD;*OPC?"));
+        // ... and a `?` in the payload still does not.
+        assert!(!query_hint(b"TRAC#14?BCD;*OPC"));
+        // A quote byte inside the payload must not open a string literal and
+        // swallow the real query that follows.
+        assert!(query_hint(b"TRAC#14A\"CD;*OPC?"));
+    }
+
+    /// §7.7.6: `#0` is indefinite-length — the payload runs to the end of the
+    /// message, so nothing after it can be a query.
+    #[test]
+    fn query_hint_treats_an_indefinite_block_as_payload_to_the_end() {
+        assert!(!query_hint(b"TRAC#0\x01?\x02?"));
+        assert!(query_hint(b"TRAC?;TRAC#0\x01?"));
+    }
+
+    /// A declared count that overruns the message is a truncated block: the
+    /// remainder is payload, which errs toward "not a query".
+    #[test]
+    fn query_hint_handles_malformed_and_truncated_block_headers() {
+        assert!(!query_hint(b"TRAC#42048ab?cd"));
+        // Header cut off mid-count, and a bare trailing `#`.
+        assert!(!query_hint(b"TRAC#4204"));
+        assert!(!query_hint(b"TRAC#"));
+        // `#` followed by a non-digit is not a block header: numeric literals
+        // like `#HFF` are stepped over, and a query after one still counts.
+        assert!(query_hint(b"SOUR:DIG #HFF;*ESR?"));
+        assert!(!query_hint(b"SOUR:DIG #B1010"));
+        // A non-digit inside what looked like a count is not a header either.
+        assert!(query_hint(b"TRAC#4abcd?"));
     }
 
     #[test]
